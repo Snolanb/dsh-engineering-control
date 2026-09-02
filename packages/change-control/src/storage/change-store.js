@@ -131,8 +131,8 @@ async function reseedFromDisk(file) {
 function validateWorkItem(workItem) {
   if (workItem == null) return null;
   if (typeof workItem !== 'object' || Array.isArray(workItem)
-    || typeof workItem.system !== 'string' || workItem.system.trim() === ''
-    || typeof workItem.id !== 'string' || workItem.id.trim() === '') {
+    || typeof workItem.system !== 'string' || workItem.system.trim() === '' || workItem.system !== workItem.system.trim()
+    || typeof workItem.id !== 'string' || workItem.id.trim() === '' || workItem.id !== workItem.id.trim()) {
     throw Object.assign(new Error('workItem must be { system: string, id: string }'), { code: 'INVALID_WORK_ITEM' });
   }
   return { system: workItem.system, id: workItem.id };

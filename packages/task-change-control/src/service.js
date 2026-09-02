@@ -33,7 +33,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
   const requireChange = () => { const s = changeControl(); if (!s) throw unavailable('changeControl service not provided'); return s; };
   /** @param {string} taskId */
   const requireTaskId = (taskId) => {
-    if (typeof taskId !== 'string' || taskId.trim() === '') {
+    if (typeof taskId !== 'string' || taskId.trim() === '' || taskId !== taskId.trim()) {
       throw Object.assign(new Error('taskId is required and must be a non-blank string'), { code: 'INVALID_TASK_ID' });
     }
     return taskId;

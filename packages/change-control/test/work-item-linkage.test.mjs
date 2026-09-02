@@ -173,6 +173,27 @@ console.log(c.id);`;
   assert.equal(disk.audit.filter((e) => e.type === 'WORK_ITEM_LINKED').length, 1);
 });
 
+test('padded workItem ids are rejected at the store, closing the padded/canonical split-brain', async (t) => {
+  const { store } = await fixture(t);
+  await assert.rejects(
+    store.findOrCreateForWorkItem(input({ workItem: { system: SYSTEM_PAD, id: ` ${PADDED_ID} ` } })),
+    (e) => e.code === 'INVALID_WORK_ITEM'
+  );
+  await assert.rejects(
+    store.create(input({ workItem: { system: SYSTEM_PAD, id: `${PADDED_ID} ` } })),
+    (e) => e.code === 'INVALID_WORK_ITEM'
+  );
+  // Padded id can NEVER create a second Change for the same canonical id.
+  await store.create(input({ workItem: { system: SYSTEM_PAD, id: PADDED_ID } }));
+  await assert.rejects(
+    store.findOrCreateForWorkItem(input({ workItem: { system: SYSTEM_PAD, id: ` ${PADDED_ID}` } })),
+    (e) => e.code === 'INVALID_WORK_ITEM'
+  );
+});
+
+const SYSTEM_PAD = 'dsh-task-orchestrator';
+const PADDED_ID = 'task-pad-check';
+
 test('service facade exposes findByWorkItem and findOrCreateForWorkItem', async (t) => {
   const { store } = await fixture(t);
   const svc = createChangeControlService(store);

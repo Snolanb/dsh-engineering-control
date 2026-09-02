@@ -113,6 +113,21 @@ test('service rejects blank taskId; linkTaskChange on a deleted task yields TASK
   );
 });
 
+test('padded taskId is rejected before any Change-side call (no split-brain duplicates)', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'tcc-bootstrap-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const { ctx, taskStore } = await composeFresh(t, dir);
+  const task = await taskStore.create({ title: 'pad victim' });
+  assert.throws(
+    () => ctx.taskChangeControl.bootstrapTask(` ${task.id} `),
+    (e) => e.code === 'INVALID_TASK_ID'
+  );
+  // Only the canonical id works, and it yields exactly one Change.
+  const first = await ctx.taskChangeControl.bootstrapTask(task.id);
+  const again = await ctx.taskChangeControl.bootstrapTask(task.id);
+  assert.equal(again.change.id, first.change.id);
+});
+
 test('cross-boundary persistence: link survives full recomposition against the same files', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'tcc-bootstrap-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
