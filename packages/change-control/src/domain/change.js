@@ -69,10 +69,11 @@ export const TRANSITIONS = deepFreeze({
  * @param {string} [params.objective='']
  * @param {string[]} [params.acceptanceCriteria=[]]
  * @param {'low'|'normal'|'high'|null} [params.risk=null] unset until a host decision
+ * @param {{ system: string, id: string } | null} [params.workItem=null]
  * @returns {Change}
  */
-export function createChange({ title, objective = '', acceptanceCriteria = [], risk = null }) {
-  return new Change({ title, objective, acceptanceCriteria, risk });
+export function createChange({ title, objective = '', acceptanceCriteria = [], risk = null, workItem = null }) {
+  return new Change({ title, objective, acceptanceCriteria, risk, workItem });
 }
 
 /**
@@ -87,8 +88,9 @@ export class Change {
    * @param {string} [params.objective]
    * @param {string[]} [params.acceptanceCriteria]
    * @param {'low'|'normal'|'high'|null} [params.risk]
+   * @param {{ system: string, id: string } | null} [params.workItem]
    */
-  constructor({ title, objective = '', acceptanceCriteria = [], risk = null }) {
+  constructor({ title, objective = '', acceptanceCriteria = [], risk = null, workItem = null }) {
     /** @type {string} */
     this.id = crypto.randomUUID();
     /** @type {string} */
@@ -101,6 +103,12 @@ export class Change {
     this.risk = risk;
     /** @type {string|null} */
     this.acceptedPlanId = null;
+    /**
+     * Authoritative external work-item reference { system, id }.
+     * Persisted; the Change side of the task↔Change linkage is canonical.
+     * @type {{ system: string, id: string } | null}
+     */
+    this.workItem = workItem;
     /** @type {string} */
     this.createdAt = new Date().toISOString();
     /** @type {string} */

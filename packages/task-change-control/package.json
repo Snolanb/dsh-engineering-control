@@ -1,0 +1,28 @@
+{
+  "name": "dsh-task-change-control",
+  "version": "0.0.0",
+  "description": "Integration package linking Task Orchestrator tasks to Change Control Changes. Backstop: both domain plugins work standalone without it.",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./service": "./src/service.js"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "build": "echo 'ESM package, no build step required'",
+    "typecheck": "tsc --noEmit -p jsconfig.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dependencies": {
+    "dsh-change-control": "workspace:*",
+    "dsh-task-orchestrator": "workspace:*"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.7 <0.2.0-0"
+  }
+}

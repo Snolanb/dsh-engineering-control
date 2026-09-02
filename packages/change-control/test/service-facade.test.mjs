@@ -15,7 +15,8 @@ import plugin from '../src/index.js';
 const OPS = [
   'create', 'get', 'submitPlan', 'acceptPlan', 'bindRole', 'unbindRole',
   'resolveRole', 'submitProof', 'runPreflight', 'submitReview',
-  'submitRepair', 'history', 'status',
+  'submitRepair', 'history', 'status', 'setRisk',
+  'findByWorkItem', 'findOrCreateForWorkItem',
 ];
 
 async function host(t) {
@@ -32,7 +33,7 @@ test('changeControl service exposes exactly the facade operations', async (t) =>
   const ctx = await host(t);
   const service = ctx.get('changeControl');
   for (const op of OPS) assert.equal(typeof service[op], 'function', `missing ${op}`);
-  assert.equal(service.findByWorkItem, undefined, 'findByWorkItem lands in Phase 3, not here');
+  assert.equal(typeof service.findByWorkItem, 'function', 'work-item linkage ops are part of the facade (Phase 3 / T3.1)');
 });
 
 test('changeStore is no longer provided', async (t) => {

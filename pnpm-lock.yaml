@@ -30,6 +30,18 @@ importers:
         specifier: 0.1.1-rc.2
         version: 0.1.1-rc.2(fce27d0fcc1cba3231d79c0a47b47475)
 
+  packages/task-change-control:
+    dependencies:
+      '@deepseek-ai/dsh-tools':
+        specifier: 0.1.1-rc.2
+        version: 0.1.1-rc.2(fce27d0fcc1cba3231d79c0a47b47475)
+      dsh-change-control:
+        specifier: workspace:*
+        version: link:../change-control
+      dsh-task-orchestrator:
+        specifier: workspace:*
+        version: link:../task-orchestrator
+
   packages/task-orchestrator:
     dependencies:
       '@deepseek-ai/dsh-tools':
