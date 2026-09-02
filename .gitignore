@@ -1,0 +1,9 @@
+node_modules/
+.pnpm-store/
+.DS_Store
+.dsh/
+.dsh-acp/
+.agent-teams/
+.tmp-*/
+packages/task-change-control/dist/
+packages/task-orchestrator/.client-build/
