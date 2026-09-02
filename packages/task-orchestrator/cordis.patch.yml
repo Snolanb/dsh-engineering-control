@@ -1,0 +1,4 @@
+# Add the task control plane and its standalone browser board to a DSH profile bundle.
+- insert:
+    - id: task-orchestrator
+      name: dsh-task-orchestrator

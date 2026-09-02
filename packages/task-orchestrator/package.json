@@ -1,0 +1,51 @@
+{
+  "name": "dsh-task-orchestrator",
+  "version": "0.1.0",
+  "description": "Persistent local SQLite task control plane for multi-agent DSH workflows.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./store": "./lib/store.js",
+    "./routes": "./lib/routes.js",
+    "./tools": "./lib/tools.js",
+    "./client": "./lib/client.js",
+    "./client-api": "./lib/client-api.js",
+    "./worker-specs": "./lib/worker-specs.js",
+    "./worker-preflight": "./lib/worker-preflight.js",
+    "./dispatcher": "./lib/dispatcher.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "src",
+    "README.md",
+    "PLAN.md",
+    "docs",
+    "profiles",
+    "cordis.patch.yml"
+  ],
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.7 <0.2.0-0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [],
+      "platform": "web"
+    }
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "tsdown": "0.21.0"
+  }
+}

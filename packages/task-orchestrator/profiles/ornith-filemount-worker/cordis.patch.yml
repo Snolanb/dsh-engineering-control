@@ -1,0 +1,59 @@
+# Headless Ornith worker composition.
+# The dispatcher owns task lifecycle reporting; this profile only edits the pinned workspace.
+
+- id: compaction-basic
+  name: '@deepseek-ai/dsh-compaction-basic'
+  disabled: false
+  config:
+    thresholdRatio: 0.6
+    retainRatio: 0.16
+
+- id: tool-result-pruner
+  name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+  disabled: false
+  config:
+    thresholdChars: 8192
+    headChars: 4096
+    tailChars: 1024
+
+- id: tool-fs
+  disabled: false
+
+- id: file-mount
+  config:
+    valveReads: 2
+
+# dsh-llm-pi-ai is mounted by dsh-base. Supplying an explicit profile here
+# prevents the isolated headless worker from starting with a dormant Ollama route.
+- id: llm-pi-ai
+  name: '@deepseek-ai/dsh-llm-pi-ai'
+  config:
+    providers:
+      ollama:
+        api: openai-completions
+        baseURL: http://127.0.0.1:11434/v1
+        apiKeyEnv: OLLAMA_API_KEY
+        models:
+          - id: ornith-1.5:9b
+            name: Ornith 1.5 9B
+
+- id: agent-default-model
+  name: '@deepseek-ai/dsh-agent-default-model'
+  config:
+    provider: ollama
+    model: ornith-1.5:9b
+
+- id: small-model-guard
+  name: dsh-small-model-guard
+  config:
+    preventBadEditorPaths: true
+    preventImmediateDuplicateReads: true
+    guideClippedReads: true
+    blockFullCatAfterClip: true
+    enforceReadOnlyMutations: true
+    blockReadOnlyBashMutations: true
+    progressSentinel: true
+    failureWarnCount: 2
+    failureStallCount: 3
+    fullReadWarnCount: 3
+    blockBroadFind: true

@@ -1,0 +1,20 @@
+{
+  "name": "dsh-change-control",
+  "version": "0.0.0",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": "./src/index.js",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "build": "echo 'ESM package, no build step required'",
+    "typecheck": "tsc --noEmit"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.7 <0.2.0-0"
+  }
+}
