@@ -1,4 +1,5 @@
 import { createTaskChangeControlService } from './service.js';
+import { createIntegrationTools } from './tools.js';
 
 /**
  * Task ↔ Change integration plugin.
@@ -19,5 +20,13 @@ export default {
       changeControl: () => ctx.get('changeControl'),
     });
     ctx.provide('taskChangeControl', service);
+
+    // Model-facing surface: exactly two tools, registered only when a tools
+    // registry exists (probed defensively, same pattern as change-control's
+    // host commands). Registry health errors fail loudly.
+    const registry = ctx.get('tools');
+    if (registry) {
+      for (const tool of createIntegrationTools(service)) registry.register(tool);
+    }
   },
 };

@@ -151,6 +151,49 @@ test('legacy pre-domainState replay tolerates WORK_ITEM_LINKED events missing fr
   assert.equal((await store.findByWorkItem(WORK_ITEM.system, WORK_ITEM.id))?.id, 'c1');
 });
 
+test('cross-PROCESS race: two host processes linking the same work item converge on one Change', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'work-item-xproc-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, 'changes.json');
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const storeImport = new URL('../src/storage/change-store.js', import.meta.url).pathname;
+  const childScript = `import { ChangeStore } from '${storeImport}';
+const s = await ChangeStore.open(process.argv[1]);
+const c = await s.findOrCreateForWorkItem({ title: 'racer', objective: 'o', acceptanceCriteria: [], workItem: { system: 'dsh-task-orchestrator', id: 'xc-task' } });
+console.log(c.id);`;
+  const runChild = () => promisify(execFile)(process.execPath, ['--input-type=module', '-e', childScript, file]);
+  const [a, b] = await Promise.all([runChild(), runChild()]);
+  const idA = a.stdout.trim(); const idB = b.stdout.trim();
+  assert.ok(idA && idB, 'both processes returned an id');
+  assert.equal(idA, idB, 'two host processes must converge on the same Change');
+  const { readFile } = await import('node:fs/promises');
+  const disk = JSON.parse(await readFile(file, 'utf8'));
+  assert.equal(disk.changes.length, 1, 'exactly one Change persisted');
+  assert.equal(disk.audit.filter((e) => e.type === 'WORK_ITEM_LINKED').length, 1);
+});
+
+test('padded workItem ids are rejected at the store, closing the padded/canonical split-brain', async (t) => {
+  const { store } = await fixture(t);
+  await assert.rejects(
+    store.findOrCreateForWorkItem(input({ workItem: { system: SYSTEM_PAD, id: ` ${PADDED_ID} ` } })),
+    (e) => e.code === 'INVALID_WORK_ITEM'
+  );
+  await assert.rejects(
+    store.create(input({ workItem: { system: SYSTEM_PAD, id: `${PADDED_ID} ` } })),
+    (e) => e.code === 'INVALID_WORK_ITEM'
+  );
+  // Padded id can NEVER create a second Change for the same canonical id.
+  await store.create(input({ workItem: { system: SYSTEM_PAD, id: PADDED_ID } }));
+  await assert.rejects(
+    store.findOrCreateForWorkItem(input({ workItem: { system: SYSTEM_PAD, id: ` ${PADDED_ID}` } })),
+    (e) => e.code === 'INVALID_WORK_ITEM'
+  );
+});
+
+const SYSTEM_PAD = 'dsh-task-orchestrator';
+const PADDED_ID = 'task-pad-check';
+
 test('service facade exposes findByWorkItem and findOrCreateForWorkItem', async (t) => {
   const { store } = await fixture(t);
   const svc = createChangeControlService(store);
