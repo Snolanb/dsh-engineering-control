@@ -19,8 +19,8 @@ async function fixture(fn) {
     const ctx = new Context();
     await ctx.plugin(SystemPrompt);
     await ctx.plugin(ToolRuntime);
-    await ctx.plugin({ name, apply, inject: ['tools'] }, { storePath: file });
-    const store = ctx.get('changeStore');
+    const store = await ChangeStore.open(file);
+    await ctx.plugin({ name, apply, inject: ['tools'] }, { store, storePath: file });
     const change = await store.create(input);
     await fn({ file, store, change, registry: ctx.get('tools') });
   } finally { await rm(dir, { recursive: true, force: true }); }

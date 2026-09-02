@@ -34,9 +34,9 @@ async function rtFixture(t, policy = {}) {
   await ctx.plugin(SystemPrompt);
   await ctx.plugin(ToolRuntime);
   const storePath = file;
-  await ctx.plugin({ name, apply, inject: ['tools'] }, { storePath, policy: { enabled: true, projectId: 'project-1', owner: 'host', workspaceRoots: [dir], ...policy } });
+  const store = await ChangeStore.open(storePath, { preflightPolicy: policy.preflightPolicy });
+  await ctx.plugin({ name, apply, inject: ['tools'] }, { store, storePath, policy: { enabled: true, projectId: 'project-1', owner: 'host', workspaceRoots: [dir], ...policy } });
   const registry = ctx.get('tools');
-  const store = ctx.get('changeStore');
   registry.register(defineTool({
     name: 'filesystem_write',
     description: 'test write',
