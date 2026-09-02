@@ -109,6 +109,7 @@ export class WorkerDispatcher {
     registry,
     launcher = createWorkerLauncher(),
     preflight,
+    preDispatch = null,
     preflightOptions = {},
     actor = 'task-dispatcher',
     idFactory = randomUUID,
@@ -122,6 +123,8 @@ export class WorkerDispatcher {
     this.registry = registry
     this.launcher = launcher
     this.preflight = preflight ?? ((request, options) => runPreflight(registry, request, options))
+    if (preDispatch !== null && typeof preDispatch !== 'function') throw new TypeError('preDispatch must be a function or null')
+    this.preDispatch = preDispatch
     this.preflightOptions = { ...preflightOptions }
     this.actor = actor
     this.idFactory = idFactory
@@ -153,6 +156,19 @@ export class WorkerDispatcher {
     const worker = runId
     const claimed = this.store.claim(task.id, worker, { lease_seconds: spec.leaseSeconds, actor: this.actor })
     if (!claimed.claimed) return { dispatched: false, reason: 'claim_race', task: claimed.task, claim: claimed }
+
+    if (this.preDispatch) {
+      let verdict
+      try {
+        verdict = await this.preDispatch({ task: claimed.task ?? task, worker, runId })
+      } catch (error) {
+        verdict = { ok: false, code: 'GUARD_ERROR', error: errorText(error) }
+      }
+      if (verdict && verdict.ok === false) {
+        try { this.store.release(task.id, worker, { actor: this.actor }) } catch {}
+        return { dispatched: false, reason: 'dispatch_not_governed', predispatch: verdict, task: this.store.get(task.id), run_id: runId, worker }
+      }
+    }
 
     let handle
     try {

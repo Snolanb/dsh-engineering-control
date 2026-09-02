@@ -5,6 +5,7 @@
  * into task metadata, and resolve task → Change with the Change side canonical.
  * No TaskStore/ChangeStore imports here — only the two Cordis services.
  */
+import { createGovernanceGuard } from './governance.js';
 
 /** The task-orchestrator identity on the Change-side workItem. */
 export const WORK_ITEM_SYSTEM = 'dsh-task-orchestrator';
@@ -22,7 +23,7 @@ function unavailable(detail) {
 
 /**
  * Minimal typed views of the two domain services this package depends on.
- * @typedef {{ get: (id: string) => Promise<any>, update: (id: string, patch: any) => Promise<any> }} TaskOrchestratorApi
+ * @typedef {{ get: (id: string) => Promise<any>, update: (id: string, patch: any) => Promise<any>, createDispatcher: (options?: any) => any }} TaskOrchestratorApi
  * @typedef {{ get: (id: string) => Promise<any>, findByWorkItem: (system: string, id: string) => Promise<any>, findOrCreateForWorkItem: (input: { system: string, id: string, change: object }) => Promise<any> }} ChangeControlApi
  * @param {object} deps
  * @param {() => TaskOrchestratorApi | undefined} deps.taskOrchestrator accessor (may be absent)
@@ -137,6 +138,24 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         await api.linkTaskChange(taskId);
         return { change, snapshot };
       })();
+    },
+
+    /**
+     * Build a WorkerDispatcher wired with the governance guard. The dispatcher
+     * is constructed through taskOrchestrator.createDispatcher — no store
+     * access here, only service composition.
+     * @param {Record<string, any> & { preDispatch?: (input: any) => Promise<any> }} [options] dispatcher constructor overrides
+     */
+    createGovernedDispatcher(options = {}) {
+      const t = requireTask();
+      const c = requireChange();
+      if (typeof t.createDispatcher !== 'function') {
+        throw unavailable('taskOrchestrator.createDispatcher not provided');
+      }
+      return t.createDispatcher({
+        ...options,
+        preDispatch: options.preDispatch ?? createGovernanceGuard(c, WORK_ITEM_SYSTEM),
+      });
     },
 
     /** True when both domain services are resolvable right now. */
