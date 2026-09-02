@@ -95,12 +95,32 @@ async function reseedFromDisk(file) {
   }
 }
 
+/**
+ * Validate an external work-item reference. Non-terminal uniqueness is
+ * enforced by ChangeStore; this validates shape only.
+ */
+function validateWorkItem(workItem) {
+  if (workItem == null) return null;
+  if (typeof workItem !== 'object' || Array.isArray(workItem)
+    || typeof workItem.system !== 'string' || workItem.system.trim() === ''
+    || typeof workItem.id !== 'string' || workItem.id.trim() === '') {
+    throw Object.assign(new Error('workItem must be { system: string, id: string }'), { code: 'INVALID_WORK_ITEM' });
+  }
+  return { system: workItem.system, id: workItem.id };
+}
+
+/** A Change is nonterminal until it reaches APPROVED (the only terminal state). */
+function isNonterminal(change) {
+  return change.state !== 'APPROVED';
+}
+
 function rehydrate(serialized, events) {
   const c = createChange({
     title: serialized.title,
     objective: serialized.objective,
     acceptanceCriteria: serialized.acceptanceCriteria,
     risk: serialized.risk,
+    workItem: serialized.workItem ?? null,
   });
   c.id = serialized.id;
   c.createdAt = serialized.createdAt;
@@ -146,6 +166,7 @@ function freezeChange(c) {
     acceptanceCriteria: [...c.acceptanceCriteria],
     risk: c.risk,
     acceptedPlanId: c.acceptedPlanId,
+    workItem: c.workItem ? Object.freeze({ system: c.workItem.system, id: c.workItem.id }) : null,
     state: c.state,
     createdAt: c.createdAt,
     updatedAt: c.updatedAt,
@@ -421,6 +442,7 @@ export class ChangeStore {
           acceptanceCriteria: c.acceptanceCriteria,
           risk: c.risk,
           acceptedPlanId: c.acceptedPlanId,
+          workItem: c.workItem ? { system: c.workItem.system, id: c.workItem.id } : null,
           planState: c._getPlanState?.() ?? null,
           domainState: c._getDomainState?.() ?? c.state,
           createdAt: c.createdAt,
@@ -574,7 +596,8 @@ export class ChangeStore {
   async create(input) {
     const release = await acquireLock(this.#file);
     try {
-      const change = createChange(input);
+      const workItem = validateWorkItem(input?.workItem);
+      const change = createChange({ ...input, workItem });
       this.#changes.set(change.id, change);
       // Reseed from disk under lock immediately before assigning eventId,
       // so concurrent process writes are visible and no collision occurs.
@@ -584,6 +607,73 @@ export class ChangeStore {
         changeId: change.id,
         from: null,
         to: 'DRAFT',
+        ts: change.createdAt,
+      });
+      if (workItem) {
+        this.#audit.push({
+          eventId: nextEventId(),
+          changeId: change.id,
+          type: 'WORK_ITEM_LINKED',
+          workItem: { system: workItem.system, id: workItem.id },
+          ts: change.createdAt,
+        });
+      }
+      await this.#persist();
+      return freezeChange(change);
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Find the NONTERMINAL Change linked to an external work item, or null.
+   * At most one nonterminal Change exists per (system, id); terminal/history
+   * Changes are ignored.
+   */
+  async findByWorkItem(system, id) {
+    const release = await acquireLock(this.#file);
+    try {
+      for (const c of this.#changes.values()) {
+        if (c.workItem && c.workItem.system === system && c.workItem.id === id && isNonterminal(c)) {
+          return freezeChange(c);
+        }
+      }
+      return null;
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Idempotent, concurrency-safe find-or-create for an external work item.
+   * Holds the store file lock across lookup+create so two concurrent callers
+   * cannot create two Changes for the same (system, id).
+   */
+  async findOrCreateForWorkItem(input) {
+    const release = await acquireLock(this.#file);
+    try {
+      const workItem = validateWorkItem(input?.workItem);
+      if (!workItem) throw Object.assign(new Error('findOrCreateForWorkItem requires input.workItem'), { code: 'INVALID_WORK_ITEM' });
+      for (const c of this.#changes.values()) {
+        if (c.workItem && c.workItem.system === workItem.system && c.workItem.id === workItem.id && isNonterminal(c)) {
+          return freezeChange(c);
+        }
+      }
+      const change = createChange({ ...input, workItem });
+      this.#changes.set(change.id, change);
+      await reseedFromDisk(this.#file);
+      this.#audit.push({
+        eventId: nextEventId(),
+        changeId: change.id,
+        from: null,
+        to: 'DRAFT',
+        ts: change.createdAt,
+      });
+      this.#audit.push({
+        eventId: nextEventId(),
+        changeId: change.id,
+        type: 'WORK_ITEM_LINKED',
+        workItem: { system: workItem.system, id: workItem.id },
         ts: change.createdAt,
       });
       await this.#persist();

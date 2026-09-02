@@ -27,6 +27,20 @@ export function createChangeControlService(store) {
     /** Get a Change by id (public projection, no private store state). */
     get: (changeId) => store.get(changeId),
 
+    /**
+     * Resolve the NONTERMINAL Change linked to an external work item
+     * { system, id } — the authoritative task↔Change linkage. Returns null
+     * when unlinked. Terminal/legacy Changes are never matched.
+     */
+    findByWorkItem: (system, id) => store.findByWorkItem(system, id),
+
+    /**
+     * Idempotent find-or-create for a work item: at most one nonterminal
+     * Change per (system, id). Concurrent calls converge on one Change.
+     */
+    findOrCreateForWorkItem: ({ system, id, change }) =>
+      store.findOrCreateForWorkItem({ ...change, workItem: { system, id } }),
+
     /** Submit a plan revision. */
     submitPlan: (changeId, content) => store.submitPlan(changeId, content),
 
