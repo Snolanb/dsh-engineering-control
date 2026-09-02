@@ -23,7 +23,7 @@ function unavailable(detail) {
 /**
  * Minimal typed views of the two domain services this package depends on.
  * @typedef {{ get: (id: string) => Promise<any>, update: (id: string, patch: any) => Promise<any> }} TaskOrchestratorApi
- * @typedef {{ get: (id: string) => Promise<any>, findByWorkItem: (system: string, id: string) => Promise<any> }} ChangeControlApi
+ * @typedef {{ get: (id: string) => Promise<any>, findByWorkItem: (system: string, id: string) => Promise<any>, findOrCreateForWorkItem: (input: { system: string, id: string, change: object }) => Promise<any> }} ChangeControlApi
  * @param {object} deps
  * @param {() => TaskOrchestratorApi | undefined} deps.taskOrchestrator accessor (may be absent)
  * @param {() => ChangeControlApi | undefined} deps.changeControl accessor (may be absent)
@@ -74,6 +74,52 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         const metadata = { ...(task.metadata ?? {}), changeControl: { ...(task.metadata?.changeControl ?? {}), changeId: change.id } };
         await Promise.resolve(t.update(taskId, { metadata }));
         return { taskId, changeId: change.id };
+      })();
+    },
+
+    /**
+     * Bootstrap a governed unit of work: snapshot the CANONICAL task record
+     * (never caller-supplied content) into one linked Change in DRAFT, and
+     * write the denormalized task-side projection. Idempotent.
+     * Never approves a plan, never grants roles.
+     * @param {string} taskId
+     * @returns {Promise<{ change: any, snapshot: object }>}
+     */
+    bootstrapTask(taskId) {
+      const t = requireTask();
+      const c = requireChange();
+      return (async () => {
+        let task = null;
+        try { task = await Promise.resolve(t.get(taskId)); } catch { task = null; }
+        if (!task) {
+          throw Object.assign(new Error(`task not found: ${taskId}`), { code: 'TASK_NOT_FOUND' });
+        }
+        // Snapshot ONLY from the canonical task record. No caller override
+        // parameter exists — content below is deliberately task-only.
+        const snapshot = {
+          title: task.title,
+          description: task.description ?? '',
+          acceptance_criteria: [...(task.acceptance_criteria ?? [])],
+          workspace: task.workspace ?? null,
+          repo: task.repo ?? null,
+          branch: task.branch ?? null,
+          task_type: task.task_type ?? null,
+          project_id: task.project_id ?? null,
+          milestone_id: task.milestone_id ?? null,
+        };
+        // Lock-safe find-or-create owns the at-most-one-nonterminal invariant.
+        const change = await c.findOrCreateForWorkItem({
+          system: WORK_ITEM_SYSTEM,
+          id: taskId,
+          change: {
+            title: snapshot.title,
+            objective: snapshot.description || snapshot.title,
+            acceptanceCriteria: snapshot.acceptance_criteria,
+          },
+        });
+        // Denormalized projection (repairs drift; Change side stays canon).
+        await api.linkTaskChange(taskId);
+        return { change, snapshot };
       })();
     },
 
