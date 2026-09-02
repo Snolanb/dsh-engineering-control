@@ -84,6 +84,13 @@ test('change_for_task on an unlinked task returns a structured not-linked result
   assert.equal(result.change, null);
 });
 
+test('tools reject blank taskId with INVALID_TASK_ID', async (t) => {
+  const { ctx } = await compose(t);
+  const tools = ctx.tools.view().visible;
+  await assert.rejects(tools.get('change_for_task').execute({ taskId: '  ' }, {}), (e) => e.code === 'INVALID_TASK_ID');
+  await assert.rejects(tools.get('change_bootstrap_task').execute({ taskId: '' }, {}), (e) => e.code === 'INVALID_TASK_ID');
+});
+
 test('change_bootstrap_task + change_for_task round-trip through the real registry', async (t) => {
   const { ctx, taskStore } = await compose(t);
   const task = await taskStore.create({ title: 'boot me', description: 'd', acceptance_criteria: ['a'] });

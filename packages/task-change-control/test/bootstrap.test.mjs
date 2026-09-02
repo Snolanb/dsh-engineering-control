@@ -99,6 +99,20 @@ test('TASK_NOT_FOUND for nonexistent task; no Change is created', async (t) => {
   assert.equal(await ctx.changeControl.findByWorkItem(SYSTEM, 'no-such-task'), null);
 });
 
+test('service rejects blank taskId; linkTaskChange on a deleted task yields TASK_NOT_FOUND (not TypeError)', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'tcc-bootstrap-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const { ctx, taskStore } = await composeFresh(t, dir);
+  assert.throws(() => ctx.taskChangeControl.bootstrapTask('   '), (e) => e.code === 'INVALID_TASK_ID');
+  const task = await taskStore.create({ title: 'x' });
+  await ctx.taskChangeControl.bootstrapTask(task.id);
+  await taskStore.delete(task.id);
+  await assert.rejects(
+    ctx.taskChangeControl.linkTaskChange(task.id),
+    (e) => e.code === 'TASK_NOT_FOUND'
+  );
+});
+
 test('cross-boundary persistence: link survives full recomposition against the same files', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'tcc-bootstrap-'));
   t.after(() => rm(dir, { recursive: true, force: true }));

@@ -7,7 +7,7 @@
  * transitions don't append events.
  */
 // @ts-nocheck
-import { readFile, writeFile, rename, unlink } from 'node:fs/promises';
+import { readFile, writeFile, rename, unlink, mkdir, rmdir, stat } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { createChange, ChangeDomainError, TRANSITIONS, RISK_LEVELS } from '../domain/change.js';
 
@@ -54,6 +54,35 @@ function rotate(key) {
   if (!next) { lock.active = null; return; }
   lock.active = next;
   next(() => { rotate(key); });
+}
+
+/**
+ * Cross-process mutex for one store file, via atomic mkdir. Used ONLY on
+ * paths that must hold lookup+create atomicity across host processes (work
+ * item linkage). Process-local acquireLock stays the fast inner serializer.
+ */
+async function acquireDiskLock(file) {
+  const lockDir = canonicalPath(file) + '.linklock';
+  const deadline = Date.now() + 10000;
+  const staleMs = 30000;
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    try {
+      await mkdir(lockDir);
+      return async () => { await rmdir(lockDir).catch(() => {}); };
+    } catch (err) {
+      if (err?.code !== 'EEXIST') throw err;
+      // Reap a crashed-holder lock (lock dir older than staleMs).
+      try {
+        const st = await stat(lockDir);
+        if (Date.now() - st.mtimeMs > staleMs) await rmdir(lockDir);
+      } catch { /* lock re-acquired between check and reap */ }
+      if (Date.now() > deadline) {
+        throw Object.assign(new Error(`disk lock timeout for ${file}`), { code: 'DISK_LOCK_TIMEOUT' });
+      }
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  }
 }
 
 function readJson(file) {
@@ -599,9 +628,13 @@ export class ChangeStore {
 
   async create(input) {
     const release = await acquireLock(this.#file);
+    let releaseDisk = null;
     try {
       const workItem = validateWorkItem(input?.workItem);
       if (workItem) {
+        // Cross-process mutex: the lookup+persist window must be atomic even
+        // when two HOST PROCESSES share this store file.
+        releaseDisk = await acquireDiskLock(this.#file);
         // Enforce at-most-one nonterminal Change per workItem even via create();
         // refresh from disk first so a concurrent store instance is visible.
         await this.#refreshChange();
@@ -642,6 +675,7 @@ export class ChangeStore {
       await this.#persist();
       return freezeChange(change);
     } finally {
+      if (releaseDisk) await releaseDisk();
       release();
     }
   }
@@ -675,7 +709,11 @@ export class ChangeStore {
    */
   async findOrCreateForWorkItem(input) {
     const release = await acquireLock(this.#file);
+    // Disk-lock acquisition must be inside try: a timeout/error here must
+    // still release the process lock, or this instance's write queue wedges.
+    let releaseDisk = null;
     try {
+      releaseDisk = await acquireDiskLock(this.#file);
       const workItem = validateWorkItem(input?.workItem);
       if (!workItem) throw Object.assign(new Error('findOrCreateForWorkItem requires input.workItem'), { code: 'INVALID_WORK_ITEM' });
       // Refresh from disk under the lock before lookup+create so concurrent
@@ -708,6 +746,7 @@ export class ChangeStore {
       await this.#persist();
       return freezeChange(change);
     } finally {
+      if (releaseDisk) await releaseDisk();
       release();
     }
   }

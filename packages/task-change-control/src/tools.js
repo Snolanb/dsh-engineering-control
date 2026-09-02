@@ -17,7 +17,7 @@ export function createIntegrationTools(service) {
       parameters: { taskId: { type: 'string' } },
       output: out,
       execute: async (args) => {
-        if (typeof args?.taskId !== 'string' || !args.taskId) {
+        if (typeof args?.taskId !== 'string' || args.taskId.trim() === '') {
           throw Object.assign(new Error('taskId is required and must be a string'), { code: 'INVALID_TASK_ID' });
         }
         const change = await service.getChangeForTask(args.taskId);
@@ -30,7 +30,7 @@ export function createIntegrationTools(service) {
       parameters: { taskId: { type: 'string' } },
       output: out,
       execute: async (args) => {
-        if (typeof args?.taskId !== 'string' || !args.taskId) {
+        if (typeof args?.taskId !== 'string' || args.taskId.trim() === '') {
           throw Object.assign(new Error('taskId is required and must be a string'), { code: 'INVALID_TASK_ID' });
         }
         return service.bootstrapTask(args.taskId);

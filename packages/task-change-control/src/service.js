@@ -31,6 +31,13 @@ function unavailable(detail) {
 export function createTaskChangeControlService({ taskOrchestrator, changeControl }) {
   const requireTask = () => { const s = taskOrchestrator(); if (!s) throw unavailable('taskOrchestrator service not provided'); return s; };
   const requireChange = () => { const s = changeControl(); if (!s) throw unavailable('changeControl service not provided'); return s; };
+  /** @param {string} taskId */
+  const requireTaskId = (taskId) => {
+    if (typeof taskId !== 'string' || taskId.trim() === '') {
+      throw Object.assign(new Error('taskId is required and must be a non-blank string'), { code: 'INVALID_TASK_ID' });
+    }
+    return taskId;
+  };
 
   const api = {
     /**
@@ -41,6 +48,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
      * @returns {Promise<any | null>}
      */
     getChangeForTask(taskId) {
+      requireTaskId(taskId);
       const t = requireTask();
       const c = requireChange();
       void t; // task service presence still required: drone ops must not half-work
@@ -61,6 +69,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
      * @returns {Promise<{ taskId: string, changeId: string }>}
      */
     linkTaskChange(taskId) {
+      requireTaskId(taskId);
       const t = requireTask();
       const c = requireChange();
       return (async () => {
@@ -70,7 +79,12 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         }
         // Task Orchestrator service methods are synchronous (the facade
         // binds them directly); Promise.resolve normalizes either shape.
+        // get() returns null for a missing task — surface a structured error
+        // instead of dereferencing null mid-mutation.
         const task = await Promise.resolve(t.get(taskId));
+        if (!task) {
+          throw Object.assign(new Error(`task not found: ${taskId}`), { code: 'TASK_NOT_FOUND' });
+        }
         const metadata = { ...(task.metadata ?? {}), changeControl: { ...(task.metadata?.changeControl ?? {}), changeId: change.id } };
         await Promise.resolve(t.update(taskId, { metadata }));
         return { taskId, changeId: change.id };
@@ -86,11 +100,13 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
      * @returns {Promise<{ change: any, snapshot: object }>}
      */
     bootstrapTask(taskId) {
+      requireTaskId(taskId);
       const t = requireTask();
       const c = requireChange();
       return (async () => {
-        let task = null;
-        try { task = await Promise.resolve(t.get(taskId)); } catch { task = null; }
+        // get() returns null for a missing task; genuine accessor errors
+        // must propagate — never silently reclassified as TASK_NOT_FOUND.
+        const task = await Promise.resolve(t.get(taskId));
         if (!task) {
           throw Object.assign(new Error(`task not found: ${taskId}`), { code: 'TASK_NOT_FOUND' });
         }
