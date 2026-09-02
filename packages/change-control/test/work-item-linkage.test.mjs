@@ -100,6 +100,57 @@ test('legacy Changes without workItem remain fully valid and unlinked', async (t
   assert.equal((await store.get(legacy.id)).state, 'PLANNED');
 });
 
+test('cross-instance race: two stores opened BEFORE the link both converge on one Change', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'work-item-race-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, 'changes.json');
+  const s1 = await ChangeStore.open(file);
+  const s2 = await ChangeStore.open(file); // both instances pre-date any link
+  const [a, b] = await Promise.all([
+    s1.findOrCreateForWorkItem(input({ workItem: WORK_ITEM })),
+    s2.findOrCreateForWorkItem(input({ workItem: WORK_ITEM })),
+  ]);
+  assert.equal(a.id, b.id, 'cross-instance find-or-create must converge');
+  // And a fresh lookup on the STALE instance sees the link + terminal switch.
+  for (const s of ['PLANNED', 'READY', 'IMPLEMENTING', 'PREFLIGHT', 'REVIEW', 'APPROVED']) {
+    await s1.transition(a.id, s);
+  }
+  assert.equal(await s2.findByWorkItem(WORK_ITEM.system, WORK_ITEM.id), null, 'stale instance must see terminal state');
+});
+
+test('direct create() with workItem enforces nonterminal uniqueness', async (t) => {
+  const { store } = await fixture(t);
+  await store.create(input({ workItem: WORK_ITEM }));
+  await assert.rejects(
+    store.create(input({ workItem: WORK_ITEM })),
+    (e) => e.code === 'WORK_ITEM_ALREADY_LINKED' && typeof e.existingChangeId === 'string'
+  );
+  // Legacy path is unaffected: unlinked creates always allowed.
+  const free = await store.create(input());
+  assert.ok(free.id);
+});
+
+test('legacy pre-domainState replay tolerates WORK_ITEM_LINKED events missing from/to', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'work-item-replay-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, 'changes.json');
+  const { writeFile } = await import('node:fs/promises');
+  // First-iteration Phase-3 record: no domainState, linkage event without from/to.
+  const doc = {
+    changes: [{ id: 'c1', title: 'legacy', objective: '', acceptanceCriteria: [], risk: null, acceptedPlanId: null, workItem: WORK_ITEM, createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z' }],
+    audit: [
+      { eventId: 1, changeId: 'c1', from: null, to: 'DRAFT', ts: '2026-01-01T00:00:00.000Z' },
+      { eventId: 2, changeId: 'c1', type: 'WORK_ITEM_LINKED', workItem: WORK_ITEM, ts: '2026-01-01T00:00:00.000Z' },
+    ],
+  };
+  await writeFile(file, JSON.stringify(doc), 'utf8');
+  const store = await ChangeStore.open(file);
+  const c = await store.get('c1');
+  assert.equal(c.state, 'DRAFT');
+  assert.deepEqual(c.workItem, WORK_ITEM);
+  assert.equal((await store.findByWorkItem(WORK_ITEM.system, WORK_ITEM.id))?.id, 'c1');
+});
+
 test('service facade exposes findByWorkItem and findOrCreateForWorkItem', async (t) => {
   const { store } = await fixture(t);
   const svc = createChangeControlService(store);

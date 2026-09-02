@@ -43,13 +43,13 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
     getChangeForTask(taskId) {
       const t = requireTask();
       const c = requireChange();
+      void t; // task service presence still required: drone ops must not half-work
       return (async () => {
-        const byWorkItem = await c.findByWorkItem(WORK_ITEM_SYSTEM, taskId);
-        if (byWorkItem) return byWorkItem;
-        const task = await t.get(taskId).catch(() => null);
-        const hinted = task?.metadata?.changeControl?.changeId;
-        if (!hinted) return null;
-        return c.get(hinted).catch(() => null);
+        // Change-side workItem is the ONLY authoritative resolution. The task
+        // metadata projection is a denormalized cache, never a fallback: a
+        // stale or forged projection must not resolve to another task's
+        // Change (or resurrect a terminal one).
+        return c.findByWorkItem(WORK_ITEM_SYSTEM, taskId);
       })();
     },
 
@@ -68,9 +68,11 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         if (!change) {
           throw Object.assign(new Error(`no Change linked to task ${taskId}`), { code: 'TASK_NOT_LINKED' });
         }
-        const task = await t.get(taskId);
+        // Task Orchestrator service methods are synchronous (the facade
+        // binds them directly); Promise.resolve normalizes either shape.
+        const task = await Promise.resolve(t.get(taskId));
         const metadata = { ...(task.metadata ?? {}), changeControl: { ...(task.metadata?.changeControl ?? {}), changeId: change.id } };
-        await t.update(taskId, { metadata });
+        await Promise.resolve(t.update(taskId, { metadata }));
         return { taskId, changeId: change.id };
       })();
     },

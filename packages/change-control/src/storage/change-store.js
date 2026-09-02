@@ -142,7 +142,11 @@ function rehydrate(serialized, events) {
   // Normal path: replay only pure domain transitions (no planId).
   for (const e of events) {
     if (e.planId != null) continue;
-    if (e.from !== null) c.transitionTo(e.to);
+    // Replay only real state-transition events; typed audit events
+    // (e.g. WORK_ITEM_LINKED) and any record missing `from` are skipped.
+    if (e.type != null) continue;
+    if (e.from === null || e.from === undefined) continue;
+    c.transitionTo(e.to);
   }
   // Apply plan-lifecycle state override.
   if (serialized.planState) {
@@ -597,6 +601,19 @@ export class ChangeStore {
     const release = await acquireLock(this.#file);
     try {
       const workItem = validateWorkItem(input?.workItem);
+      if (workItem) {
+        // Enforce at-most-one nonterminal Change per workItem even via create();
+        // refresh from disk first so a concurrent store instance is visible.
+        await this.#refreshChange();
+        for (const c of this.#changes.values()) {
+          if (c.workItem && c.workItem.system === workItem.system && c.workItem.id === workItem.id && isNonterminal(c)) {
+            throw Object.assign(
+              new Error(`a nonterminal Change is already linked to ${workItem.system}:${workItem.id}`),
+              { code: 'WORK_ITEM_ALREADY_LINKED', existingChangeId: c.id },
+            );
+          }
+        }
+      }
       const change = createChange({ ...input, workItem });
       this.#changes.set(change.id, change);
       // Reseed from disk under lock immediately before assigning eventId,
@@ -614,6 +631,10 @@ export class ChangeStore {
           eventId: nextEventId(),
           changeId: change.id,
           type: 'WORK_ITEM_LINKED',
+          // Structurally identical to the creation event (non-transition):
+          // rehydrate only replays events with from !== null.
+          from: null,
+          to: 'DRAFT',
           workItem: { system: workItem.system, id: workItem.id },
           ts: change.createdAt,
         });
@@ -633,6 +654,9 @@ export class ChangeStore {
   async findByWorkItem(system, id) {
     const release = await acquireLock(this.#file);
     try {
+      // Refresh under the lock so links/terminations made by other store
+      // instances of the same store file are visible (no stale lookups).
+      await this.#refreshChange();
       for (const c of this.#changes.values()) {
         if (c.workItem && c.workItem.system === system && c.workItem.id === id && isNonterminal(c)) {
           return freezeChange(c);
@@ -654,6 +678,9 @@ export class ChangeStore {
     try {
       const workItem = validateWorkItem(input?.workItem);
       if (!workItem) throw Object.assign(new Error('findOrCreateForWorkItem requires input.workItem'), { code: 'INVALID_WORK_ITEM' });
+      // Refresh from disk under the lock before lookup+create so concurrent
+      // store instances on the same file cannot race to double-link.
+      await this.#refreshChange();
       for (const c of this.#changes.values()) {
         if (c.workItem && c.workItem.system === workItem.system && c.workItem.id === workItem.id && isNonterminal(c)) {
           return freezeChange(c);
@@ -673,6 +700,8 @@ export class ChangeStore {
         eventId: nextEventId(),
         changeId: change.id,
         type: 'WORK_ITEM_LINKED',
+        from: null,
+        to: 'DRAFT',
         workItem: { system: workItem.system, id: workItem.id },
         ts: change.createdAt,
       });

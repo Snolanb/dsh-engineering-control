@@ -67,6 +67,26 @@ test('AC3: Change-side workItem wins over a stale projection, which is repaired'
   assert.equal((await ctx.taskOrchestrator.get(task.id)).metadata.changeControl.changeId, canonical.id);
 });
 
+test('cross-task stale projection is NOT resolved (Change side alone is authority)', async (t) => {
+  const { ctx, taskStore } = await compose(t);
+  const taskA = await taskStore.create({ title: 'A' });
+  const taskB = await taskStore.create({ title: 'B' });
+  const changeB = await ctx.changeControl.findOrCreateForWorkItem({
+    system: SYSTEM, id: taskB.id, change: { title: 'for B', objective: 'o', acceptanceCriteria: [] },
+  });
+  // Forge task A's projection at task B's Change — must NOT resolve.
+  await ctx.taskOrchestrator.update(taskA.id, { metadata: { changeControl: { changeId: changeB.id } } });
+  assert.equal(await ctx.taskChangeControl.getChangeForTask(taskA.id), null);
+  assert.equal((await ctx.taskChangeControl.getChangeForTask(taskB.id))?.id, changeB.id);
+});
+
+test('unlinked/legacy task resolves to null without touching the synchronous TaskStore.path', async (t) => {
+  const { ctx, taskStore } = await compose(t);
+  const task = await taskStore.create({ title: 'unlinked' });
+  // Regression: t.get is SYNC; the old code called .catch on its plain-object return.
+  assert.equal(await ctx.taskChangeControl.getChangeForTask(task.id), null);
+});
+
 test('AC4: omits taskOrchestrator — ops report LINKAGE_UNAVAILABLE, no corruption', async (t) => {
   const { ctx } = await compose(t, { omitTask: true });
   assert.throws(() => ctx.taskChangeControl.linkTaskChange('task-x'), (e) => e.code === 'LINKAGE_UNAVAILABLE');
