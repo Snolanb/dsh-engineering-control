@@ -59,7 +59,7 @@ async function apply(ctx, config) {
   }
 
   // Initialize ChangeStore from config and register the narrow model-facing Change tools
-  const store = await registerChangeTools(ctx, config);
+  const { store, service } = await registerChangeTools(ctx, config);
 
   // Register host-side manual /change-* commands when the host exposes a
   // commands service (absent in tool-only compositions; the model-facing tools
@@ -72,7 +72,7 @@ async function apply(ctx, config) {
   try { commands = ctx.commands; } catch { commands = null; }
   let commandDisposers = [];
   if (commands) {
-    commandDisposers = registerChangeCommands(commands, store);
+    commandDisposers = registerChangeCommands(commands, service);
   }
 
   // Wire up the filesystem/tool policy pre-execute interceptor.

@@ -2,6 +2,7 @@
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import { ChangeService, AuthorizationError } from '../change-control.js';
 import { ChangeStore } from '../storage/change-store.js';
+import { createChangeControlService } from '../service/change-control-service.js';
 import { TRANSITIONS, ChangeDomainError, RISK_LEVELS } from '../domain/change.js';
 
 /**
@@ -220,13 +221,18 @@ export async function registerChangeTools(ctx, config) {
   // Preflight policy honors the established config.policy contract first;
   // the top-level preflightPolicy key is retained for legacy wiring.
   const preflightPolicy = config?.policy?.preflightPolicy ?? config?.preflightPolicy;
-  const store = await ChangeStore.open(storePath, { preflightPolicy });
-  ctx.provide('changeStore', store);
+  // config.store: optional injection seam for composed test fixtures that must
+  // share the plugin's single store instance. Production hosts omit it.
+  const store = config?.store ?? await ChangeStore.open(storePath, { preflightPolicy });
+  // The sole integration contract. ChangeStore itself is never provided:
+  // external packages integrate via ctx.changeControl only.
+  const service = createChangeControlService(store);
+  ctx.provide('changeControl', service);
   const tools = createChangeTools(store);
   const registry = ctx.tools;
   if (!registry?.register) throw new Error('tools.register not available');
   for (const tool of tools) registry.register(tool);
-  return store;
+  return { store, service };
 }
 
 // ─── Host-side manual Change commands (/change-*) ────────────────────────────
@@ -299,42 +305,15 @@ function defineHostCommand(name, description, hint, run, { sessionKeyAllowed = f
   };
 }
 
-/** Canonical status projection: state, risk, accepted plan, bindings, revision, proof, preflight, open findings. */
-async function changeStatusProjection(store, changeId) {
-  const change = await store.get(changeId);
-  const bindings = (await store.listRoleBindings()).filter((b) => b.changeId === changeId);
-  const attempts = await store.listAttempts(changeId);
-  const revision = attempts.length > 0 ? attempts[attempts.length - 1].revision ?? null : null;
-  const proof = await store.getProof(changeId).catch(() => null);
-  const preflight = await store.getPreflight(changeId).catch(() => null);
-  const acceptedPlan = change.acceptedPlanId ? await store.getPlan(change.acceptedPlanId).catch(() => null) : null;
-  let openFindings = [];
-  try {
-    // Canonical projection: whatever getRepairContext reports, no command-layer filtering.
-    openFindings = (await store.getRepairContext(changeId)).unresolvedFindings;
-  } catch { /* no reviews yet */ }
-  return {
-    id: change.id,
-    title: change.title,
-    objective: change.objective,
-    state: change.state,
-    risk: change.risk,
-    acceptedPlan,
-    bindings,
-    revision,
-    proof,
-    preflight,
-    openFindings,
-  };
-}
-
 /**
  * Register the eight manual Change commands on a host command registry.
+ * All Change operations delegate through the canonical changeControl service
+ * facade — host commands never touch ChangeStore directly.
  * Returns the registry-supplied disposers so the caller can release them on teardown.
  * @param {{register: (definition: object) => unknown}} registry ctx.commands
- * @param {import('../storage/change-store.js').ChangeStore} store
+ * @param {ReturnType<import('../service/change-control-service.js').createChangeControlService>} svc
  */
-export function registerChangeCommands(registry, store) {
+export function registerChangeCommands(registry, svc) {
   if (!registry || typeof registry.register !== 'function') {
     throw new Error('commands.register not available');
   }
@@ -344,42 +323,42 @@ export function registerChangeCommands(registry, store) {
         if (args.risk !== undefined && !RISK_LEVELS.includes(args.risk)) {
           throw Object.assign(new Error(`Invalid risk: ${args.risk}; expected one of ${RISK_LEVELS.join(', ')}`), { code: 'INVALID_RISK' });
         }
-        const change = await store.create({
+        const change = await svc.create({
           title: requireStringArg(args, 'title'),
           objective: requireStringArg(args, 'objective'),
           acceptanceCriteria: Array.isArray(args.acceptanceCriteria) ? args.acceptanceCriteria : [],
         });
         // Effective risk goes through the canonical host risk API so audit,
         // downgrade protection, and gate invalidation all apply.
-        return args.risk !== undefined ? store.setRisk(change.id, args.risk) : change;
+        return args.risk !== undefined ? svc.setRisk(change.id, args.risk) : change;
       }),
     defineHostCommand('change-status', 'Show canonical Change status projection', '{"changeId":"..."}',
-      async (args) => changeStatusProjection(store, requireStringArg(args, 'changeId'))),
+      async (args) => svc.status(requireStringArg(args, 'changeId'))),
     defineHostCommand('change-plan', 'Submit a plan revision for a Change', '{"changeId":"...","content":{}}',
       async (args) => {
         if (!args.content || typeof args.content !== 'object' || Array.isArray(args.content)) {
           throw Object.assign(new Error('content is required and must be an object'), { code: 'INVALID_CONTENT' });
         }
-        const plan = await store.submitPlan(requireStringArg(args, 'changeId'), args.content);
+        const plan = await svc.submitPlan(requireStringArg(args, 'changeId'), args.content);
         return { planId: plan.id, status: plan.status };
       }),
     defineHostCommand('change-approve-plan', 'Accept the current PLANNED plan revision', '{"changeId":"...","planId":"..."}',
-      async (args, actor) => store.acceptPlan(requireStringArg(args, 'changeId'), requireStringArg(args, 'planId'), { authorized: true, actor })),
+      async (args, actor) => svc.acceptPlan(requireStringArg(args, 'changeId'), requireStringArg(args, 'planId'), { authorized: true, actor })),
     defineHostCommand('change-bind', 'Bind a session to a role on a Change', '{"changeId":"...","sessionId":"...","role":"planner|worker|reviewer"}',
       async (args) => {
         const role = requireStringArg(args, 'role');
         if (!CANONICAL_ROLES.includes(role)) {
           throw Object.assign(new Error(`Invalid role: ${role}; expected one of ${CANONICAL_ROLES.join(', ')}`), { code: 'INVALID_ROLE' });
         }
-        return store.bindRole(requireStringArg(args, 'changeId'), requireStringArg(args, 'sessionId'), role);
+        return svc.bindRole(requireStringArg(args, 'changeId'), requireStringArg(args, 'sessionId'), role);
       }, { sessionKeyAllowed: true }),
     defineHostCommand('change-unbind', 'Remove a session role binding from a Change', '{"changeId":"...","sessionId":"..."}',
-      async (args, actor) => store.unbindRole(requireStringArg(args, 'changeId'), requireStringArg(args, 'sessionId'), { actor }),
+      async (args, actor) => svc.unbindRole(requireStringArg(args, 'changeId'), requireStringArg(args, 'sessionId'), { actor }),
       { sessionKeyAllowed: true }),
     defineHostCommand('change-history', 'Show the chronological audit history for a Change', '{"changeId":"..."}',
-      async (args) => store.history(requireStringArg(args, 'changeId'))),
+      async (args) => svc.history(requireStringArg(args, 'changeId'))),
     defineHostCommand('change-preflight', 'Run or retry canonical preflight for a Change', '{"changeId":"...","currentRevision":"...","changedFiles":[],"checkResults":[]}',
-      async (args) => store.runPreflight(requireStringArg(args, 'changeId'), {
+      async (args) => svc.runPreflight(requireStringArg(args, 'changeId'), {
         currentRevision: args.currentRevision,
         changedFiles: args.changedFiles,
         checkResults: args.checkResults,

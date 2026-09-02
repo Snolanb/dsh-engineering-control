@@ -18,8 +18,8 @@ async function fixture(t, policy = { enabled: true }) {
   const ctx = new Context();
   await ctx.plugin(SystemPrompt);
   await ctx.plugin(ToolRuntime);
-  await ctx.plugin({ name, apply, inject: ['tools'] }, { storePath: file, policy });
-  const store = ctx.get('changeStore');
+  const store = await ChangeStore.open(file, { preflightPolicy: policy?.preflightPolicy });
+  await ctx.plugin({ name, apply, inject: ['tools'] }, { store, storePath: file, policy });
   const change = await store.create(input);
   return { ctx, registry: ctx.get('tools'), store, change, file, dir };
 }
@@ -143,8 +143,8 @@ test('ambiguous multi-change binding denies when no changeId specified', async (
   const ctx = new Context();
   await ctx.plugin(SystemPrompt);
   await ctx.plugin(ToolRuntime);
-  await ctx.plugin({ name, apply, inject: ['tools'] }, { storePath: file, policy: { enabled: true } });
-  const store = ctx.get('changeStore');
+  const store = await ChangeStore.open(file);
+  await ctx.plugin({ name, apply, inject: ['tools'] }, { store, storePath: file, policy: { enabled: true } });
   const registry = ctx.get('tools');
   const changeA = await store.create(input);
   const changeB = await store.create(input);
@@ -167,8 +167,8 @@ test('binding lookup errors deny rather than allow', async (t) => {
   const ctx = new Context();
   await ctx.plugin(SystemPrompt);
   await ctx.plugin(ToolRuntime);
-  await ctx.plugin({ name, apply, inject: ['tools'] }, { storePath: file, policy: { enabled: true } });
-  const store = ctx.get('changeStore');
+  const store = await ChangeStore.open(file);
+  await ctx.plugin({ name, apply, inject: ['tools'] }, { store, storePath: file, policy: { enabled: true } });
   const registry = ctx.get('tools');
   const change = await store.create(input);
   await store.bindRole(change.id, 'err-session', 'worker');
@@ -203,8 +203,8 @@ test('listRoleBindings throw during policy evaluation denies rather than allow',
   const ctx = new Context();
   await ctx.plugin(SystemPrompt);
   await ctx.plugin(ToolRuntime);
-  await ctx.plugin({ name, apply, inject: ['tools'] }, { storePath: file, policy: { enabled: true } });
-  const store = ctx.get('changeStore');
+  const store = await ChangeStore.open(file);
+  await ctx.plugin({ name, apply, inject: ['tools'] }, { store, storePath: file, policy: { enabled: true } });
   const registry = ctx.get('tools');
   const change = await store.create(input);
   await store.bindRole(change.id, 'throw-session', 'worker');
@@ -231,8 +231,8 @@ test('store.get throw during policy evaluation denies rather than allow', async 
   const ctx = new Context();
   await ctx.plugin(SystemPrompt);
   await ctx.plugin(ToolRuntime);
-  await ctx.plugin({ name, apply, inject: ['tools'] }, { storePath: file, policy: { enabled: true } });
-  const store = ctx.get('changeStore');
+  const store = await ChangeStore.open(file);
+  await ctx.plugin({ name, apply, inject: ['tools'] }, { store, storePath: file, policy: { enabled: true } });
   const registry = ctx.get('tools');
   const change = await store.create(input);
   await store.bindRole(change.id, 'getthrow-session', 'worker');

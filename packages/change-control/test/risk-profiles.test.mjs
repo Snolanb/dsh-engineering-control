@@ -252,7 +252,9 @@ test('validates riskProfiles at plugin wiring and enforces them at the tool boun
   const ctx = new Context();
   await ctx.plugin(SystemPrompt);
   await ctx.plugin(ToolRuntime);
+  const store = await ChangeStore.open(join(dir, 'changes.json'));
   await ctx.plugin({ name, apply, inject: ['tools'] }, {
+    store,
     storePath: join(dir, 'changes.json'),
     policy: {
       enabled: true,
@@ -260,7 +262,6 @@ test('validates riskProfiles at plugin wiring and enforces them at the tool boun
       riskProfiles: { high: { requiredChecks: ['lint'] } },
     },
   });
-  const store = ctx.get('changeStore');
   const registry = ctx.get('tools');
   registry.register(defineTool({
     name: 'filesystem_write',

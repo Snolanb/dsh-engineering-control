@@ -407,8 +407,8 @@ test('rejects string repair and _legacy bypass', async () => {
     const ctx = new Context();
     await ctx.plugin(SystemPrompt);
     await ctx.plugin(ToolRuntime);
-    await ctx.plugin({ name, apply, inject: ['tools'] }, { storePath: file });
-    const store = ctx.get('changeStore');
+    const store = await ChangeStore.open(file);
+    await ctx.plugin({ name, apply, inject: ['tools'] }, { store, storePath: file });
     const registry = ctx.get('tools');
     const change = await store.create(input);
     await store.bindRole(change.id, 'worker-session', 'worker');
@@ -429,8 +429,8 @@ test('rejected repair leaves no phantom claims', async () => {
     const ctx = new Context();
     await ctx.plugin(SystemPrompt);
     await ctx.plugin(ToolRuntime);
-    await ctx.plugin({ name, apply, inject: ['tools'] }, { storePath: file });
-    const store = ctx.get('changeStore');
+    const store = await ChangeStore.open(file);
+    await ctx.plugin({ name, apply, inject: ['tools'] }, { store, storePath: file });
     const registry = ctx.get('tools');
     const change = await store.create(input);
     await store.bindRole(change.id, 'worker-session', 'worker');
@@ -489,8 +489,8 @@ test('repair denied without accepted plan - strict authorization', async () => {
     const ctx = new Context();
     await ctx.plugin(SystemPrompt);
     await ctx.plugin(ToolRuntime);
-    await ctx.plugin({ name, apply, inject: ['tools'] }, { storePath: file });
-    const store = ctx.get('changeStore');
+    const store = await ChangeStore.open(file);
+    await ctx.plugin({ name, apply, inject: ['tools'] }, { store, storePath: file });
     const registry = ctx.get('tools');
     const change = await store.create(input);
     await store.bindRole(change.id, 'worker-session', 'worker');

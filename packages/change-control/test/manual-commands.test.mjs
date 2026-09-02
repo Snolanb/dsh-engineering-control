@@ -32,11 +32,14 @@ async function fixture(fn) {
     await ctx.plugin(SystemPrompt);
     await ctx.plugin(ToolRuntime);
     ctx.provide('commands', registry);
+    const store = await ChangeStore.open(join(dir, 'changes.json'), {
+      preflightPolicy: { requiredChecks: ['tests'], protectedPaths: [] },
+    });
     await ctx.plugin({ name, apply, inject: ['tools'] }, {
+      store,
       storePath: join(dir, 'changes.json'),
       preflightPolicy: { requiredChecks: ['tests'], protectedPaths: [] },
     });
-    const store = ctx.get('changeStore');
     await fn({ registry, store });
   } finally {
     await rm(dir, { recursive: true, force: true });
