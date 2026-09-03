@@ -1289,14 +1289,30 @@ export class ChangeStore {
    * @param {Array} proof.controllerPreflight
    * @returns {{state: string, proof: object}}
    */
-  async submitProof(changeId, proof) {
+  async submitProof(changeId, proof, expected = {}) {
     const release = await acquireLock(this.#file);
     try {
       await this.#refreshChange(changeId);
+      await this.#refreshBindingsAndAttempts();
       const c = this.#changes.get(changeId);
       if (!c) throw Object.assign(new Error(`Change ${changeId} not found`), { code: 'NOT_FOUND' });
       if (c.state !== 'IMPLEMENTING') {
         throw Object.assign(new Error(`Cannot submit proof: change is in ${c.state}, expected IMPLEMENTING`), { code: 'INVALID_STATE' });
+      }
+      // Optional atomic binding assertion (TOCTOU closure): under THIS lock,
+      // verify the sessionId is still bound as worker with the expected run
+      // identity — any rebind attempt would be queued and observed here.
+      if (expected.sessionId !== undefined || expected.expectedWorker !== undefined) {
+        const binding = (this.#bindings.get(changeId) ?? []).find((b) => b.sessionId === expected.sessionId);
+        if (!binding || binding.role !== 'worker') {
+          throw Object.assign(new Error(`session ${expected.sessionId} is not bound as worker`), { code: 'SESSION_NOT_BOUND' });
+        }
+        if (binding.worker !== expected.expectedWorker) {
+          throw Object.assign(
+            new Error(`session ${expected.sessionId} bound to worker ${binding.worker}, expected ${expected.expectedWorker}`),
+            { code: 'SESSION_WORKER_MISMATCH' },
+          );
+        }
       }
 
       // ── Validate proof structure ──────────────────────────────────────

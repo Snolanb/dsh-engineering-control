@@ -63,7 +63,7 @@ export function createChangeControlService(store) {
     getBinding: (changeId, sessionId) => store.getBinding(changeId, sessionId),
 
     /** Submit a proof bundle (IMPLEMENTING → PREFLIGHT). */
-    submitProof: (changeId, proof) => store.submitProof(changeId, proof),
+    submitProof: (changeId, proof, expected) => store.submitProof(changeId, proof, expected),
 
     /** Run deterministic controller preflight. */
     runPreflight: (changeId, input) => store.runPreflight(changeId, input),

@@ -25,7 +25,7 @@ function unavailable(detail) {
 /**
  * Minimal typed views of the two domain services this package depends on.
  * @typedef {{ get: (id: string) => any, update: (id: string, patch: any) => Promise<any>, complete?: (id: string, result: object, options?: any) => any, createDispatcher: (options?: any) => any, createWorkerLauncher?: (options?: any) => any }} TaskOrchestratorApi
- * @typedef {{ get: (id: string) => Promise<any>, findByWorkItem: (system: string, id: string) => Promise<any>, findOrCreateForWorkItem: (input: { system: string, id: string, change: object }) => Promise<any>, resolveRole: (changeId: string, sessionId: string) => Promise<string>, getBinding: (changeId: string, sessionId: string) => Promise<any>, status: (changeId: string) => Promise<any>, submitProof: (changeId: string, proof: any) => Promise<any>, transition: (changeId: string, toState: string, opts?: any) => Promise<any> }} ChangeControlApi
+ * @typedef {{ get: (id: string) => Promise<any>, findByWorkItem: (system: string, id: string) => Promise<any>, findOrCreateForWorkItem: (input: { system: string, id: string, change: object }) => Promise<any>, resolveRole: (changeId: string, sessionId: string) => Promise<string>, getBinding: (changeId: string, sessionId: string) => Promise<any>, status: (changeId: string) => Promise<any>, submitProof: (changeId: string, proof: any, expected?: { sessionId?: string, expectedWorker?: string }) => Promise<any>, transition: (changeId: string, toState: string, opts?: any) => Promise<any> }} ChangeControlApi
  * @param {object} deps
  * @param {() => TaskOrchestratorApi | undefined} deps.taskOrchestrator accessor (may be absent)
  * @param {() => ChangeControlApi | undefined} deps.changeControl accessor (may be absent)
@@ -299,6 +299,14 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
               { code: 'PROOF_FIELD_INVALID', field: key, got: value === null ? 'null' : typeof value },
             );
           }
+          for (const entry of value) {
+            if (typeof entry !== 'string') {
+              throw Object.assign(
+                new Error(`proof.${key}[*] must be strings`),
+                { code: 'PROOF_FIELD_INVALID', field: key, got: typeof entry },
+              );
+            }
+          }
         }
         const commitSha = proof.commit_sha;
         if (typeof commitSha !== 'string' || commitSha.trim() === '') {
@@ -330,7 +338,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         // any mismatch means the prior submission persisted a stale proof.
         const change = await c.get(changed.id);
         if (change.state === 'IMPLEMENTING') {
-          await c.submitProof(changed.id, { ...proof, sessionId });
+          await c.submitProof(changed.id, { ...proof, sessionId }, { sessionId, expectedWorker: worker });
         } else if (change.state === 'PREFLIGHT') {
           const statusSnapshot = await c.status(changed.id).catch(() => null);
           const existing = statusSnapshot && statusSnapshot.proof ? statusSnapshot.proof : null;
