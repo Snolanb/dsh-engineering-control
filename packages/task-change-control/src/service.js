@@ -519,17 +519,22 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         // ── Phase 2: repairs (only when no manual findings).
         if (manualIntervention.length > 0) return { repairs, manualIntervention };
 
-        // R0 linkage / projection repair (metadata same-source-of-truth).
-        if (linkage && linkage !== change.id) {
-          const meta = { ...(task.metadata ?? {}), changeControl: { ...(task.metadata?.changeControl ?? {}), changeId: change.id } };
+        // R0 linkage / projection repair — runs for ANY task whose stored
+        // metadata.details.changeControl.changeId does not match the
+        // Change-side workItem (including missing/null metadata); the
+        // integration task owns this pointer.
+        if (linkage !== change.id) {
           const patched = t.updateIf(
             taskId,
             { metadata_change_id: linkage },
-            { metadata: meta },
+            { metadata: (/** @type {any} */ liveMeta) => ({
+                ...(liveMeta && typeof liveMeta === 'object' ? liveMeta : {}),
+                changeControl: { ...(liveMeta?.changeControl ?? {}), changeId: change.id },
+              }) },
           );
           if (patched) {
             await c.appendAudit({ kind: 'reconciliation', changeId: change.id, action: 'projection_linkage', previousChangeId: linkage });
-            repairs.push({ kind: 'projection_linkage', previousChangeId: linkage });
+            repairs.push({ kind: 'projection_linkage', previousChangeId: linkage, correctedTo: change.id });
           }
         }
 

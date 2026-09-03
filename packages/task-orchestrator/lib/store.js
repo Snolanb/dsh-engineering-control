@@ -1007,7 +1007,17 @@ export class TaskStore {
       if (patch.tests_run !== undefined) add('tests_run', jsonText(patch.tests_run ?? [], [], 'tests_run'))
       if (patch.remaining_blockers !== undefined) add('remaining_blockers', jsonText(patch.remaining_blockers ?? [], [], 'remaining_blockers'))
       if (patch.result_summary !== undefined) add('result_summary', optionalString(patch.result_summary, 'result_summary'))
-      if (patch.metadata !== undefined) add('metadata', jsonText(patch.metadata ?? {}, {}, 'metadata'))
+      if (patch.metadata !== undefined) {
+        if (typeof patch.metadata === 'function') {
+          // Reactive merge: caller gets the FRESH row's metadata — atomic
+          // regardless of how much the caller's own snapshot has drifted.
+          const base = row.metadata ? JSON.parse(row.metadata) : {}
+          const merged = patch.metadata(base)
+          add('metadata', jsonText(merged ?? {}, {}, 'metadata'))
+        } else {
+          add('metadata', jsonText(patch.metadata ?? {}, {}, 'metadata'))
+        }
+      }
       if (patch.completed_at !== undefined) {
         if (patch.completed_at === null) { setters.push('completed_at = NULL'); }
         else add('completed_at', Number(patch.completed_at))
