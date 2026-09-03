@@ -201,7 +201,7 @@ export function createFilesystemPolicy(store, config) {
     // governance modes map; the default is 'off' (fully backward compatible).
     // Runs BEFORE the unidentifiable-session early return — a missing
     // agent identity is exactly the case where mandatory mode matters.
-    const mgDecision = await evaluateMandatoryGovernance(store, exec, agentId);
+    const mgDecision = await evaluateMandatoryGovernance(store, exec, agentId, isReadOnlyToolName);
     if (mgDecision) return mgDecision;
     // Mandatory gate approved this required-mode call (all preconditions
     // already verified there) — legacy policy must not re-litigate.
@@ -568,6 +568,10 @@ async function auditDenial(store, changeId, exec, sessionId, role, state, reason
  */
 const READ_ONLY_TOOL_NAMES = new Set([
   'read', 'grep', 'glob', 'ls', 'cat', 'head', 'tail', 'find', 'search',
+  // Read-only change-control / task-orchestrator surface (Phase 9 catalogue):
+  'change_get', 'task_get', 'task_list', 'project_get', 'project_list',
+  'milestone_get', 'milestone_list', 'task_events', 'task_list_links',
+  'task_ready_to_run', 'task_board_list',
 ]);
 
 function makeReadOnlyClassifier(extraNames) {
@@ -629,9 +633,9 @@ const isReadOnlyToolByDefault = makeReadOnlyClassifier(null);
  * The 'optional' mode is informational: nothing is denied, nothing is
  * required (today).
  */
-async function evaluateMandatoryGovernance(store, exec, agentId) {
+async function evaluateMandatoryGovernance(store, exec, agentId, isReadOnlyToolName = isReadOnlyToolByDefault) {
   // Read-only tools are NEVER gated by mandatory mode (AC of T9.1).
-  if (isReadOnlyToolByDefault(exec?.name)) return null;
+  if (isReadOnlyToolName(exec?.name)) return null;
   // Store API predating T9.1 (legacy test fixtures / compositional callers
   // holding a pre-T9.1 store): mandatory governance is not enforceable.
   if (typeof store.getGovernanceMode !== 'function') return null;

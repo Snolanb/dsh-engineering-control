@@ -279,3 +279,12 @@ test('F7 (luna): two ChangeStore instances writing DISJOINT governance keys merg
   assert.equal(await fresh.getGovernanceMode({ projectId: 'proj-p' }), 'required');
   assert.equal(await fresh.getGovernanceMode({ projectId: 'proj-q' }), 'required');
 });
+
+test('F-final: host-config readOnlyToolNames extends the read-only allow-list', async (t) => {
+  const { ctx, registry } = await compose(t, { registerProvider: 'none', policy: { enabled: true, owner: 'host', projectId: 'proj-A', readOnlyToolNames: ['task_get'] } });
+  registerFakeTools(registry);
+  await ctx.changeControl.setGovernanceMode({ projectId: 'proj-A', mode: 'required' });
+  registry.register(defineTool({ name: 'task_get', description: 't', parameters: { data: { type: 'string' } }, output: { schema:{ type:'object', additionalProperties:true }, render: (_a,v)=>v }, execute: async () => ({ content: [{ type: 'text', text: 'GOT' }] }) }));
+  const out = await execTool(registry, 'task_get', 'sess-any', { projectId: 'proj-A' });
+  assert.match(asText(out), /GOT/, 'configured extra read must pass');
+});
