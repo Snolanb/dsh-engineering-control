@@ -65,6 +65,9 @@ export function createChangeControlService(store) {
     /** Synchronous live view of binding state. */
     getBindingSync: (changeId, sessionId) => store.getBindingSync(changeId, sessionId),
 
+    /** Sync fresh (disk) binding read — catches concurrent cross-store mutations. */
+    getBindingFromDisk: (changeId, sessionId) => store.getBindingFromDisk(changeId, sessionId),
+
     /** Submit a proof bundle (IMPLEMENTING → PREFLIGHT). */
     submitProof: (changeId, proof, expected) => store.submitProof(changeId, proof, expected),
 

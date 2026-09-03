@@ -8,6 +8,7 @@
  */
 // @ts-nocheck
 import { readFile, writeFile, rename, unlink, mkdir, rmdir, stat } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { createChange, ChangeDomainError, TRANSITIONS, RISK_LEVELS } from '../domain/change.js';
 
@@ -1126,6 +1127,25 @@ export class ChangeStore {
   getBindingSync(changeId, sessionId) {
     const entry = (this.#bindings.get(changeId) ?? []).find((b) => b.sessionId === sessionId) ?? null;
     return entry ? structuredClone(entry) : null;
+  }
+
+  /**
+   * Synchronous FRESH binding read from disk — catches mutations by other
+   * ChangeStore instances (the #bindings-in-memory view lags disk).
+   * Returns null if the underlying file vanishes; callers must treat null
+   * as failure (fail-closed).
+   */
+  getBindingFromDisk(changeId, sessionId) {
+    try {
+      const raw = readFileSync(this.#file, 'utf8');
+      const data = JSON.parse(raw);
+      const entry = (Array.isArray(data.bindings) ? data.bindings : []).find(
+        (b) => b.changeId === changeId && b.sessionId === sessionId,
+      ) ?? null;
+      return entry;
+    } catch {
+      return null;
+    }
   }
 
   async resolveRole(changeId, sessionId) {
