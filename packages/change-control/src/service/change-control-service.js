@@ -134,5 +134,6 @@ async function statusProjection(store, changeId) {
     proof,
     preflight,
     openFindings,
+    attempts,
   };
 }

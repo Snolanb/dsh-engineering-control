@@ -653,6 +653,7 @@ export class ChangeStore {
       // Reseed from disk under lock immediately before assigning eventId,
       // so concurrent process writes are visible and no collision occurs.
       await reseedFromDisk(this.#file);
+
       this.#audit.push({
         eventId: nextEventId(),
         changeId: change.id,
@@ -1431,6 +1432,12 @@ export class ChangeStore {
       const before = c.state;
       c.transitionTo('PREFLIGHT');
 
+      // Record the worker's implementation attempt. Reviewer-independence
+      // (submitReview) reads the attempt list, so a review can never be
+      // submitted for a change that never had a worker-run.
+
+
+
       await reseedFromDisk(this.#file);
       this.#audit.push({
         eventId: nextEventId(),
@@ -1439,6 +1446,25 @@ export class ChangeStore {
         to: 'PREFLIGHT',
         ts: c.updatedAt,
       });
+
+      // Worker implementation attempt (kept UNDER in-memory after reseed).
+      // we record BOTH the worker profile (workerId) AND the bound session
+      // so submitReview's REVIEWER_NOT_INDEPENDENT check is keyed on the
+      // session namespace — the profile alone would never match.
+      {
+        const attempts200 = this.#attempts.get(changeId) ?? [];
+        const workerBinding501 = (this.#bindings.get(changeId) ?? []).find((b) => b.role === 'worker' && (expected.sessionId ? b.sessionId === expected.sessionId : true));
+        attempts200.push({
+          changeId,
+          attemptId: `${changeId}:${proof.commit_sha ?? 'unknown'}:${proof.afterRevision ?? 'unknown'}`,
+          workerId: workerBinding501?.worker ?? expected.sessionId ?? 'unknown',
+          sessionId: expected.sessionId ?? workerBinding501?.sessionId ?? null,
+          status: 'proof_submitted',
+          revision: proof.afterRevision ?? null,
+          recordedAt: new Date().toISOString(),
+        });
+        this.#attempts.set(changeId, attempts200);
+      }
 
       // Store proof
       this.#proofs.set(changeId, structuredClone(proof));
@@ -1812,7 +1838,7 @@ export class ChangeStore {
 
       // Reject if reviewer session appears as workerId in any recorded attempt (self-review)
       const attempts = this.#attempts.get(changeId) ?? [];
-      if (attempts.some((a) => a.workerId === sessionId)) {
+      if (attempts.some((a) => a.sessionId === sessionId || a.workerId === sessionId)) {
         throw Object.assign(new Error(`Session ${sessionId} has recorded implementation attempts on this change`), { code: 'REVIEWER_NOT_INDEPENDENT' });
       }
 
@@ -2176,6 +2202,7 @@ export class ChangeStore {
       const before = c.state;
       c.transitionTo('PREFLIGHT');
 
+
       await reseedFromDisk(this.#file);
       this.#audit.push({
         eventId: nextEventId(),
@@ -2184,6 +2211,25 @@ export class ChangeStore {
         to: 'PREFLIGHT',
         ts: c.updatedAt,
       });
+
+      // Worker implementation attempt: a repair is a fresh implementation
+      // round — revision is the new afterRevision, and we persist BOTH the
+      // worker profile and the bound session so reviewer independence can
+      // check sessionId namespaces at submitReview time.
+      {
+        const attempts300 = this.#attempts.get(changeId) ?? [];
+        const workerBindingRightNow = (this.#bindings.get(changeId) ?? []).find((b) => b.role === 'worker');
+        attempts300.push({
+          changeId,
+          attemptId: `${changeId}:repair:${repair.proof.afterRevision ?? 'unknown'}`,
+          workerId: workerBindingRightNow?.worker ?? 'unknown',
+          sessionId: workerBindingRightNow?.sessionId ?? null,
+          status: 'repair_submitted',
+          revision: repair.proof.afterRevision ?? null,
+          recordedAt: new Date().toISOString(),
+        });
+        this.#attempts.set(changeId, attempts300);
+      }
 
       await this.#persist();
 
