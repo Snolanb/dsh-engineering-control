@@ -484,7 +484,21 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         if (['in_review', 'done', 'cancelled', 'failed'].includes(task.status)) {
           for (const b of bindings) {
             if (b.role !== 'worker') continue;
-            try { await c.unbindRole(change.id, b.sessionId, { actor: 'reconciliation' }); } catch { /* racing unbind */ }
+            try {
+              await c.unbindRole(change.id, b.sessionId, { actor: 'reconciliation' });
+            } catch (/** @type {any} */ error) {
+              // Race-safe concurrency: unbind-by-other-party between the
+              // snapshot and our repair just pretends success to us; we check
+              // the post-condition before recording the audit.
+              const still = await c.getBinding(change.id, b.sessionId).catch(() => null);
+              if (still !== null) {
+                manualIntervention.push({
+                  issue: 'UNBIND_FAILED', taskId,
+                  detail: error?.message ?? String(error),
+                });
+                return { repairs, manualIntervention };
+              }
+            }
             await c.appendAudit({ kind: 'reconciliation', changeId: change.id, sessionId: b.sessionId, action: 'orphan_binding_unbound' });
             repairs.push({ kind: 'orphan_binding_unbound', sessionId: b.sessionId });
           }
