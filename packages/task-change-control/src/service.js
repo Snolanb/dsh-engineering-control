@@ -6,6 +6,7 @@
  * No TaskStore/ChangeStore imports here — only the two Cordis services.
  */
 import { createGovernanceGuard } from './governance.js';
+import { createBindingLauncher } from './binding.js';
 
 /** The task-orchestrator identity on the Change-side workItem. */
 export const WORK_ITEM_SYSTEM = 'dsh-task-orchestrator';
@@ -156,8 +157,20 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
       // Governance is not replaceable: a caller-supplied preDispatch COMPOSES
       // after the integration guard — the governed-check can never be bypassed.
       const userGuard = options.preDispatch;
+      // T6.1: ALWAYS wrap the launcher with the binding hook. The wrapper
+      // binds the returned sessionId ('worker' role) on successful launch and
+      // unbinds on finally-after-wait AND terminate — even if the caller
+      // passes their own launcher (they get a wrapped one, behavior visible
+      // in audit, not in spec).
+      // T6.1: when a launcher is supplied, wrap it with the binding hook:
+      // bind the returned sessionId ('worker' role) on launch, unbind on
+      // wait-settle AND terminate. When the caller delegates launch to the
+      // domain default (no launcher passed), standalone semantics stay
+      // byte-identical — binding wiring for the default launcher lives with
+      // the host that configures it.
       return t.createDispatcher({
         ...options,
+        ...(options.launcher ? { launcher: createBindingLauncher(options.launcher, c, WORK_ITEM_SYSTEM) } : {}),
         preDispatch: userGuard
           ? async (/** @type {any} */ input) => {
               const mandatory = await integrationGuard(input);
