@@ -429,7 +429,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
      *   - manualIntervention: entries the integration won't touch
      * Every repair also lands an audit record on the Change-side store.
      */
-    reconcileTaskChange(/** @type {string} */ taskId, /** @type {any} */ options = {}) {
+    reconcileTaskChange(/** @type {string} */ taskId) {
       const t = requireTask();
       const c = requireChange();
       return (async () => {
@@ -447,18 +447,50 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
           });
           return { repairs, manualIntervention };
         }
-        const change = nonTerminal[0] ?? null;
+        // Terminal Changes linked to a TERMINAL task still qualify for R1
+        // orphan binding cleanup (they are no longer the active drift target,
+        // but their bindings can outlive the run).
+        const change = nonTerminal[0] ?? allChanges[0] ?? null;
         if (!change) return { repairs, manualIntervention };
 
         const status = await c.status(change.id);
         const proof = status.proof ?? null;
         const bindings = (await c.listRoleBindings()).filter((/** @type {any} */ b) => b.changeId === change.id);
-        const now = Number(options.simulatedExpiryAt ?? Date.now());
+        const now = Date.now();
+
+        // (R0) Linkage/projection repair: the task's metadata.changeControl
+        // pointer, if present, must agree with the authoritative Change-side
+        // workItem. Correction happens with an audit record.
+        const linkage = task?.metadata && task.metadata.changeControl && task.metadata.changeControl.changeId;
+        if (linkage && linkage !== change.id) {
+          const metadata = typeof task.metadata === 'object' && task.metadata ? { ...task.metadata } : {};
+          metadata.changeControl = { ...(task.metadata.changeControl ?? {}), changeId: change.id };
+          await Promise.resolve(t.update(taskId, { metadata }));
+          await c.appendAudit({ kind: 'reconciliation', changeId: change.id, action: 'projection_linkage_corrected', previousChangeId: linkage });
+          repairs.push({ kind: 'projection_linkage', previousChangeId: linkage, correctedTo: change.id });
+        }
+
+        // (R0') Lifecycle/pairing mismatches and result-vs-proof gaps are
+        // MANUAL findings — a driver should NOT act on them; reconcile only
+        // reports. Both facts are computed BEFORE any mutation.
+        if (task.status === 'running' && ['DRAFT', 'PLANNED', 'READY'].includes(change.state)) {
+          manualIntervention.push({
+            issue: 'LIFECYCLE_MISMATCH', taskId, detail: `task running with Change in ${change.state}`,
+          });
+        }
+        if (task.status === 'in_review' && ['DRAFT', 'READY', 'PLANNED'].includes(change.state)
+          && (task.result_summary || task.commit_sha || (task.files_changed ?? []).length)) {
+          manualIntervention.push({
+            issue: 'TASK_RESULT_WITHOUT_PROOF', taskId,
+            detail: 'task carries completion result while the linked Change has not been driven to PREFLIGHT',
+          });
+        }
 
         // (R1) Orphaned bindings: task is in a terminal state but still has
         // a session bound as worker → release + audit.
         if (['in_review', 'done', 'cancelled', 'failed'].includes(task.status)) {
           for (const binding of bindings) {
+            if (binding.role !== 'worker') continue; // reviewer host bindings are owner-fenced
             await c.unbindRole(change.id, binding.sessionId, { actor: 'reconciliation' });
             await c.appendAudit({
               kind: 'reconciliation',
@@ -473,7 +505,32 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         // (R2) Half-completed governed completion: Change is PREFLIGHT but
         // task is still claimed/running with a dead lease.
         if (change.state === 'PREFLIGHT' && (task.status === 'claimed' || task.status === 'running')
-          && Number(task.lease_expires_at ?? 0) <= now && proof) {
+          && Number(task.lease_expires_at ?? 0) <= now) {
+          if (!proof || typeof proof.commit_sha !== 'string') {
+            manualIntervention.push({
+              issue: 'HALF_COMPLETION_PROOF_INCOMPLETE',
+              taskId, detail: 'Change is PREFLIGHT but proof has no required alignment fields',
+            });
+          } else if (!proof.files_changed || !Array.isArray(proof.files_changed)) {
+            manualIntervention.push({
+              issue: 'HALF_COMPLETION_PROOF_MALFORMED',
+              taskId, detail: 'proof.files_changed wrong shape',
+            });
+          } else {
+          // TOCTOU guard: the lease may have been re-claimed by another
+          // worker during the Change-side awaits above. Re-read atomically
+          // and bail rather than clobber their claim.
+          const finalTask = await Promise.resolve(t.get(taskId));
+          if (!finalTask
+            || finalTask.status !== task.status
+            || finalTask.claimed_by !== task.claimed_by
+            || Number(finalTask.lease_expires_at ?? 0) !== Number(task.lease_expires_at ?? 0)) {
+            manualIntervention.push({
+              issue: 'RECONCILE_RACE', taskId,
+              detail: `task claim changed mid-reconciliation; skipping repair`,
+            });
+            return { repairs, manualIntervention };
+          }
           await Promise.resolve(t.update(taskId, {
             status: 'in_review',
             commit_sha: proof.commit_sha,
@@ -484,6 +541,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
           }));
           await c.appendAudit({ kind: 'reconciliation', changeId: change.id, action: 'half_completion_converged' });
           repairs.push({ kind: 'half_completion_converged' });
+          }
         }
 
         // (R3) Projection mismatch on completed tasks: task fields disagree
