@@ -992,7 +992,15 @@ export class TaskStore {
       const add = (name, value) => { setters.push(name + ' = ?'); params.push(value); changes[name] = value }
       if (patch.status !== undefined) {
         validateTransition(row.status, patch.status)
-        if (patch.status !== row.status) add('status', patch.status)
+        if (patch.status !== row.status) {
+          add('status', patch.status)
+          if (['claimed', 'running'].includes(row.status) && !['claimed', 'running'].includes(patch.status)) {
+            setters.push('claimed_by = NULL', 'claimed_at = NULL', 'lease_expires_at = NULL')
+            changes.claimed_by = null
+            changes.claimed_at = null
+            changes.lease_expires_at = null
+          }
+        }
       }
       if (patch.commit_sha !== undefined) add('commit_sha', optionalString(patch.commit_sha, 'commit_sha'))
       if (patch.files_changed !== undefined) add('files_changed', jsonText(patch.files_changed ?? [], [], 'files_changed'))
