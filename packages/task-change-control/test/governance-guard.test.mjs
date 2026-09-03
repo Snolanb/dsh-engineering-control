@@ -101,6 +101,7 @@ test('non-{ok:true} verdict (undefined/null/false) fails closed at the dispatche
     new (class { constructor() { this.ok = true; } })(),                  // custom prototype
     Object.freeze({ ok: false }),                                         // frozen false
     getterVerdict,                                                        // throwing ok getter
+    (() => { const f = () => {}; f.ok = true; return f; })(),             // function with own ok
   ];
   // Null-prototype {ok:true} is a LEGITIMATE plain object and must pass.
   {

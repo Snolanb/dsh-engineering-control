@@ -218,28 +218,40 @@ export class WorkerDispatcher {
         // or PROTOTYPE-inherited keys, and ok !== true all reject.
         // The guard may hand back ANY value — including a throwing Proxy. All
         // inspection stays in a try/catch and failure to validate = reject.
-        // Move the shape judgement + normalization INSIDE one try/catch so a
-        // throwing-proxy can never escape with the claim still held.
-        let normalized = null
+        // Move the shape judgement INSIDE one try/catch; NEVER retain the
+        // caller-provided verdict afterwards (a dynamic Proxy can change its
+        // answers between reads). The only thing that leaves the try is a 1-bit
+        // boolean decision + one immutable plain-object payload.
+        let approved = false
+        let finalVerdict = null
         try {
-          const proto = verdict === null || typeof verdict !== 'object' ? null : Object.getPrototypeOf(verdict)
-          const isPlain = (proto === Object.prototype || proto === null) && verdict.ok === true
-          if (isPlain && Reflect.ownKeys(verdict).length === 1 && Reflect.ownKeys(verdict)[0] === 'ok') {
-            normalized = { ok: true } // exact shape; ok:true; only key 'ok'
-          } else if (verdict !== null && typeof verdict === 'object' && verdict.ok === false
-            && (proto === Object.prototype || proto === null)) {
-            normalized = verdict // structured failure — plain object the guard crafted
+          const proto = typeof verdict !== 'object' || verdict === null ? null : Object.getPrototypeOf(verdict)
+          const isPlain = verdict !== null && typeof verdict === 'object' && (proto === Object.prototype || proto === null)
+          const soleOk = isPlain && Reflect.ownKeys(verdict).length === 1 && Reflect.ownKeys(verdict)[0] === 'ok'
+          if (soleOk && verdict.ok === true) {
+            approved = true
+            finalVerdict = { ok: true }
+          } else if (isPlain && verdict.ok === false) {
+            // Structured plain-object failure: copy (never retain) so later
+            // re-evaluation cannot flip.
+            approved = false
+            finalVerdict = { ok: false, code: verdict.code ?? 'GUARD_REJECTED' }
+            for (const k of ['preconditions', 'changeId', 'detail', 'error']) {
+              const v = verdict[k]
+              if (v !== undefined) finalVerdict[k] = v
+            }
           } else {
-            normalized = { ok: false, code: 'GUARD_REJECTED', detail: verdict ?? null }
+            approved = false
+            finalVerdict = { ok: false, code: 'GUARD_REJECTED', detail: typeof verdict === 'object' && verdict !== null ? null : verdict }
           }
         } catch {
-          normalized = { ok: false, code: 'GUARD_REJECTED', detail: null }
+          approved = false
+          finalVerdict = { ok: false, code: 'GUARD_REJECTED', detail: null }
         }
-        if (normalized.ok !== true) {
-          verdict = normalized
+        if (!approved) {
           const restored = this.releaseOrRevert(task.id, worker)
           return {
-            dispatched: false, reason: 'dispatch_not_governed', predispatch: verdict,
+            dispatched: false, reason: 'dispatch_not_governed', predispatch: finalVerdict,
             claim_cleanup: restored, task: this.store.get(task.id), run_id: runId, worker,
           }
         }
