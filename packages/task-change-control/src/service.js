@@ -471,10 +471,12 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
             preflightPassed = true;
           } catch (/** @type {any} */ err) {
             if (err?.code === 'NO_POLICY') {
-              // No host-level policy configured: default gate = no failing
-              // controllerPreflight entries, which the test rig and Helm
-              // local runs rely on.
-              preflightPassed = checkResults.every((/** @type {{passed?:boolean}} */ r) => r.passed === true);
+              // No host-level policy configured: the default gate is every
+              // entry explicitly labelled pass:.../ok:..., and an EMPTY
+              // list FAILS CLOSED (a worker must not skip preflight by
+              // submitting zero controllerPreflight entries at all).
+              preflightPassed = checkResults.length > 0
+                && checkResults.every((/** @type {{passed?:boolean}} */ r) => r.passed === true);
             } else {
               preflightPassed = false;
             }

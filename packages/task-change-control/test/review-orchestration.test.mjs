@@ -195,3 +195,24 @@ test('rejected review (unbound session) leaves task NOT done and Change re-revie
   const rv2 = await ctx.taskChangeControl.runGovernedReview(task.id);
   assert.equal(rv2.outcome, 'review_started');
 });
+
+test('preflight with EMPTY controllerPreflight fails closed (no silent pass)', async (t) => {
+  const { ctx, taskStore, dir } = await compose(t);
+  // same-id setup but proof carries NO controllerPreflight entries
+  const task = await taskStore.create({ title: 'g', description: 'd', status: 'ready', workspace: dir, worker_profile: 'w-e', acceptance_criteria: ['ship'] });
+  const { change } = await ctx.taskChangeControl.bootstrapTask(task.id);
+  const plan = await ctx.changeControl.submitPlan(change.id, { steps: ['s'] });
+  await ctx.changeControl.acceptPlan(change.id, plan.id, { authorized: true, actor: 'host' });
+  await ctx.changeControl.transition(change.id, 'IMPLEMENTING', {});
+  await taskStore.claim(task.id, 'w-e', { lease_seconds: 300 });
+  await taskStore.start(task.id, 'w-e', {});
+  await ctx.changeControl.bindRole(change.id, 'sess-w-e', 'worker', { worker: 'w-e' });
+  await ctx.changeControl.submitProof(change.id, {
+    beforeRevision: 'b', afterRevision: 'a', commit_sha: 'ce', files_changed: ['f'], tests_run: ['t'], remaining_blockers: [],
+    criteria: [{ id: 'ship', satisfied: true }], deviations: [], workerChecks: ['ok'], controllerPreflight: [], summary: 'x',
+  }, { sessionId: 'sess-w-e', expectedWorker: 'w-e' });
+  await taskStore.complete(task.id, { commit_sha: 'ce', files_changed: ['f'], tests_run: ['t'], remaining_blockers: [] }, { worker: 'w-e' });
+  const out = await ctx.taskChangeControl.runGovernedReview(task.id);
+  assert.equal(out.outcome, 'preflight_failed');
+  assert.equal((await ctx.changeControl.get(change.id)).state, 'PREFLIGHT');
+});
