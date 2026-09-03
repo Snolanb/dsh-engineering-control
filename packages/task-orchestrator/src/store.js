@@ -947,6 +947,29 @@ export class TaskStore {
     })
   }
 
+  /**
+   * Atomic release of an EXPIRED claim owned by `worker`: one conditional
+   * UPDATE — succeeds only if the row is still claimed/running, still owned
+   * by `worker`, and its lease has passed. No TOCTOU window, safe against a
+   * concurrent reclaimer. Returns { released, reason, task }.
+   */
+  releaseExpiredClaim(id, worker, options = {}) {
+    const taskId = requiredString(id, 'id')
+    const owner = requiredString(worker, 'worker')
+    const timestamp = nowMs(this.clock)
+    return this._write(db => {
+      const row = this._requireRow(taskId, db)
+      const expired = row.lease_expires_at !== null && Number(row.lease_expires_at) <= timestamp
+      if (row.claimed_by !== owner) return { released: false, reason: 'not_owner', task: this._hydrate(row, db) }
+      if (!expired) return { released: false, reason: 'lease_active', task: this._hydrate(row, db) }
+      db.prepare("UPDATE tasks SET status = ?, claimed_by = NULL, claimed_at = NULL, lease_expires_at = NULL, started_at = NULL, completed_at = NULL, updated_at = ? WHERE id = ? AND claimed_by = ? AND lease_expires_at <= ? AND status IN ('claimed', 'running')")
+        .run('ready', timestamp, taskId, owner, timestamp)
+      this._statusEvent(taskId, row.status, 'ready', options.actor ?? owner, timestamp, db)
+      this._appendEvent(taskId, 'task_released', options.actor ?? owner, { previous_status: row.status, expired: true }, db, timestamp)
+      return { released: true, task: this._hydrate(this._requireRow(taskId, db), db) }
+    })
+  }
+
   renewLease(id, worker, options = {}) {
     const taskId = requiredString(id, 'id')
     const owner = requiredString(worker, 'worker')

@@ -109,6 +109,7 @@ export class WorkerDispatcher {
     registry,
     launcher = createWorkerLauncher(),
     preflight,
+    preDispatch = null,
     preflightOptions = {},
     actor = 'task-dispatcher',
     idFactory = randomUUID,
@@ -122,6 +123,8 @@ export class WorkerDispatcher {
     this.registry = registry
     this.launcher = launcher
     this.preflight = preflight ?? ((request, options) => runPreflight(registry, request, options))
+    if (preDispatch !== null && typeof preDispatch !== 'function') throw new TypeError('preDispatch must be a function or null')
+    this.preDispatch = preDispatch
     this.preflightOptions = { ...preflightOptions }
     this.actor = actor
     this.idFactory = idFactory
@@ -140,6 +143,55 @@ export class WorkerDispatcher {
     return { dispatched: false, reason: 'no_ready_task', worker_profile: workerProfile }
   }
 
+  /**
+   * Release a held claim; if the lease expired mid-guard (release throws),
+   * revert the task row directly so it can never strand. Returns one of
+   * 'released' | 'reverted' | 'failed'.
+   */
+  releaseOrRevert(taskId, worker) {
+    try {
+      this.store.release(taskId, worker, { actor: this.actor })
+      return 'released'
+    } catch {
+      // Lease likely expired mid-guard. Atomically RE-claim as this worker
+      // (claim() only succeeds if the lease is still expired or the task is
+      // claimable — a THIRD party holding a live lease forces already_claimed)
+      // then release under the fresh lease. Fully transactional: no window for
+      // another owner to be clobbered.
+      let reclaim
+      try {
+        reclaim = this.store.claim(taskId, worker, { actor: this.actor })
+      } catch {
+        return 'failed'
+      }
+      if (!reclaim.claimed) {
+        if (reclaim.reason === 'already_claimed') return 'held_by_other'
+        // For EVERY other failure (blocked_by_dependencies, not_claimable,
+        // max_attempts_exceeded, ...) run the atomic owner+expiry-checked
+        // release — one conditional SQL UPDATE, no TOCTOU window at all:
+        //   - released  → reverted
+        //   - not_owner → held_by_other
+        //   - lease_active / anything else → failed (someone else deals with it)
+        try {
+          const expired = this.store.releaseExpiredClaim
+            ? this.store.releaseExpiredClaim(taskId, worker, { actor: this.actor })
+            : { released: false, reason: 'unavailable' }
+          return expired.released
+            ? 'reverted'
+            : (expired.reason === 'not_owner' ? 'held_by_other' : 'failed')
+        } catch {
+          return 'failed'
+        }
+      }
+      try {
+        this.store.release(taskId, worker, { actor: this.actor })
+        return 'reverted'
+      } catch {
+        return 'failed'
+      }
+    }
+  }
+
   async dispatchTask(task) {
     const workerProfile = task.worker_profile
     const preflight = await this.preflight({
@@ -154,9 +206,61 @@ export class WorkerDispatcher {
     const claimed = this.store.claim(task.id, worker, { lease_seconds: spec.leaseSeconds, actor: this.actor })
     if (!claimed.claimed) return { dispatched: false, reason: 'claim_race', task: claimed.task, claim: claimed }
 
+    if (this.preDispatch) {
+      let verdict
+      try {
+        verdict = await this.preDispatch({ task: claimed.task ?? task, worker, runId })
+      } catch (error) {
+        verdict = { ok: false, code: 'GUARD_ERROR', error: errorText(error) }
+      } finally {
+        // Fail-closed: ONLY the exact plain-object shape { ok: true } counts.
+        // Arrays/functions, subclasses, extra enumerable/symbol/non-enumerable
+        // or PROTOTYPE-inherited keys, and ok !== true all reject.
+        // The guard may hand back ANY value — including a throwing Proxy. All
+        // inspection stays in a try/catch and failure to validate = reject.
+        // Move the shape judgement INSIDE one try/catch; NEVER retain the
+        // caller-provided verdict afterwards (a dynamic Proxy can change its
+        // answers between reads). The only thing that leaves the try is a 1-bit
+        // boolean decision + one immutable plain-object payload.
+        let approved = false
+        let finalVerdict = null
+        try {
+          const proto = typeof verdict !== 'object' || verdict === null ? null : Object.getPrototypeOf(verdict)
+          const isPlain = verdict !== null && typeof verdict === 'object' && (proto === Object.prototype || proto === null)
+          const soleOk = isPlain && Reflect.ownKeys(verdict).length === 1 && Reflect.ownKeys(verdict)[0] === 'ok'
+          if (soleOk && verdict.ok === true) {
+            approved = true
+            finalVerdict = { ok: true }
+          } else if (isPlain && verdict.ok === false) {
+            // Structured plain-object failure: copy (never retain) so later
+            // re-evaluation cannot flip.
+            approved = false
+            finalVerdict = { ok: false, code: verdict.code ?? 'GUARD_REJECTED' }
+            for (const k of ['preconditions', 'changeId', 'detail', 'error']) {
+              const v = verdict[k]
+              if (v !== undefined) finalVerdict[k] = v
+            }
+          } else {
+            approved = false
+            finalVerdict = { ok: false, code: 'GUARD_REJECTED', detail: typeof verdict === 'object' && verdict !== null ? null : verdict }
+          }
+        } catch {
+          approved = false
+          finalVerdict = { ok: false, code: 'GUARD_REJECTED', detail: null }
+        }
+        if (!approved) {
+          const restored = this.releaseOrRevert(task.id, worker)
+          return {
+            dispatched: false, reason: 'dispatch_not_governed', predispatch: finalVerdict,
+            claim_cleanup: restored, task: this.store.get(task.id), run_id: runId, worker,
+          }
+        }
+      }
+    }
+
     let handle
     try {
-      handle = await this.launcher.launch({ task, spec, selection: spec.model, runId, worker })
+      handle = await this.launcher.launch({ task: claimed.task ?? task, spec, selection: spec.model, runId, worker })
       this.store.start(task.id, worker, { actor: this.actor })
     } catch (error) {
       await handle?.terminate?.()
