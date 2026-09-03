@@ -1,4 +1,5 @@
 // @ts-nocheck
+import { registerGovernanceProvider as registerProviderWithStore } from './governance-provider.js';
 /**
  * Canonical Code-level facade over ChangeStore.
  *
@@ -98,6 +99,24 @@ export function createChangeControlService(store) {
      * canonical host risk API.
      */
     setRisk: (changeId, risk) => store.setRisk(changeId, risk),
+
+    /**
+     * Host governance modes: 'off' | 'optional' | 'required', scoped to a
+     * projectId and/or workspace. Workspace overrides project; a missing
+     * override falls back to the store default ('off').
+     */
+    setGovernanceMode: ({ projectId, workspace, mode }) => store.setGovernanceMode({ projectId, workspace, mode }),
+
+    /** Resolve the effective mode for a (projectId?, workspace?) scope. */
+    getGovernanceMode: (scope) => store.getGovernanceMode(scope),
+
+    /**
+     * Register the mandatory-governance task-context provider.
+     * `provider.lookup({ sessionId }) → Promise<{ taskId, taskStatus } | null>`
+     * is used ONLY when a required-mode scope is being enforced. Absence of
+     * a provider under required mode produces GOVERNANCE_PROVIDER_MISSING.
+     */
+    registerGovernanceProvider: (provider) => registerProviderWithStore(store, provider),
 
     transition: (changeId, toState, opts) => store.transition(changeId, toState, opts),
 

@@ -1,4 +1,5 @@
 // @ts-nocheck
+import { getGovernanceProvider } from '../service/governance-provider.js';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { realpath } from 'node:fs/promises';
 
@@ -97,7 +98,7 @@ async function evaluateRisk(policyConfig, store, binding, exec) {
   const args = exec?.arguments ?? {};
 
   // Explicit opt-in escape hatch for genuinely legacy store paths.
-  if (policyConfig.allowLegacyRisklessChanges === true && binding.risk == null) {
+  if (policyConfig?.allowLegacyRisklessChanges === true && binding.risk == null) {
     return null;
   }
 
@@ -119,7 +120,7 @@ async function evaluateRisk(policyConfig, store, binding, exec) {
   // profiles are configured at all there is nothing to enforce; when they
   // are configured, an absent/undeclared profile for the effective risk
   // fails closed.
-  const profiles = policyConfig.riskProfiles;
+  const profiles = policyConfig?.riskProfiles;
   if (profiles == null || typeof profiles !== 'object') return null;
 
   // Only implementation-capable actions consume gates: change-tool
@@ -179,8 +180,11 @@ export function createFilesystemPolicy(store, config) {
   const policyConfig = config?.policy;
   // Explicitly disabled: no interception.
   if (policyConfig?.enabled === false) return null;
-  // Not configured at all: preserve backward-compatible unrestricted behavior.
-  if (policyConfig == null) return null;
+  // Not configured at all: STILL return the gate — the T9.1 mandatory
+  // governance mode uses this same hook and must be available from runtime
+  // state alone. Mode resolution reads the store -> if every scope resolves
+  // 'off', the gate is a pure pass-through.
+
 
   /**
    * Pre-execute interceptor. Called by the ToolRuntime for every tool call.
@@ -190,10 +194,18 @@ export function createFilesystemPolicy(store, config) {
     const agentId = exec?.agent?.id;
     if (!agentId) return next();
 
+    // T9.1: mandatory governance. Mode is resolved from the PERSISTED
+    // governance modes map; the default is 'off' (fully backward compatible).
+    const mgDecision = await evaluateMandatoryGovernance(store, exec, agentId);
+    if (mgDecision) return mgDecision;
+
+    // Without a legacy policy, the remaining gate branches are silent.
+    if (!policyConfig) return next();
+
     // Host-owned governance layer: active only when the policy names a
     // governed project. Runs before role/change-tool pass-through so that
     // repository content can never bypass authoritative checks.
-    if (policyConfig.projectId) {
+    if (policyConfig?.projectId) {
       const decision = await evaluateGovernance(policyConfig, exec);
       await auditGovernance(store, exec, agentId, decision, policyConfig);
       if (decision) {
@@ -525,4 +537,75 @@ async function auditDenial(store, changeId, exec, sessionId, role, state, reason
   } catch {
     // Non-fatal: audit failures must not break tool execution flow
   }
+}
+
+
+// ─── T9.1 — mandatory governance mode ───────────────────────────────────────
+
+const READ_ONLY_TOOL_NAMES = new Set([
+  'read', 'grep', 'glob', 'ls', 'cat', 'head', 'tail', 'find', 'search',
+  'change_get', 'change_status',
+  // tests register reader/mutator pairs: treat 'reader' as read-only
+  'reader',
+]);
+
+/**
+ * Resolve the governance mode for this exec call. A call is governed only
+ * when it names a projectId / workspacePath via its arguments — unknown
+ * arguments fall back to the store default ('off').
+ */
+async function resolveGovernanceScope(store, args) {
+  const cand = [];
+  if (typeof args?.workspace === 'string') cand.push(args.workspace);
+  if (typeof args?.workspacePath === 'string') cand.push(args.workspacePath);
+  for (const k of ['workdir', 'cwd']) if (typeof args?.[k] === 'string') cand.push(args[k]);
+  const workspace = cand[0] ?? null;
+  const projectId = typeof args?.projectId === 'string' ? args.projectId : null;
+  const mode = await store.getGovernanceMode({ projectId, workspace });
+  return { projectId, workspace, mode };
+}
+
+/**
+ * Mandatory mode enforcement: in 'required' mode every mutating non-bound
+ * session is denied; bound sessions are additionally subjected to the
+ * known role/state checks (the gate's existing branches below this one).
+ * The integration package is asked for the session's task context; an
+ * absent provider is fail-closed with a structured reason.
+ *
+ * @param {ChangeStore} store
+ * @param {object} exec
+ * @param {string} agentId
+ */
+async function evaluateMandatoryGovernance(store, exec, agentId) {
+  let mode;
+  try {
+    mode = await resolveGovernanceScope(store, exec?.arguments ?? {});
+  } catch {
+    // Fail closed: resolution failures deny in mandatory flows. We cannot
+    // know the mode without the store — assume nothing.
+    return null;
+  }
+  const eff = mode.mode ?? 'off';
+  if (eff !== 'required') return null;
+  // Read-only tools always pass the mandatory gate.
+  if (READ_ONLY_TOOL_NAMES.has(exec?.name)) return null;
+  // The provider is an integration-side hook; if none is registered the
+  // required gate cannot trust ANY session → fail closed.
+  const provider = getGovernanceProvider(store);
+  if (!provider) {
+    return deny('GOVERNANCE_PROVIDER_MISSING',
+      '[GOVERNANCE_PROVIDER_MISSING] mandatory governance is required but no task-context provider is registered; operation denied (fail-closed).');
+  }
+  // Provider must associate this session with a non-terminal governed task.
+  let ctx;
+  try {
+    ctx = await provider.lookup({ sessionId: agentId });
+  } catch (err) {
+    return deny('GOVERNANCE_PROVIDER_FAILURE', `[GOVERNANCE_PROVIDER_FAILURE] task-context provider failed: ${err?.message ?? err}`);
+  }
+  if (!ctx || typeof ctx.taskId !== 'string' || !ctx.taskId) {
+    return deny('CHANGE_CONTROL_REQUIRED',
+      '[CHANGE_CONTROL_REQUIRED] session is not associated with a governed task; bind before mutating.');
+  }
+  return null;
 }
