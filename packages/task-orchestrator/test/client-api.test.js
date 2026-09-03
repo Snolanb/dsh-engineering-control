@@ -97,3 +97,11 @@ test('client posts markdown to plan-import endpoints', async () => {
   assert.equal(applied.project.id, 'p1')
   assert.ok(calls[1].url.endsWith('/plan-import/apply'))
 })
+test('describeTaskGovernance returns the integration projection (or null)', async () => {
+  const seen = []
+  const fetcher = async (url) => { seen.push(url); return fakeResponse({ governance: { linked: true, changeId: 'c1' }, degraded: false }) }
+  const client = new TaskOrchestratorClient(fetcher, '/api/task-orchestrator/')
+  const out = await client.describeTaskGovernance('t1')
+  assert.deepEqual(out, { linked: true, changeId: 'c1' })
+  assert.equal(seen[0], '/api/task-orchestrator/tasks/t1/governance')
+})
