@@ -164,7 +164,27 @@ export class WorkerDispatcher {
       } catch {
         return 'failed'
       }
-      if (!reclaim.claimed) return reclaim.reason === 'already_claimed' ? 'held_by_other' : 'failed'
+      if (!reclaim.claimed) {
+        if (reclaim.reason === 'already_claimed') return 'held_by_other'
+        // 'blocked_by_dependencies' / 'not_claimable' fire BEFORE the expiry
+        // check in claim(); in that window nobody can claim the task anyway
+        // (the same first check rebuffs every worker), so the thin
+        // get-then-update below is race-free. Guard it all the same.
+        if (reclaim.reason === 'blocked_by_dependencies' || reclaim.reason === 'not_claimable') {
+          try {
+            const stale = this.store.get(taskId)
+            const leaseExpired = stale && stale.claimed_by === worker
+              && stale.lease_expires_at !== null
+              && Number(stale.lease_expires_at) <= (typeof this.clock === 'function' ? this.clock() : Date.now())
+            if (!leaseExpired) return 'failed'
+            this.store.update(taskId, { status: 'ready' }, { actor: this.actor })
+            return 'reverted'
+          } catch {
+            return 'failed'
+          }
+        }
+        return 'failed'
+      }
       try {
         this.store.release(taskId, worker, { actor: this.actor })
         return 'reverted'
@@ -195,12 +215,15 @@ export class WorkerDispatcher {
       } catch (error) {
         verdict = { ok: false, code: 'GUARD_ERROR', error: errorText(error) }
       } finally {
-        // Fail-closed: ONLY the exact one-key shape { ok: true } counts as
-        // approval. Extra keys, missing ok, or non-object verdicts all reject.
-        const strictPass = verdict !== null
-          && typeof verdict === 'object'
+        // Fail-closed: ONLY the exact plain-object shape { ok: true } counts.
+        // Arrays/functions, subclasses, extra enumerable/symbol/non-enumerable
+        // or PROTOTYPE-inherited keys, and ok !== true all reject.
+        const isPlainObject = (v) => v !== null && typeof v === 'object'
+          && (Object.getPrototypeOf(v) === Object.prototype || Object.getPrototypeOf(v) === null)
+        const strictPass = isPlainObject(verdict)
           && verdict.ok === true
-          && Object.keys(verdict).length === 1
+          && Reflect.ownKeys(verdict).length === 1
+          && Reflect.ownKeys(verdict)[0] === 'ok'
         if (!strictPass) {
           verdict = (verdict && typeof verdict === 'object' && verdict.ok === false)
             ? verdict

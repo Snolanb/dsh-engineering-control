@@ -88,7 +88,17 @@ test('non-{ok:true} verdict (undefined/null/false) fails closed at the dispatche
     title: 'raw dispatcher', description: 'd', status: 'ready', workspace: dir,
     worker_profile: 'worker', acceptance_criteria: ['a'],
   });
-  for (const bad of [undefined, null, false, {}, 'ok', { ok: true, extra: 'unexpected' }, [], { ok: 1 }]) {
+  const inheritedOk = Object.create({ ok: true });
+  const badShapes = [
+    undefined, null, false, {}, 'ok', { ok: true, extra: 'unexpected' }, { ok: 1 }, [],
+    (() => { const a = []; a.ok = true; return a; })(),                 // array with own key
+    inheritedOk,                                                          // prototype-inherited ok
+    (() => { const o = { ok: true }; Object.defineProperty(o, 'sneak', { value: 1, enumerable: false }); return o; })(), // non-enumerable extra
+    (() => { const o = { ok: true }; o[Symbol('s')] = 1; return o; })(),  // symbol extra
+    new (class { constructor() { this.ok = true; } })(),                  // custom prototype
+    Object.freeze({ ok: false }),                                         // frozen false
+  ];
+  for (const bad of badShapes) {
     const { WorkerDispatcher } = await import('dsh-task-orchestrator/dispatcher');
     const dispatcher = new WorkerDispatcher({
       store: taskStore, registry,

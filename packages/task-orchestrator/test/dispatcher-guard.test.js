@@ -91,6 +91,30 @@ test('slow guard with expired lease never strands the task (claim restored)', as
   assert.notEqual(result.claim_cleanup, 'failed')
 })
 
+test('dependency added during guard does not strand the expired claimant', async t => {
+  const f = fixture(); t.after(() => f.cleanup())
+  const task = readyTask(f)
+  const blocker = f.store.create({ id: 'blocker', title: 'blocker', status: 'ready', workspace: f.dir })
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+  const dispatcher = new WorkerDispatcher({
+    store: f.store,
+    registry: f.registry,
+    idFactory: () => 'run-dep',
+    preflight: async () => ({ ok: true, spec: { ...f.registry.get('worker'), leaseSeconds: 1 } }),
+    launcher: { async launch() { throw new Error('must not launch') } },
+    preDispatch: async () => {
+      await sleep(1300) // lease (1s) expired
+      f.store.addDependency(task.id, blocker.id)
+    },
+  })
+  const result = await dispatcher.dispatchTask(task)
+  assert.equal(result.dispatched, false)
+  assert.ok(['reverted', 'released'].includes(result.claim_cleanup), 'cleanup must never leave an expired claim behind: got ' + result.claim_cleanup)
+  const after = f.store.get(task.id)
+  assert.equal(after.status, 'ready')
+  assert.equal(after.claimed_by, null)
+})
+
 test('expired-lease rejection never clobbers a concurrent reclaimer', async t => {
   const f = fixture(); t.after(() => f.cleanup())
   const task = readyTask(f)
