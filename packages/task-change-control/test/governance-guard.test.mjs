@@ -89,7 +89,9 @@ test('non-{ok:true} verdict (undefined/null/false) fails closed at the dispatche
     worker_profile: 'worker', acceptance_criteria: ['a'],
   });
   const inheritedOk = Object.create({ ok: true });
+  const evilProxy = new Proxy({}, { getPrototypeOf() { throw new Error('proto trap') }, ownKeys() { throw new Error('ownKeys trap') } });
   const badShapes = [
+    evilProxy,
     undefined, null, false, {}, 'ok', { ok: true, extra: 'unexpected' }, { ok: 1 }, [],
     (() => { const a = []; a.ok = true; return a; })(),                 // array with own key
     inheritedOk,                                                          // prototype-inherited ok
@@ -107,7 +109,7 @@ test('non-{ok:true} verdict (undefined/null/false) fails closed at the dispatche
       preDispatch: async () => bad,
     });
     const result = await dispatcher.dispatchTask(task);
-    assert.equal(result.dispatched, false, `${JSON.stringify(bad)} must fail closed`);
+    assert.equal(result.dispatched, false, `shape #${badShapes.indexOf(bad)} must fail closed`);
     assert.equal(result.reason, 'dispatch_not_governed');
     assert.equal((await taskStore.get(task.id)).status, 'ready', 'claim restored');
   }

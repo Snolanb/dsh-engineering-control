@@ -166,19 +166,14 @@ export class WorkerDispatcher {
       }
       if (!reclaim.claimed) {
         if (reclaim.reason === 'already_claimed') return 'held_by_other'
-        // 'blocked_by_dependencies' / 'not_claimable' fire BEFORE the expiry
-        // check in claim(); in that window nobody can claim the task anyway
-        // (the same first check rebuffs every worker), so the thin
-        // get-then-update below is race-free. Guard it all the same.
+        // Blocked / not-claimable: take the atomic owner-checked expired-lease
+        // release — one SQL statement, NO window for anyone else.
         if (reclaim.reason === 'blocked_by_dependencies' || reclaim.reason === 'not_claimable') {
           try {
-            const stale = this.store.get(taskId)
-            const leaseExpired = stale && stale.claimed_by === worker
-              && stale.lease_expires_at !== null
-              && Number(stale.lease_expires_at) <= (typeof this.clock === 'function' ? this.clock() : Date.now())
-            if (!leaseExpired) return 'failed'
-            this.store.update(taskId, { status: 'ready' }, { actor: this.actor })
-            return 'reverted'
+            const expired = this.store.releaseExpiredClaim
+              ? this.store.releaseExpiredClaim(taskId, worker, { actor: this.actor })
+              : { released: false, reason: 'unavailable' }
+            return expired.released ? 'reverted' : (expired.reason === 'not_owner' ? 'held_by_other' : 'failed')
           } catch {
             return 'failed'
           }
@@ -218,12 +213,20 @@ export class WorkerDispatcher {
         // Fail-closed: ONLY the exact plain-object shape { ok: true } counts.
         // Arrays/functions, subclasses, extra enumerable/symbol/non-enumerable
         // or PROTOTYPE-inherited keys, and ok !== true all reject.
-        const isPlainObject = (v) => v !== null && typeof v === 'object'
-          && (Object.getPrototypeOf(v) === Object.prototype || Object.getPrototypeOf(v) === null)
-        const strictPass = isPlainObject(verdict)
-          && verdict.ok === true
-          && Reflect.ownKeys(verdict).length === 1
-          && Reflect.ownKeys(verdict)[0] === 'ok'
+        // The guard may hand back ANY value — including a throwing Proxy. All
+        // inspection stays in a try/catch and failure to validate = reject.
+        let strictPass = false
+        try {
+          const isPlainObject = (v) => v !== null && typeof v === 'object'
+            && Object.getPrototypeOf(v) !== null
+            && (Object.getPrototypeOf(v) === Object.prototype || Object.getPrototypeOf(v) === null)
+          strictPass = isPlainObject(verdict)
+            && verdict.ok === true
+            && Reflect.ownKeys(verdict).length === 1
+            && Reflect.ownKeys(verdict)[0] === 'ok'
+        } catch {
+          strictPass = false
+        }
         if (!strictPass) {
           verdict = (verdict && typeof verdict === 'object' && verdict.ok === false)
             ? verdict
