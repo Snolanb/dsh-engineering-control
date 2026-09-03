@@ -25,8 +25,8 @@ function unavailable(detail) {
 
 /**
  * Minimal typed views of the two domain services this package depends on.
- * @typedef {{ get: (id: string) => any, update: (id: string, patch: any) => Promise<any>, updateIf: (id: string, expected: any, patch: any) => any, complete?: (id: string, result: object, options?: any) => any, createDispatcher: (options?: any) => any, createWorkerLauncher?: (options?: any) => any }} TaskOrchestratorApi
- * @typedef {{ get: (id: string) => Promise<any>, findByWorkItem: (system: string, id: string) => Promise<any>, findOrCreateForWorkItem: (input: { system: string, id: string, change: object }) => Promise<any>, resolveRole: (changeId: string, sessionId: string) => Promise<string>, getBinding: (changeId: string, sessionId: string) => Promise<any>, getBindingSync: (changeId: string, sessionId: string) => any, getBindingFromDisk: (changeId: string, sessionId: string) => any, listByWorkItem: (system: string, id: string) => Promise<any[]>, listRoleBindings: () => Promise<any[]>, status: (changeId: string) => Promise<any>, appendAudit: (event: any) => Promise<any>, submitProof: (changeId: string, proof: any, expected?: { sessionId?: string, expectedWorker?: string }) => Promise<any>, unbindRole: (changeId: string, sessionId: string, opts?: any) => Promise<any>, transition: (changeId: string, toState: string, opts?: any) => Promise<any> }} ChangeControlApi
+ * @typedef {{ get: (id: string) => any, update: (id: string, patch: any) => Promise<any>, updateIf: (id: string, expected: any, patch: any) => any, complete?: (id: string, result: object, options?: any) => any, createDispatcher: (options?: any) => any, createWorkerLauncher?: (options?: any) => any, createReviewerLauncher?: (options?: any) => any }} TaskOrchestratorApi
+ * @typedef {{ get: (id: string) => Promise<any>, findByWorkItem: (system: string, id: string) => Promise<any>, findOrCreateForWorkItem: (input: { system: string, id: string, change: object }) => Promise<any>, resolveRole: (changeId: string, sessionId: string) => Promise<string>, getBinding: (changeId: string, sessionId: string) => Promise<any>, getBindingSync: (changeId: string, sessionId: string) => any, getBindingFromDisk: (changeId: string, sessionId: string) => any, listByWorkItem: (system: string, id: string) => Promise<any[]>, listRoleBindings: () => Promise<any[]>, status: (changeId: string) => Promise<any>, appendAudit: (event: any) => Promise<any>, submitProof: (changeId: string, proof: any, expected?: { sessionId?: string, expectedWorker?: string }) => Promise<any>, bindRole: (changeId: string, sessionId: string, role: string, opts?: any) => Promise<any>, unbindRole: (changeId: string, sessionId: string, opts?: any) => Promise<any>, transition: (changeId: string, toState: string, opts?: any) => Promise<any> }} ChangeControlApi
  * @param {object} deps
  * @param {() => TaskOrchestratorApi | undefined} deps.taskOrchestrator accessor (may be absent)
  * @param {() => ChangeControlApi | undefined} deps.changeControl accessor (may be absent)
@@ -420,6 +420,77 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
           );
         }
         return { ok: true, taskId, changeId: changed.id };
+      })();
+    },
+
+    /**
+     * T8.1 — Launch an independent REVIEWER session for a governed task.
+     * The session is bound to the authoritative Change as role 'reviewer'
+     * using the sessionId returned by the launcher (the REAL identity).
+     * This path never claims the task and never touches worker leases.
+     *
+     * @param {string} taskId
+     * @param {{ spec?: object, launcherOptions?: object }} [options]
+     */
+    launchReviewer(taskId, options = {}) {
+      const t = requireTask();
+      const c = requireChange();
+      requireTaskId(taskId);
+      if (typeof t.createReviewerLauncher !== 'function') {
+        return Promise.reject(Object.assign(
+          new Error('taskOrchestrator facade does not expose createReviewerLauncher'),
+          { code: 'REVIEWER_LAUNCHER_UNAVAILABLE' },
+        ));
+      }
+      return (async () => {
+        const task = await Promise.resolve(t.get(taskId));
+        if (!task) throw Object.assign(new Error(`task not found: ${taskId}`), { code: 'TASK_NOT_FOUND' });
+        const change = await c.findByWorkItem(WORK_ITEM_SYSTEM, taskId);
+        if (!change) throw Object.assign(new Error(`no Change linked to task ${taskId}`), { code: 'CHANGE_NOT_FOUND' });
+        const launcher = /** @type {any} */ (t).createReviewerLauncher(options.launcherOptions ?? {});
+        const defaultPrompt = `You are the independent reviewer for task ${task.id}.
+Review the governed Change ${change.id} against its Plan and project task acceptance criteria. Read-only: do NOT modify any files. Inspect the worker's submitted proof and test log and decide PASS / FAIL / ESCALATE with a brief rationale.`;
+        const spec = options.spec ?? {
+          mode: 'session',
+          prompt: defaultPrompt,
+          agentPreset: task.reviewer_profile ?? 'reviewer',
+          // Parse 'provider/model' convention, same as worker_model elsewhere;
+          // bare 'model' leaves provider undefined and DSH host resolution fills
+          // it at session.selectModel time.
+          ...(typeof task.reviewer_model === 'string' && task.reviewer_model !== ''
+            ? (() => {
+                const s = task.reviewer_model;
+                const slash = s.indexOf('/');
+                if (slash < 1 || slash === s.length - 1) {
+                  throw Object.assign(
+                    new Error(`reviewer_model must be 'provider/model' (got: ${s})`),
+                    { code: 'REVIEWER_MODEL_MALFORMED' },
+                  );
+                }
+                return { model: { provider: s.slice(0, slash), model: s.slice(slash + 1) } };
+              })()
+            : {}),
+        };
+        const handle = await launcher.launch({ task, spec });
+        if (typeof handle?.sessionId !== 'string' || handle.sessionId === '') {
+          if (typeof handle?.terminate === 'function') {
+            try { await handle.terminate(); } catch { /* best-effort */ }
+          }
+          throw Object.assign(new Error('reviewer launcher returned no sessionId'), { code: 'SESSION_ID_MISSING' });
+        }
+        let binding;
+        try {
+          binding = await c.bindRole(change.id, handle.sessionId, 'reviewer');
+        } catch (error) {
+          // If binding fails the session would be orphaned: terminate it so
+          // there is no live reviewer session with no track record on the
+          // Change side.
+          if (typeof handle?.terminate === 'function') {
+            try { await handle.terminate(); } catch { /* best-effort */ }
+          }
+          throw error;
+        }
+        return { sessionId: handle.sessionId, changeId: change.id, binding, handle };
       })();
     },
 

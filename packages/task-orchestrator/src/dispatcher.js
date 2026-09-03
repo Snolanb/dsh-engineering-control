@@ -390,16 +390,26 @@ export function createSessionLauncher({ rpc = createSessionRpcClient(), pollInte
       const created = await rpc.call('session.create', { cwd: task.workspace, agentPreset: spec.agentPreset })
       const sessionId = created?.sessionId
       if (typeof sessionId !== 'string' || sessionId === '') throw new WorkerDispatchError('session.create returned no session id', 'SESSION_ID_MISSING')
-      const selection = { provider: spec.model.provider, model: spec.model.model }
-      if (spec.model.reasoningEffort !== undefined) selection.reasoningEffort = spec.model.reasoningEffort
-      await rpc.call('session.selectModel', { sessionId, ...selection })
-      const before = sessionEvents(await rpc.call('session.history', { sessionId, maxMessages: historyMaxMessages }))
-      const baselineSeq = before.reduce((max, event) => Math.max(max, Number.isSafeInteger(event.seq) ? event.seq : max), -1)
-      await rpc.call('session.prompt', {
-        sessionId,
-        mode: 'queue',
-        content: [{ type: 'text', text: buildTaskPrompt(task, spec, runId) }],
-      })
+      let baselineSeq = -1
+      try {
+        if (spec.model) {
+          const selection = { provider: spec.model.provider, model: spec.model.model }
+          if (spec.model.reasoningEffort !== undefined) selection.reasoningEffort = spec.model.reasoningEffort
+          await rpc.call('session.selectModel', { sessionId, ...selection })
+        }
+        const before = sessionEvents(await rpc.call('session.history', { sessionId, maxMessages: historyMaxMessages }))
+        baselineSeq = before.reduce((max, event) => Math.max(max, Number.isSafeInteger(event.seq) ? event.seq : max), -1)
+        await rpc.call('session.prompt', {
+          sessionId,
+          mode: 'queue',
+          content: [{ type: 'text', text: typeof spec.prompt === 'string' && spec.prompt !== '' ? spec.prompt : buildTaskPrompt(task, spec, runId) }],
+        })
+      } catch (setupError) {
+        // Never strand a live session half-configured: cancel it so it does
+        // not show up as a live item in the host UI without any work item.
+        try { await rpc.call('session.cancel', { sessionId }); } catch { /* best-effort */ }
+        throw setupError
+      }
       let waitPromise
       const wait = () => {
         if (!waitPromise) {
