@@ -572,7 +572,11 @@ const READ_ONLY_TOOL_NAMES = new Set([
   'change_get', 'task_get', 'task_list', 'project_get', 'project_list',
   'milestone_get', 'milestone_list', 'task_events', 'task_list_links',
   'task_ready_to_run', 'task_board_list',
-]);
+  // Actions catalogue confirmed READ-ONLY via task-orchestrator tooling
+  'task_list_children', 'task_list_descendants', 'task_blocked_by_dependencies',
+  'plan_import_preview',
+]);""
+
 
 function makeReadOnlyClassifier(extraNames) {
   const extras = Array.isArray(extraNames) ? extraNames.filter((n) => typeof n === 'string') : [];
