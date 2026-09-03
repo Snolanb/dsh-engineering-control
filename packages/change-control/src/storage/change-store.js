@@ -2209,19 +2209,6 @@ export class ChangeStore {
       });
 
       // Worker implementation attempt (kept UNDER in-memory after reseed).
-      {
-        const attempts200 = this.#attempts.get(changeId) ?? [];
-        const workerBinding501 = (this.#bindings.get(changeId) ?? []).find((b) => b.role === 'worker' && (expected.sessionId ? b.sessionId === expected.sessionId : true));
-        attempts200.push({
-          changeId,
-          attemptId: `${changeId}:${proof.commit_sha ?? 'unknown'}:${proof.afterRevision ?? 'unknown'}`,
-          workerId: workerBinding501?.worker ?? expected.sessionId ?? 'unknown',
-          status: 'proof_submitted',
-          revision: proof.afterRevision ?? null,
-          recordedAt: new Date().toISOString(),
-        });
-        this.#attempts.set(changeId, attempts200);
-      }
 
       await this.#persist();
 
