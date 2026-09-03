@@ -1844,18 +1844,38 @@ export class ChangeStore {
    * Resolve the effective governance mode for a (projectId?, workspace?)
    * pair. Precedence: workspace override > project > store default > 'off'.
    */
-  async getGovernanceMode({ projectId = null, workspace = null } = {}) {
+  async getGovernanceMode({ projectId = null, workspace = null, path = null } = {}) {
     if (projectId !== null && typeof projectId !== 'string') {
       throw Object.assign(new Error('projectId must be a string'), { code: 'INVALID_GOVERNANCE_KEY' });
     }
     if (workspace !== null && typeof workspace !== 'string') {
       throw Object.assign(new Error('workspace must be a string'), { code: 'INVALID_GOVERNANCE_KEY' });
     }
-    const modes = this.#governanceModes;
+    if (path !== null && typeof path !== 'string') {
+      throw Object.assign(new Error('path must be a string'), { code: 'INVALID_GOVERNANCE_KEY' });
+    }
+    // Fresh_disk read: the mandatory-governance gate must not be bypassed by
+    // a stale in-memory snapshot written by a racing store instance.
+    let modes = this.#governanceModes;
+    try {
+      const disk = await readJson(this.#file);
+      if (disk?.governanceModes && typeof disk.governanceModes === 'object') modes = disk.governanceModes;
+    } catch { /* a corrupt or missing store must not WEAKEN enforcement */ }
     if (!modes) return 'off';
-    if (workspace !== null && typeof modes.workspaces?.[workspace] === 'string') return modes.workspaces[workspace];
-    if (projectId !== null && typeof modes.projects?.[projectId] === 'string') return modes.projects[projectId];
-    if (typeof modes.default === 'string') return modes.default;
+    const sanitize = (m) => (['off', 'optional', 'required'].includes(m) ? m : 'required');
+    if (workspace !== null && typeof modes.workspaces?.[workspace] === 'string') return sanitize(modes.workspaces[workspace]);
+    // A path falls back to the governing workspace that contains it.
+    if (path !== null && modes.workspaces) {
+      const hits = Object.entries(modes.workspaces)
+        .filter(([ws]) => typeof ws === 'string' && typeof path === 'string' && (path === ws || path.startsWith(ws + '/')));
+      if (hits.length > 0) {
+        // Longest containment wins.
+        hits.sort((a, b) => b[0].length - a[0].length);
+        return sanitize(hits[0][1]);
+      }
+    }
+    if (projectId !== null && typeof modes.projects?.[projectId] === 'string') return sanitize(modes.projects[projectId]);
+    if (typeof modes.default === 'string') return sanitize(modes.default);
     return 'off';
   }
 
