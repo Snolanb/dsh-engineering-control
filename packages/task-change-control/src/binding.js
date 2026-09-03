@@ -37,7 +37,9 @@ export function createBindingLauncher(launcher, changeControl, WORK_ITEM_SYSTEM)
       try {
         change = await changeControl.findByWorkItem(WORK_ITEM_SYSTEM, input.task.id);
         if (!change) return handle;
-        await changeControl.bindRole(change.id, sessionId, 'worker');
+        await changeControl.bindRole(change.id, sessionId, 'worker', {
+          worker: input.worker ?? input.runId ?? null,
+        });
       } catch (error) {
         // On lookup/bind failure, the child session is orphaned. kill before rethrow.
         try { await handle.terminate?.('SIGKILL'); } catch {}

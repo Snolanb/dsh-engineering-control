@@ -59,8 +59,17 @@ export function createChangeControlService(store) {
     /** Resolve the role of a session on a Change. */
     resolveRole: (changeId, sessionId) => store.resolveRole(changeId, sessionId),
 
+    /** Full binding record (role + bound worker identity) for a session. */
+    getBinding: (changeId, sessionId) => store.getBinding(changeId, sessionId),
+
+    /** Synchronous live view of binding state. */
+    getBindingSync: (changeId, sessionId) => store.getBindingSync(changeId, sessionId),
+
+    /** Sync fresh (disk) binding read — catches concurrent cross-store mutations. */
+    getBindingFromDisk: (changeId, sessionId) => store.getBindingFromDisk(changeId, sessionId),
+
     /** Submit a proof bundle (IMPLEMENTING → PREFLIGHT). */
-    submitProof: (changeId, proof) => store.submitProof(changeId, proof),
+    submitProof: (changeId, proof, expected) => store.submitProof(changeId, proof, expected),
 
     /** Run deterministic controller preflight. */
     runPreflight: (changeId, input) => store.runPreflight(changeId, input),
@@ -80,6 +89,8 @@ export function createChangeControlService(store) {
      * canonical host risk API.
      */
     setRisk: (changeId, risk) => store.setRisk(changeId, risk),
+
+    transition: (changeId, toState, opts) => store.transition(changeId, toState, opts),
 
     /**
      * Canonical read-only status projection: state, risk, accepted plan,

@@ -8,6 +8,7 @@
  */
 // @ts-nocheck
 import { readFile, writeFile, rename, unlink, mkdir, rmdir, stat } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { createChange, ChangeDomainError, TRANSITIONS, RISK_LEVELS } from '../domain/change.js';
 
@@ -1034,7 +1035,9 @@ export class ChangeStore {
         if (opts.rebind) {
           // Replace the existing binding with the new role
           const idx = changeBindings.indexOf(existing);
-          changeBindings[idx] = { changeId, sessionId, role };
+          changeBindings[idx] = opts.worker !== undefined
+            ? { changeId, sessionId, role, worker: opts.worker ?? null }
+            : { changeId, sessionId, role };
           this.#bindings.set(changeId, changeBindings);
           this.#dirtyBindings.add(`${changeId}:${sessionId}`);
           await this.#persist();
@@ -1043,7 +1046,9 @@ export class ChangeStore {
         throw Object.assign(new Error(`Session ${sessionId} is already bound to role ${existing.role} on change ${changeId}`), { code: 'ALREADY_BOUND' });
       }
 
-      const binding = { changeId, sessionId, role };
+      const binding = opts.worker !== undefined
+        ? { changeId, sessionId, role, worker: opts.worker ?? null }
+        : { changeId, sessionId, role };
       changeBindings.push(binding);
       this.#bindings.set(changeId, changeBindings);
       this.#dirtyBindings.add(`${changeId}:${sessionId}`);
@@ -1096,6 +1101,53 @@ export class ChangeStore {
    * Resolve a session's binding for a role on a Change.
    * Returns the role string or throws if no binding exists.
    */
+  /**
+   * Full binding record for (changeId, sessionId) or null. Includes the
+   * optional run-level worker identity bound by the controller at dispatch
+   * time. Read-only surface — callers must not mutate.
+   */
+  async getBinding(changeId, sessionId) {
+    const release = await acquireLock(this.#file);
+    try {
+      await this.#refreshBindingsAndAttempts();
+      const hit = (this.#bindings.get(changeId) ?? []).find((b) => b.sessionId === sessionId) ?? null;
+      return hit ? structuredClone(hit) : null;
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Synchronous ZERO-AWAIT binding read against the live in-memory map.
+   * bindRole/unbindRole mutate this map synchronously before their first
+   * await, so a caller that opens nothing between this read and its follow-on
+   * synchronous action is atomic w.r.t. any concurrent mutator.
+   * Diagnostics-only for asynchronous callers; fresh-then-refresh is async.
+   */
+  getBindingSync(changeId, sessionId) {
+    const entry = (this.#bindings.get(changeId) ?? []).find((b) => b.sessionId === sessionId) ?? null;
+    return entry ? structuredClone(entry) : null;
+  }
+
+  /**
+   * Synchronous FRESH binding read from disk — catches mutations by other
+   * ChangeStore instances (the #bindings-in-memory view lags disk).
+   * Returns null if the underlying file vanishes; callers must treat null
+   * as failure (fail-closed).
+   */
+  getBindingFromDisk(changeId, sessionId) {
+    try {
+      const raw = readFileSync(this.#file, 'utf8');
+      const data = JSON.parse(raw);
+      const entry = (Array.isArray(data.bindings) ? data.bindings : []).find(
+        (b) => b.changeId === changeId && b.sessionId === sessionId,
+      ) ?? null;
+      return entry;
+    } catch {
+      return null;
+    }
+  }
+
   async resolveRole(changeId, sessionId) {
     const release = await acquireLock(this.#file);
     try {
@@ -1201,7 +1253,9 @@ export class ChangeStore {
     this.#bindings = new Map();
     const put = (b) => {
       if (!this.#bindings.has(b.changeId)) this.#bindings.set(b.changeId, []);
-      this.#bindings.get(b.changeId).push({ changeId: b.changeId, sessionId: b.sessionId, role: b.role });
+      this.#bindings.get(b.changeId).push(
+        'worker' in b ? { changeId: b.changeId, sessionId: b.sessionId, role: b.role, worker: b.worker } : { changeId: b.changeId, sessionId: b.sessionId, role: b.role },
+      );
     };
     if (Array.isArray(data.bindings)) {
       for (const b of data.bindings) {
@@ -1267,14 +1321,30 @@ export class ChangeStore {
    * @param {Array} proof.controllerPreflight
    * @returns {{state: string, proof: object}}
    */
-  async submitProof(changeId, proof) {
+  async submitProof(changeId, proof, expected = {}) {
     const release = await acquireLock(this.#file);
     try {
       await this.#refreshChange(changeId);
+      await this.#refreshBindingsAndAttempts();
       const c = this.#changes.get(changeId);
       if (!c) throw Object.assign(new Error(`Change ${changeId} not found`), { code: 'NOT_FOUND' });
       if (c.state !== 'IMPLEMENTING') {
         throw Object.assign(new Error(`Cannot submit proof: change is in ${c.state}, expected IMPLEMENTING`), { code: 'INVALID_STATE' });
+      }
+      // Optional atomic binding assertion (TOCTOU closure): under THIS lock,
+      // verify the sessionId is still bound as worker with the expected run
+      // identity — any rebind attempt would be queued and observed here.
+      if (expected.sessionId !== undefined || expected.expectedWorker !== undefined) {
+        const binding = (this.#bindings.get(changeId) ?? []).find((b) => b.sessionId === expected.sessionId);
+        if (!binding || binding.role !== 'worker') {
+          throw Object.assign(new Error(`session ${expected.sessionId} is not bound as worker`), { code: 'SESSION_NOT_BOUND' });
+        }
+        if (binding.worker !== expected.expectedWorker) {
+          throw Object.assign(
+            new Error(`session ${expected.sessionId} bound to worker ${binding.worker}, expected ${expected.expectedWorker}`),
+            { code: 'SESSION_WORKER_MISMATCH' },
+          );
+        }
       }
 
       // ── Validate proof structure ──────────────────────────────────────
