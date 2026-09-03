@@ -95,3 +95,47 @@ test('SESSION_ID_MISSING path terminates the spawned handle', async (t) => {
   await assert.rejects(ctx.taskChangeControl.launchReviewer(task.id), (e) => e && e.code === 'SESSION_ID_MISSING');
   assert.equal(terminated, 1);
 });
+
+test('reviewer_model as bare name throws REVIEWER_MODEL_MALFORMED', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'tcc-t81-real4-'));
+  const { ctx, taskStore } = await compose(t, dir);
+  const task = await taskStore.create({ title: 'g', description: 'd', status: 'ready', workspace: dir, worker_profile: 'w', reviewer_model: 'bare-no-provider', acceptance_criteria: ['a'] });
+  await ctx.taskChangeControl.bootstrapTask(task.id);
+  await assert.rejects(
+    ctx.taskChangeControl.launchReviewer(task.id),
+    (e) => e && e.code === 'REVIEWER_MODEL_MALFORMED',
+  );
+});
+test.rollback = true;
+
+test('setup failure after session.create cancels the session (no orphan)', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'tcc-t81-real5-'));
+  const rpcLog = [];
+  const ctx = new Context();
+  await ctx.plugin(SystemPrompt);
+  await ctx.plugin(ToolRuntime, {});
+  const store = new TaskStore({ dbPath: join(dir, 'o.db') });
+  ctx.provide('taskOrchestrator', Object.freeze({
+    get: store.get.bind(store),
+    update: store.update.bind(store),
+    updateIf: (id, e, p) => store.updateIf(id, e, p),
+    complete: store.complete.bind(store),
+    createReviewerLauncher: () => createReviewerLauncher({
+      rpc: {
+        async call(op, args) {
+          rpcLog.push({ op, args });
+          if (op === 'session.create') return { sessionId: 'sess-will-fail' };
+          if (op === 'session.selectModel') throw new Error('model-unavailable');
+          if (op === 'session.history') return { events: [] };
+          return {};
+        },
+      },
+    }),
+  }));
+  await ctx.plugin(changeControlPlugin, { storePath: join(dir, 'changes.json') });
+  await ctx.plugin(plugin);
+  const task = await store.create({ title: 'g', description: 'd', status: 'ready', workspace: dir, worker_profile: 'w', reviewer_model: 'x/y', acceptance_criteria: ['a'] });
+  await ctx.taskChangeControl.bootstrapTask(task.id);
+  await assert.rejects(ctx.taskChangeControl.launchReviewer(task.id));
+  assert.ok(rpcLog.some((r) => r.op === 'session.cancel'), 'cancel must be issued');
+});

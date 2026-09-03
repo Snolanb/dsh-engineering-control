@@ -454,11 +454,17 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
           // Parse 'provider/model' convention, same as worker_model elsewhere;
           // bare 'model' leaves provider undefined and DSH host resolution fills
           // it at session.selectModel time.
-          ...(task.reviewer_model
+          ...(typeof task.reviewer_model === 'string' && task.reviewer_model !== ''
             ? (() => {
-                const s = String(task.reviewer_model);
+                const s = task.reviewer_model;
                 const slash = s.indexOf('/');
-                return { model: slash < 1 ? { model: s } : { provider: s.slice(0, slash), model: s.slice(slash + 1) } };
+                if (slash < 1 || slash === s.length - 1) {
+                  throw Object.assign(
+                    new Error(`reviewer_model must be 'provider/model' (got: ${s})`),
+                    { code: 'REVIEWER_MODEL_MALFORMED' },
+                  );
+                }
+                return { model: { provider: s.slice(0, slash), model: s.slice(slash + 1) } };
               })()
             : {}),
         };
