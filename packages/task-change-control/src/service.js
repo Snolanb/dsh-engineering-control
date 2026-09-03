@@ -24,7 +24,7 @@ function unavailable(detail) {
 
 /**
  * Minimal typed views of the two domain services this package depends on.
- * @typedef {{ get: (id: string) => Promise<any>, update: (id: string, patch: any) => Promise<any>, complete?: (id: string, result: object, options?: any) => Promise<any>, createDispatcher: (options?: any) => any, createWorkerLauncher?: (options?: any) => any }} TaskOrchestratorApi
+ * @typedef {{ get: (id: string) => any, update: (id: string, patch: any) => Promise<any>, complete?: (id: string, result: object, options?: any) => any, createDispatcher: (options?: any) => any, createWorkerLauncher?: (options?: any) => any }} TaskOrchestratorApi
  * @typedef {{ get: (id: string) => Promise<any>, findByWorkItem: (system: string, id: string) => Promise<any>, findOrCreateForWorkItem: (input: { system: string, id: string, change: object }) => Promise<any>, resolveRole: (changeId: string, sessionId: string) => Promise<string>, getBinding: (changeId: string, sessionId: string) => Promise<any>, status: (changeId: string) => Promise<any>, submitProof: (changeId: string, proof: any) => Promise<any>, transition: (changeId: string, toState: string, opts?: any) => Promise<any> }} ChangeControlApi
  * @param {object} deps
  * @param {() => TaskOrchestratorApi | undefined} deps.taskOrchestrator accessor (may be absent)
@@ -285,9 +285,27 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         // values. Omitting them yields task rows of null/[] next to a proof
         // without the keys (or, on the idempotent path, a stale proof).
         for (const key of ['commit_sha', 'files_changed', 'tests_run', 'remaining_blockers']) {
+          const value = proof[key];
           if (!(key in proof)) {
-            throw Object.assign(new Error(`proof field required: ${key}`), { code: 'PROOF_FIELD_REQUIRED', field: key });
+            throw Object.assign(
+              new Error(`proof.${key} required`),
+              { code: 'PROOF_FIELD_REQUIRED', field: key },
+            );
           }
+          if (key === 'commit_sha') continue; // further typed check below
+          if (!Array.isArray(value)) {
+            throw Object.assign(
+              new Error(`proof.${key} must be an array`),
+              { code: 'PROOF_FIELD_INVALID', field: key, got: value === null ? 'null' : typeof value },
+            );
+          }
+        }
+        const commitSha = proof.commit_sha;
+        if (typeof commitSha !== 'string' || commitSha.trim() === '') {
+          throw Object.assign(
+            new Error('proof.commit_sha must be a string'),
+            { code: 'PROOF_FIELD_INVALID', field: 'commit_sha', got: typeof proof.commit_sha },
+          );
         }
 
         // 3b. Criteria alignment — re-read the task FIRST so a concurrent
@@ -331,13 +349,23 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
           throw Object.assign(new Error(`cannot complete from Change state ${change.state}`), { code: 'INVALID_STATE' });
         }
 
-        // 4b. FINAL atomic recheck — reads are synchronous on this store so
-        // a re-read followed by the mutation with no awaits in between is
-        // an atomic Cas-equivalent. Required for hostile-mutation scenarios:
-        // acceptance_criteria changed or session binding re-bound DURING
-        // the Change-side awaits above.
-        const finalTask = await Promise.resolve(taskOrchestrator.get(taskId));
+        // 4b. FINAL CONSISTENCY CHECK. Order matters: the Change-side
+        // `getBinding` await is the LAST cross-store await — after this,
+        // the TaskStore get + complete are synchronous, so an interleaving
+        // mutation of task criteria MUST happen before re-reads, and
+        // the final binding snapshot arrives post-lock.
         const finalBinding = await c.getBinding(changed.id, sessionId).catch(() => null);
+        if (!finalBinding || finalBinding.worker !== worker) {
+          throw Object.assign(
+            new Error(`session binding changed during Change-side work`),
+            { code: 'SESSION_WORKER_MISMATCH', changeId: changed.id },
+          );
+        }
+
+        // Synchronous from here on — the TaskStore facade is sync, so
+        // get() followed by criteria/lease verification followed by
+        // complete() serializes atomically in this event-loop tick.
+        const finalTask = taskOrchestrator.get(taskId);
         if (!finalTask
           || finalTask.claimed_by !== worker
           || (finalTask.status !== 'claimed' && finalTask.status !== 'running')
@@ -345,12 +373,6 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
           throw Object.assign(
             new Error('lease invalidated during Change-side work'),
             { code: 'TASK_LEASE_INVALID', stage: 'post-proof' },
-          );
-        }
-        if (!finalBinding || finalBinding.worker !== worker) {
-          throw Object.assign(
-            new Error(`session binding changed during Change-side work`),
-            { code: 'SESSION_WORKER_MISMATCH', changeId: changed.id },
           );
         }
         {
