@@ -686,6 +686,21 @@ export class ChangeStore {
    * At most one nonterminal Change exists per (system, id); terminal/history
    * Changes are ignored.
    */
+  /** ALL changes linked to a work item — for reconciliation (a healthy
+   * system returns 0..1 results; two live nonterminal changes mean the
+   * board is in manual-intervention state). */
+  async listByWorkItem(system, id) {
+    const release = await acquireLock(this.#file);
+    try {
+      await this.#refreshChange();
+      return [...this.#changes.values()]
+        .filter((c) => c.workItem && c.workItem.system === system && c.workItem.id === id)
+        .map((c) => freezeChange(c));
+    } finally {
+      release();
+    }
+  }
+
   async findByWorkItem(system, id) {
     const release = await acquireLock(this.#file);
     try {

@@ -953,6 +953,91 @@ export class TaskStore {
    * by `worker`, and its lease has passed. No TOCTOU window, safe against a
    * concurrent reclaimer. Returns { released, reason, task }.
    */
+  /**
+   * Atomic conditional repair write.
+   * Applies `patch` only if the CURRENT row still matches expectation
+   * (claimed_by/lease/status/metadata link). Returns the updated row or
+   * `null` if the expectation no longer holds. All repair classes below
+   * funnel through this entry point so callers can't clobber a replaced
+   * namespace between a get and a write.
+   * @param {string} id
+   * @param {{
+   *   claimed_by?: string,
+   *   lease_expires_at?: number|null,
+   *   status?: string,
+   *   metadata_change_id?: string|null,
+   * }} expected
+   * @param {{ status?: string, commit_sha?: string|null, files_changed?: any[],
+   *          tests_run?: any[], remaining_blockers?: any[],
+   *          result_summary?: string, metadata?: object }} patch
+   */
+  updateIf(id, expected, patch) {
+    const taskId = requiredString(id, 'id')
+    if (typeof patch !== 'object' || patch === null || Array.isArray(patch)) throw new TypeError('patch must be an object')
+    const timestamp = nowMs(this.clock)
+    return this._write(db => {
+      const row = this._requireRow(taskId, db)
+      if (expected.claimed_by !== undefined && row.claimed_by !== expected.claimed_by) return null
+      if (expected.lease_expires_at !== undefined
+        && Number(row.lease_expires_at ?? -1) !== Number(expected.lease_expires_at ?? -1)) return null
+      if (expected.status !== undefined && row.status !== expected.status) return null
+      if (expected.metadata_change_id !== undefined) {
+        const md = row.metadata ? JSON.parse(row.metadata) : null
+        const currentLink = md?.changeControl?.changeId ?? null
+        if (currentLink !== expected.metadata_change_id) return null
+      }
+      const changes = {}
+      const setters = []
+      const params = []
+      const add = (name, value) => { setters.push(name + ' = ?'); params.push(value); changes[name] = value }
+      if (patch.status !== undefined) {
+        validateTransition(row.status, patch.status)
+        if (patch.status !== row.status) {
+          add('status', patch.status)
+          if (['claimed', 'running'].includes(row.status) && !['claimed', 'running'].includes(patch.status)) {
+            setters.push('claimed_by = NULL', 'claimed_at = NULL', 'lease_expires_at = NULL')
+            changes.claimed_by = null
+            changes.claimed_at = null
+            changes.lease_expires_at = null
+          }
+        }
+      }
+      if (patch.commit_sha !== undefined) add('commit_sha', optionalString(patch.commit_sha, 'commit_sha'))
+      if (patch.files_changed !== undefined) add('files_changed', jsonText(patch.files_changed ?? [], [], 'files_changed'))
+      if (patch.tests_run !== undefined) add('tests_run', jsonText(patch.tests_run ?? [], [], 'tests_run'))
+      if (patch.remaining_blockers !== undefined) add('remaining_blockers', jsonText(patch.remaining_blockers ?? [], [], 'remaining_blockers'))
+      if (patch.result_summary !== undefined) add('result_summary', optionalString(patch.result_summary, 'result_summary'))
+      if (patch.metadata !== undefined) {
+        if (typeof patch.metadata === 'function') {
+          // Reactive merge: caller gets the FRESH row's metadata — atomic
+          // regardless of how much the caller's own snapshot has drifted.
+          const base = row.metadata ? JSON.parse(row.metadata) : {}
+          const merged = patch.metadata(base)
+          add('metadata', jsonText(merged ?? {}, {}, 'metadata'))
+        } else {
+          add('metadata', jsonText(patch.metadata ?? {}, {}, 'metadata'))
+        }
+      }
+      if (patch.completed_at !== undefined) {
+        if (patch.completed_at === null) { setters.push('completed_at = NULL'); }
+        else add('completed_at', Number(patch.completed_at))
+      }
+      if (setters.length === 0) {
+        // Nothing to change — return fetched row for symmetry with update().
+        return this._hydrate(row, db)
+      }
+      setters.push('updated_at = ?'); params.push(timestamp)
+      params.push(taskId)
+      const sql = 'UPDATE tasks SET ' + setters.join(', ') + ' WHERE id = ?'
+      db.prepare(sql).run(...params)
+      if (changes.status !== undefined && changes.status !== row.status) {
+        this._statusEvent(taskId, row.status, changes.status, 'system', timestamp, db)
+      }
+      this._appendEvent(taskId, 'task_updated', 'system', { changes }, db, timestamp)
+      return this._hydrate(this._requireRow(taskId, db), db)
+    })
+  }
+
   releaseExpiredClaim(id, worker, options = {}) {
     const taskId = requiredString(id, 'id')
     const owner = requiredString(worker, 'worker')
