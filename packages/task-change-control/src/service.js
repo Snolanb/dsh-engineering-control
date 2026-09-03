@@ -6,6 +6,7 @@
  * No TaskStore/ChangeStore imports here — only the two Cordis services.
  */
 import { createGovernanceGuard } from './governance.js';
+import { createBindingLauncher } from './binding.js';
 
 /** The task-orchestrator identity on the Change-side workItem. */
 export const WORK_ITEM_SYSTEM = 'dsh-task-orchestrator';
@@ -23,7 +24,7 @@ function unavailable(detail) {
 
 /**
  * Minimal typed views of the two domain services this package depends on.
- * @typedef {{ get: (id: string) => Promise<any>, update: (id: string, patch: any) => Promise<any>, createDispatcher: (options?: any) => any }} TaskOrchestratorApi
+ * @typedef {{ get: (id: string) => Promise<any>, update: (id: string, patch: any) => Promise<any>, createDispatcher: (options?: any) => any, createWorkerLauncher?: (options?: any) => any }} TaskOrchestratorApi
  * @typedef {{ get: (id: string) => Promise<any>, findByWorkItem: (system: string, id: string) => Promise<any>, findOrCreateForWorkItem: (input: { system: string, id: string, change: object }) => Promise<any> }} ChangeControlApi
  * @param {object} deps
  * @param {() => TaskOrchestratorApi | undefined} deps.taskOrchestrator accessor (may be absent)
@@ -156,8 +157,22 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
       // Governance is not replaceable: a caller-supplied preDispatch COMPOSES
       // after the integration guard — the governed-check can never be bypassed.
       const userGuard = options.preDispatch;
+      // T6.1: ALWAYS wrap the launcher with the binding hook. The wrapper
+      // binds the returned sessionId ('worker' role) on successful launch and
+      // unbinds on finally-after-wait AND terminate — even if the caller
+      // passes their own launcher (they get a wrapped one, behavior visible
+      // in audit, not in spec).
+      // T6.1: ALWAYS bind — caller-supplied launcher, or the service's own
+      // default launcher factory (createWorkerLauncher on the taskOrchestrator
+      // service — service boundary preserved).
+      const baseLauncher = options.launcher
+        ?? (typeof t.createWorkerLauncher === 'function'
+          ? t.createWorkerLauncher(options.launcherOptions ?? {})
+          : null);
+      if (!baseLauncher) throw unavailable('taskOrchestrator exposes neither a launcher hook nor a fallback');
       return t.createDispatcher({
         ...options,
+        launcher: createBindingLauncher(baseLauncher, c, WORK_ITEM_SYSTEM),
         preDispatch: userGuard
           ? async (/** @type {any} */ input) => {
               const mandatory = await integrationGuard(input);

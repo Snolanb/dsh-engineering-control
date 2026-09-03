@@ -70,6 +70,7 @@ export function apply(ctx, config = {}) {
     getWorkerSpec: workerRegistry.get.bind(workerRegistry),
     resolveWorkerSpec: workerRegistry.resolve.bind(workerRegistry),
     preflightWorker: preflight,
+    createWorkerLauncher: (options = {}) => createWorkerLauncher(options),
     createDispatcher: (options = {}) => new WorkerDispatcher({
       store,
       registry: workerRegistry,
