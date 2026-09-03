@@ -1116,6 +1116,18 @@ export class ChangeStore {
     }
   }
 
+  /**
+   * Synchronous ZERO-AWAIT binding read against the live in-memory map.
+   * bindRole/unbindRole mutate this map synchronously before their first
+   * await, so a caller that opens nothing between this read and its follow-on
+   * synchronous action is atomic w.r.t. any concurrent mutator.
+   * Diagnostics-only for asynchronous callers; fresh-then-refresh is async.
+   */
+  getBindingSync(changeId, sessionId) {
+    const entry = (this.#bindings.get(changeId) ?? []).find((b) => b.sessionId === sessionId) ?? null;
+    return entry ? structuredClone(entry) : null;
+  }
+
   async resolveRole(changeId, sessionId) {
     const release = await acquireLock(this.#file);
     try {

@@ -25,7 +25,7 @@ function unavailable(detail) {
 /**
  * Minimal typed views of the two domain services this package depends on.
  * @typedef {{ get: (id: string) => any, update: (id: string, patch: any) => Promise<any>, complete?: (id: string, result: object, options?: any) => any, createDispatcher: (options?: any) => any, createWorkerLauncher?: (options?: any) => any }} TaskOrchestratorApi
- * @typedef {{ get: (id: string) => Promise<any>, findByWorkItem: (system: string, id: string) => Promise<any>, findOrCreateForWorkItem: (input: { system: string, id: string, change: object }) => Promise<any>, resolveRole: (changeId: string, sessionId: string) => Promise<string>, getBinding: (changeId: string, sessionId: string) => Promise<any>, status: (changeId: string) => Promise<any>, submitProof: (changeId: string, proof: any, expected?: { sessionId?: string, expectedWorker?: string }) => Promise<any>, transition: (changeId: string, toState: string, opts?: any) => Promise<any> }} ChangeControlApi
+ * @typedef {{ get: (id: string) => Promise<any>, findByWorkItem: (system: string, id: string) => Promise<any>, findOrCreateForWorkItem: (input: { system: string, id: string, change: object }) => Promise<any>, resolveRole: (changeId: string, sessionId: string) => Promise<string>, getBinding: (changeId: string, sessionId: string) => Promise<any>, getBindingSync: (changeId: string, sessionId: string) => any, status: (changeId: string) => Promise<any>, submitProof: (changeId: string, proof: any, expected?: { sessionId?: string, expectedWorker?: string }) => Promise<any>, transition: (changeId: string, toState: string, opts?: any) => Promise<any> }} ChangeControlApi
  * @param {object} deps
  * @param {() => TaskOrchestratorApi | undefined} deps.taskOrchestrator accessor (may be absent)
  * @param {() => ChangeControlApi | undefined} deps.changeControl accessor (may be absent)
@@ -362,7 +362,11 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         // the TaskStore get + complete are synchronous, so an interleaving
         // mutation of task criteria MUST happen before re-reads, and
         // the final binding snapshot arrives post-lock.
-        const finalBinding = await c.getBinding(changed.id, sessionId).catch(() => null);
+        // SYNCHRONOUS read against the live ChangeStore map — bindRole
+        // mutates in-memory synchronously before awaiting persistence, so
+        // a rebind queued behind this synchronous read CANNOT land before
+        // the synchronous TaskStore.complete in the same continuation.
+        const finalBinding = c.getBindingSync(changed.id, sessionId);
         if (!finalBinding || finalBinding.worker !== worker) {
           throw Object.assign(
             new Error(`session binding changed during Change-side work`),

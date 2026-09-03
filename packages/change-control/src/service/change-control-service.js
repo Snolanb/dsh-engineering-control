@@ -62,6 +62,9 @@ export function createChangeControlService(store) {
     /** Full binding record (role + bound worker identity) for a session. */
     getBinding: (changeId, sessionId) => store.getBinding(changeId, sessionId),
 
+    /** Synchronous live view of binding state. */
+    getBindingSync: (changeId, sessionId) => store.getBindingSync(changeId, sessionId),
+
     /** Submit a proof bundle (IMPLEMENTING → PREFLIGHT). */
     submitProof: (changeId, proof, expected) => store.submitProof(changeId, proof, expected),
 
