@@ -7,11 +7,6 @@
  */
 import { createGovernanceGuard } from './governance.js';
 import { createBindingLauncher } from './binding.js';
-/* Node's node:crypto/child_process are unavailable under `checkJs` when importing
- * a dependency's compiled lib/*.js. Point TypeScript at the source surface for
- * type purposes only; the runtime resolves it as the workspace package. */
-// @ts-ignore — runtime resolves via pnpm workspace; types not needed here
-import { createWorkerLauncher as defaultWorkerLauncher } from 'dsh-task-orchestrator/dispatcher';
 
 /** The task-orchestrator identity on the Change-side workItem. */
 export const WORK_ITEM_SYSTEM = 'dsh-task-orchestrator';
@@ -29,7 +24,7 @@ function unavailable(detail) {
 
 /**
  * Minimal typed views of the two domain services this package depends on.
- * @typedef {{ get: (id: string) => Promise<any>, update: (id: string, patch: any) => Promise<any>, createDispatcher: (options?: any) => any }} TaskOrchestratorApi
+ * @typedef {{ get: (id: string) => Promise<any>, update: (id: string, patch: any) => Promise<any>, createDispatcher: (options?: any) => any, createWorkerLauncher?: (options?: any) => any }} TaskOrchestratorApi
  * @typedef {{ get: (id: string) => Promise<any>, findByWorkItem: (system: string, id: string) => Promise<any>, findOrCreateForWorkItem: (input: { system: string, id: string, change: object }) => Promise<any> }} ChangeControlApi
  * @param {object} deps
  * @param {() => TaskOrchestratorApi | undefined} deps.taskOrchestrator accessor (may be absent)
@@ -167,12 +162,14 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
       // unbinds on finally-after-wait AND terminate — even if the caller
       // passes their own launcher (they get a wrapped one, behavior visible
       // in audit, not in spec).
-      // T6.1: ALWAYS bind at the dispatcher level. The integration owns the
-      // launcher it installs: options.launcher (caller-supplied) wins;
-      // otherwise we wire the documented default ourselves so `createGovernedDispatcher()`
-      // without arguments ALSO binds the returned sessionId. Headless/skipped
-      // modes pass through unchanged.
-      const baseLauncher = options.launcher ?? defaultWorkerLauncher(options.launcherOptions ?? {});
+      // T6.1: ALWAYS bind — caller-supplied launcher, or the service's own
+      // default launcher factory (createWorkerLauncher on the taskOrchestrator
+      // service — service boundary preserved).
+      const baseLauncher = options.launcher
+        ?? (typeof t.createWorkerLauncher === 'function'
+          ? t.createWorkerLauncher(options.launcherOptions ?? {})
+          : null);
+      if (!baseLauncher) throw unavailable('taskOrchestrator exposes neither a launcher hook nor a fallback');
       return t.createDispatcher({
         ...options,
         launcher: createBindingLauncher(baseLauncher, c, WORK_ITEM_SYSTEM),

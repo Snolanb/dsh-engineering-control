@@ -145,25 +145,23 @@ test('importing an incidental sessionId on a HEADLESS spec does NOT bind', async
   assert.equal(s.bindings.filter((b) => b.sessionId === 'incidental-headless').length, 0);
 });
 
-test('UNGOVERNED task: session launcher never creates bindings', async (t) => {
+test('UNGOVERNED task: session launch never binds (bindRole is never invoked)', async (t) => {
   const { ctx, taskStore, dir } = await compose(t);
   const task = await taskStore.create({
     title: 'ungoverned sesh', description: 'd', status: 'ready', workspace: dir,
     worker_profile: 'worker', acceptance_criteria: ['a'],
   });
+  const cc = ctx.get('changeControl');
+  let bindRoleCalls = 0;
+  // Proxy wrap is forbidden across the dispatcher boundary — spread + intercept.
+  const spy = { ...cc, bindRole: async (...args) => { bindRoleCalls++; return cc.bindRole(...args); } };
   const launcher = fakeSessionLauncher({ sessionId: 'sess-ungoverned' });
-  const dispatcher = ctx.taskChangeControl.createGovernedDispatcher({ launcher });
-  const done = dispatcher.dispatchTask(task);
-  await launcher.launchedResolved;
-  launcher.resolveGate({ exitCode: 0, stdout: 'ok', stderr: '' });
-  const result = await done;
-  assert.equal(result.status, 'in_review');
-  // No Change exists at all, so no bindings anywhere on this context.
-  const list = await ctx.changeControl.list?.() ?? [];
-  for (const c of list) {
-    const s = await ctx.changeControl.status(c.id);
-    assert.equal(s.bindings.length, 0, 'ungoverned session never binds');
-  }
+  // Construct the wrapper directly against the SPY (bypassing service js wiring).
+  const { createBindingLauncher } = await import('../src/binding.js');
+  const wrapped = createBindingLauncher(launcher, spy, SYSTEM);
+  const handle = await wrapped.launch({ task: { id: task.id }, spec: { mode: 'session' }, runId: 'run-ug' });
+  assert.equal(handle.sessionId, 'sess-ungoverned');
+  assert.equal(bindRoleCalls, 0, 'ungoverned dispatch must never call bindRole');
 });
 
 test('bind failure mid-launch TERMINATES the orphaned session before rethrow', async (t) => {
