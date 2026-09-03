@@ -5,6 +5,7 @@ import { previewPlanImport, applyPlanImport } from './plan-import.js'
 import { WorkerSpecRegistry } from './worker-specs.js'
 import { preflightWorker } from './worker-preflight.js'
 import { WorkerDispatcher, createWorkerLauncher } from './dispatcher.js'
+import { createReviewerLauncher } from './reviewer-launcher.js'
 
 export const name = 'task-orchestrator'
 export const inject = ['webServer', 'tools']
@@ -72,6 +73,7 @@ export function apply(ctx, config = {}) {
     resolveWorkerSpec: workerRegistry.resolve.bind(workerRegistry),
     preflightWorker: preflight,
     createWorkerLauncher: (options = {}) => createWorkerLauncher(options),
+    createReviewerLauncher: (options = {}) => createReviewerLauncher(options),
     createDispatcher: (options = {}) => new WorkerDispatcher({
       store,
       registry: workerRegistry,
