@@ -68,10 +68,9 @@ test('preflight pass → REVIEW + reviewer session bound (task untouched)', asyn
 test('exhausted preflight (missing controller pass) does NOT move Change to REVIEW', async (t) => {
   const { ctx, taskStore, dir } = await compose(t);
   const { task, change } = await governedToPreflight(ctx, taskStore, dir);
-  // corrrupt preflight
-  await ctx.changeControl.unbindRole(change.id, 'sess-work');
+  // corrupt proof in-storage (simulate a late-worker committed failure trace)
   await taskStore.complete(task.id, { commit_sha: 'commit1', files_changed: [], tests_run: [], remaining_blockers: [] }, { worker: 'w-run' });
-  const out = await ctx.taskChangeControl.runGovernedReview(task.id, { preflight: () => false });
+  const out = await ctx.taskChangeControl.runGovernedReview(task.id, { controllerPreflightOverride: ['FAIL: build'] });
   assert.equal(out.outcome, 'preflight_failed');
   const ch = await ctx.changeControl.get(change.id);
   assert.equal(ch.state, 'PREFLIGHT');
@@ -105,29 +104,78 @@ test('review fail → REPAIR + task changes_requested', async (t) => {
   assert.equal((await ctx.changeControl.get(change.id)).state, 'REPAIR');
 });
 
-test('repair loop is bounded by escalation threshold', async (t) => {
+test('repair loop: same task+Change identities through N rounds, then escalation', async (t) => {
   const { ctx, taskStore, dir } = await compose(t);
   const { task, change } = await governedToPreflight(ctx, taskStore, dir);
   await taskStore.complete(task.id, { commit_sha: 'c1', files_changed: ['f'], tests_run: ['t'], remaining_blockers: [] }, { worker: 'w-run' });
-  let rv = await ctx.taskChangeControl.runGovernedReview(task.id);
-  let finish = await ctx.taskChangeControl.applyReviewOutcome(task.id, {
-    sessionId: rv.sessionId, verdict: 'fail',
-    findings: [{ severity: 'critical', category: 't', location: 'x', problem: 'broke', fix: 'fix', requiredOutcome: 'pass next round' }],
-  });
-  assert.equal(finish.outcome, 'repair');
-  const repair = await ctx.taskChangeControl.prepareRepairAttempt(task.id);
-  assert.equal(repair.status, 'ready');
 
-  // Second governed sub-run on the SAME task+Change identities with a fresh
-  // attempt recorded. Escalation threshold 1: a SECOND fail must escalate.
-  const { task: task2, change: change2 } = await governedToPreflight(ctx, taskStore, dir, 'w-run-2');
-  await taskStore.complete(task2.id, { commit_sha: 'c2', files_changed: ['f'], tests_run: ['t'], remaining_blockers: [] }, { worker: 'w-run-2' });
-  const rv2 = await ctx.taskChangeControl.runGovernedReview(task2.id);
-  const escalated = await ctx.taskChangeControl.applyReviewOutcome(task2.id, {
-    sessionId: rv2.sessionId, verdict: 'fail', maxRepairRounds: 1,
-    findings: [{ severity: 'critical', category: 't', location: 'x', problem: 'broke', fix: 'fix', requiredOutcome: 'pass' }],
+  let rv = await ctx.taskChangeControl.runGovernedReview(task.id);
+  assert.equal(rv.outcome, 'review_started');
+  // ROUND 1 fail — same review session
+  const fail1 = await ctx.taskChangeControl.applyReviewOutcome(task.id, {
+    sessionId: rv.sessionId, verdict: 'fail',
+    findings: [{ severity: 'critical', category: 't', location: 'x', problem: 'p1', fix: 'f', requiredOutcome: 'ok' }],
+  });
+  assert.equal(fail1.outcome, 'repair');
+  assert.equal((await ctx.changeControl.get(change.id)).state, 'REPAIR');
+  assert.equal((await taskStore.get(task.id)).status, 'changes_requested');
+
+  // ROUND 2: same task + change identities, new worker attempt
+  await ctx.taskChangeControl.prepareRepairAttempt(task.id);
+  await taskStore.claim(task.id, 'w-r2', { lease_seconds: 300 });
+  await taskStore.start(task.id, 'w-r2', {});
+  const ch2 = await ctx.changeControl.get(change.id);
+  await ctx.changeControl.bindRole(change.id, 'sess-w-r2', 'worker', { worker: 'w-r2' });
+  const findings = (await ctx.changeControl.status(change.id)).openFindings;
+  await ctx.changeControl.submitRepair(change.id, {
+    findings: findings.map((f) => ({ findingId: f.id, status: 'fixed', claim: 'fixed' })),
+    proof: { beforeRevision: 'a', afterRevision: 'a2', commit_sha: 'c2', files_changed: ['f'], tests_run: ['t'], remaining_blockers: [], criteria: [{ id: 'ship', satisfied: true }], deviations: [], workerChecks: ['ok'], controllerPreflight: ['ok'], summary: 'repair' },
+  }, { workerId: 'w-r2' });
+  // Move task back to in_review (worker finished repair)
+  await taskStore.updateIf(task.id, { status: 'running', claimed_by: 'w-r2' }, { status: 'in_review', commit_sha: 'c2', files_changed: ['f'], tests_run: ['t'], remaining_blockers: [], result_summary: 'r2 done' });
+  const rv2 = await ctx.taskChangeControl.runGovernedReview(task.id);
+  assert.equal(rv2.outcome, 'review_started');
+  const fail2 = await ctx.taskChangeControl.applyReviewOutcome(task.id, {
+    sessionId: rv2.sessionId, verdict: 'fail',
+    findings: [{ severity: 'critical', category: 't', location: 'x', problem: 'p2', fix: 'f', requiredOutcome: 'ok' }],
+  });
+  assert.equal(fail2.outcome, 'repair');
+  assert.equal((await ctx.changeControl.get(change.id)).state, 'REPAIR');
+
+  // ROUND 3 — escalation when attempts flow past the threshold (maxRepairRounds=2 was OSS default)
+  await ctx.taskChangeControl.prepareRepairAttempt(task.id);
+  await taskStore.claim(task.id, 'w-r3', { lease_seconds: 300 });
+  await taskStore.start(task.id, 'w-r3', {});
+  await ctx.changeControl.bindRole(change.id, 'sess-w-r3', 'worker', { worker: 'w-r3' });
+  const findings3 = (await ctx.changeControl.status(change.id)).openFindings;
+  await ctx.changeControl.submitRepair(change.id, {
+    findings: findings3.map((f) => ({ findingId: f.id, status: 'fixed', claim: 'fixed' })),
+    proof: { beforeRevision: 'a2', afterRevision: 'a3', commit_sha: 'c3', files_changed: ['f'], tests_run: ['t'], remaining_blockers: [], criteria: [{ id: 'ship', satisfied: true }], deviations: [], workerChecks: ['ok'], controllerPreflight: ['ok'], summary: 'repair2' },
+  }, { workerId: 'w-r3' });
+  await taskStore.updateIf(task.id, { status: 'running', claimed_by: 'w-r3' }, { status: 'in_review', commit_sha: 'c3', files_changed: ['f'], tests_run: ['t'], remaining_blockers: [], result_summary: 'r3 done' });
+  const rv3 = await ctx.taskChangeControl.runGovernedReview(task.id);
+  const escalated = await ctx.taskChangeControl.applyReviewOutcome(task.id, {
+    sessionId: rv3.sessionId, verdict: 'fail', maxRepairRounds: 2,
+    findings: [{ severity: 'critical', category: 't', location: 'x', problem: 'p3', fix: 'f', requiredOutcome: 'ok' }],
   });
   assert.equal(escalated.outcome, 'escalated');
-  assert.equal((await taskStore.get(task2.id)).status, 'failed');
-  assert.ok(['REPAIR', 'REJECTED'].includes((await ctx.changeControl.get(change2.id)).state));
+  assert.equal((await taskStore.get(task.id)).status, 'failed');
+  assert.equal((await ctx.changeControl.get(change.id)).state, 'REPAIR'); // terminal until human disposes
+});
+
+
+test('reviewer independence: proof session CANNOT self-review (attestation recorded)', async (t) => {
+  const { ctx, taskStore, dir } = await compose(t);
+  const { task, change } = await governedToPreflight(ctx, taskStore, dir, 'w-self');
+  await taskStore.complete(task.id, { commit_sha: 'cs', files_changed: ['f'], tests_run: ['t'], remaining_blockers: [] }, { worker: 'w-self' });
+  // Malicious: the proof session rebounds itself to reviewer and tries to approve
+  // its own work.
+  await ctx.changeControl.unbindRole(change.id, 'sess-work');
+  await ctx.changeControl.bindRole(change.id, 'sess-work', 'reviewer');
+  const rv = await ctx.taskChangeControl.runGovernedReview(task.id).catch(() => null);
+  assert.ok(rv === null || rv.outcome === 'review_started');
+  await assert.rejects(
+    ctx.taskChangeControl.applyReviewOutcome(task.id, { sessionId: 'sess-work', verdict: 'pass' }),
+    (e) => e && e.code === 'REVIEWER_NOT_INDEPENDENT',
+  );
 });

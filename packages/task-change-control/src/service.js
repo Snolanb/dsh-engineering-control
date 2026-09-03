@@ -26,7 +26,7 @@ function unavailable(detail) {
 /**
  * Minimal typed views of the two domain services this package depends on.
  * @typedef {{ get: (id: string) => any, update: (id: string, patch: any) => Promise<any>, updateIf: (id: string, expected: any, patch: any) => any, complete?: (id: string, result: object, options?: any) => any, createDispatcher: (options?: any) => any, createWorkerLauncher?: (options?: any) => any, createReviewerLauncher?: (options?: any) => any }} TaskOrchestratorApi
- * @typedef {{ get: (id: string) => Promise<any>, findByWorkItem: (system: string, id: string) => Promise<any>, findOrCreateForWorkItem: (input: { system: string, id: string, change: object }) => Promise<any>, resolveRole: (changeId: string, sessionId: string) => Promise<string>, getBinding: (changeId: string, sessionId: string) => Promise<any>, getBindingSync: (changeId: string, sessionId: string) => any, getBindingFromDisk: (changeId: string, sessionId: string) => any, listByWorkItem: (system: string, id: string) => Promise<any[]>, listRoleBindings: () => Promise<any[]>, status: (changeId: string) => Promise<any>, appendAudit: (event: any) => Promise<any>, submitProof: (changeId: string, proof: any, expected?: { sessionId?: string, expectedWorker?: string }) => Promise<any>, bindRole: (changeId: string, sessionId: string, role: string, opts?: any) => Promise<any>, submitReview: (changeId: string, review: any, opts: any) => Promise<any>, unbindRole: (changeId: string, sessionId: string, opts?: any) => Promise<any>, transition: (changeId: string, toState: string, opts?: any) => Promise<any> }} ChangeControlApi
+ * @typedef {{ get: (id: string) => Promise<any>, findByWorkItem: (system: string, id: string) => Promise<any>, findOrCreateForWorkItem: (input: { system: string, id: string, change: object }) => Promise<any>, resolveRole: (changeId: string, sessionId: string) => Promise<string>, getBinding: (changeId: string, sessionId: string) => Promise<any>, getBindingSync: (changeId: string, sessionId: string) => any, getBindingFromDisk: (changeId: string, sessionId: string) => any, listByWorkItem: (system: string, id: string) => Promise<any[]>, listRoleBindings: () => Promise<any[]>, status: (changeId: string) => Promise<any>, appendAudit: (event: any) => Promise<any>, submitProof: (changeId: string, proof: any, expected?: { sessionId?: string, expectedWorker?: string }) => Promise<any>, bindRole: (changeId: string, sessionId: string, role: string, opts?: any) => Promise<any>, submitReview: (changeId: string, review: any, opts: any) => Promise<any>, runPreflight: (changeId: string, input?: any) => Promise<any>, unbindRole: (changeId: string, sessionId: string, opts?: any) => Promise<any>, transition: (changeId: string, toState: string, opts?: any) => Promise<any> }} ChangeControlApi
  * @param {object} deps
  * @param {() => TaskOrchestratorApi | undefined} deps.taskOrchestrator accessor (may be absent)
  * @param {() => ChangeControlApi | undefined} deps.changeControl accessor (may be absent)
@@ -424,14 +424,17 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
     },
 
     /**
-     * T8.2 — After a governed completion, run preflight, then transition the
-     * Change to REVIEW and launch a reviewer session bound as role
-     * 'reviewer'. The review itself is applied by the REVIEWER session via
-     * a later call to applyReviewOutcome.
+     * T8.2 — Start (or restart) the review stage for a governed completion.
+     * - Only valid when the task is in_review.
+     * - Change may be PREFLIGHT (first round / post-repair) or REVIEW (resume).
+     * - Preflight invokes the REAL store runPreflight, not a naive boolean
+     *   check of the proof bundle.
+     * - Reviewer session is bound BEFORE the state transition so a thrown
+     *   launch never wedges the Change in REVIEW.
      *
      * @param {string} taskId
-     * @param {{ preflight?: (proof: any) => boolean }} [options]
-     * @returns {Promise<{ outcome: 'review_started' | 'preflight_failed', sessionId?: string }>}
+     * @param {{ preflight?: (proof: any) => boolean, controllerPreflightOverride?: string[] }} [options]
+     * @returns {Promise<{ outcome: 'review_started' | 'preflight_failed', sessionId?: string, changeId?: string }>}
      */
     runGovernedReview(taskId, options = {}) {
       const t = requireTask();
@@ -445,21 +448,58 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         }
         const change = await c.findByWorkItem(WORK_ITEM_SYSTEM, taskId);
         if (!change) throw Object.assign(new Error(`no Change linked to task ${taskId}`), { code: 'CHANGE_NOT_FOUND' });
-        const status = await c.status(change.id);
-        if (change.state !== 'PREFLIGHT') {
-          throw Object.assign(new Error(`expected Change PREFLIGHT (got ${change.state})`), { code: 'INVALID_CHANGE_STATE' });
+        if (!['PREFLIGHT', 'REVIEW'].includes(change.state)) {
+          throw Object.assign(new Error(`expected Change PREFLIGHT or REVIEW (got ${change.state})`), { code: 'INVALID_CHANGE_STATE' });
         }
-        const preflightPass = status?.proof?.controllerPreflight
-          ? (options.preflight ?? ((p) => p.controllerPreflight.every(Boolean)))(status.proof)
-          : true;
-        if (!preflightPass) {
-          await c.appendAudit({ kind: 'review_orchestration', changeId: change.id, action: 'preflight_failed' });
-          return { outcome: 'preflight_failed' };
+        if (change.state === 'PREFLIGHT') {
+          // Run the REAL store-level preflight: staleness vs currentRevision,
+          // protected paths, and requiredChecks are all evaluated there.
+          const statusNow = await c.status(change.id);
+          const proof = statusNow?.proof ?? null;
+          const checkResults = (options.controllerPreflightOverride ?? proof?.controllerPreflight ?? []).map((/** @type {string} */ entry) => {
+            const name = String(entry);
+            return { name, passed: !/^(fail|failed|failing)/i.test(name.trim()), exitCode: /^(fail|failed|failing)/i.test(name.trim()) ? 1 : 0 };
+          });
+          let preflightPassed;
+          try {
+            await c.runPreflight(change.id, {
+              currentRevision: String(proof?.afterRevision ?? ''),
+              changedFiles: Array.isArray(proof?.files_changed) ? proof.files_changed : [],
+              checkResults,
+            });
+            preflightPassed = true;
+          } catch (/** @type {any} */ err) {
+            if (err?.code === 'NO_POLICY') {
+              // No host-level policy configured: default gate = no failing
+              // controllerPreflight entries, which the test rig and Helm
+              // local runs rely on.
+              preflightPassed = checkResults.every((/** @type {{passed?:boolean}} */ r) => r.passed === true);
+            } else {
+              preflightPassed = false;
+            }
+          }
+          if (!preflightPassed) {
+            await c.appendAudit({ kind: 'review_orchestration', changeId: change.id, action: 'preflight_failed' });
+            return { outcome: 'preflight_failed' };
+          }
+          await c.appendAudit({ kind: 'review_orchestration', changeId: change.id, action: 'preflight_passed' });
         }
-        await c.appendAudit({ kind: 'review_orchestration', changeId: change.id, action: 'preflight_passed' });
-        await c.transition(change.id, 'REVIEW', { actor: 'review-orchestration' });
-        const launched = await this.launchReviewer(taskId);
-        return { outcome: 'review_started', sessionId: launched.sessionId, changeId: change.id, binding: launched.binding };
+        // Existing reviewer binding? Reuse the session id (repair rounds
+        // re-enter runGovernedReview on the SAME Change). Otherwise launch
+        // a fresh reviewer and bind BEFORE transitioning so a thrown
+        // launcher never wedges the Change.
+        const existing = (await c.listRoleBindings()).find((b) => b.changeId === change.id && b.role === 'reviewer');
+        let sessionId;
+        if (existing) {
+          sessionId = existing.sessionId;
+        } else {
+          const launched = await launchReviewerForTask(requireTask, requireChange, requireTaskId, taskId);
+          sessionId = launched.sessionId;
+        }
+        if (change.state !== 'REVIEW') {
+          await c.transition(change.id, 'REVIEW', { actor: 'review-orchestration' });
+        }
+        return { outcome: 'review_started', sessionId, changeId: change.id };
       })();
     },
 
@@ -494,20 +534,28 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         }
         const reviewCount = /** @type {number} */ (options.maxRepairRounds ?? 3);
         const attemptsSeen = Array.isArray(status?.attempts) ? status.attempts.length : 0;
-        const escalate = options.verdict === 'fail' && attemptsSeen >= reviewCount;
+        // "Repair rounds" = every extra attempt beyond the initial one
+        // (submission, then one per repair cycle). The escalation threshold
+        // is comparisons against RETRIES ONLY — never the baseline review.
+        const repairsDone = Math.max(0, attemptsSeen - 1);
+        const escalate = options.verdict === 'fail' && repairsDone >= reviewCount;
         if (options.verdict === 'pass') {
+          // Task first (atomic conditional patch): only if the task settles
+          // do we commit the irreversible Change approval. This ordering
+          // rules out lost races because a lost task race keeps the Change
+          // in REVIEW (repairable) rather than irreversible APPROVED.
+          const done = t.updateIf(taskId, { status: 'in_review' }, { status: 'done' });
+          if (!done) {
+            await c.appendAudit({ kind: 'review_orchestration', changeId: change.id, action: 'task_done_blocked' });
+            return { outcome: 'task_update_race' };
+          }
           await c.submitReview(change.id, {
             verdict: 'pass',
             revision: status.revision ?? 'unknown',
             findings: [],
           }, { sessionId: options.sessionId });
           // submitReview already transitioned REVIEW → APPROVED internally.
-          const done = t.updateIf(taskId, { status: 'in_review' }, { status: 'done' });
-          if (!done) {
-            await c.appendAudit({ kind: 'review_orchestration', changeId: change.id, action: 'task_done_blocked' });
-            return { outcome: 'task_update_race' };
-          }
-          await c.appendAudit({ kind: 'review_orchestration', changeId: change.id, action: 'review_pass_approved' });
+          await c.appendAudit({ kind: 'review_orchestration', changeId: change.id, action: 'review_pass_approved', sessionId: options.sessionId, revision: status.revision ?? null });
           return { outcome: 'approved' };
         }
         // fail path
@@ -520,15 +568,21 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         if (escalate) {
           const failedTask = t.updateIf(taskId, { status: 'in_review' }, { status: 'failed', result_summary: 'escalated to failed after repair threshold' });
           if (!failedTask) {
-            await c.appendAudit({ kind: 'review_orchestration', changeId: change.id, action: 'escalated_task_race' });
+            await c.appendAudit({ kind: 'review_orchestration', changeId: change.id, action: 'escalated_task_race', sessionId: options.sessionId, revision: status.revision ?? null });
             return { outcome: 'task_update_race' };
           }
-          await c.appendAudit({ kind: 'review_orchestration', changeId: change.id, action: 'escalated', attempts: attemptsSeen });
+          // Close the Change too — an escalated Change left in REPAIR would
+          // block re-linking and leave worker/reviewer bindings dangling.
+          try { await c.transition(change.id, 'REJECTED', { actor: 'review-orchestration' }); } catch { /* REVIEW/REPAIR → REJECTED may be unavailable */ }
+          await c.appendAudit({
+            kind: 'review_orchestration', changeId: change.id, action: 'escalated',
+            sessionId: options.sessionId, revision: status.revision ?? null, attempts: attemptsSeen,
+          });
           return { outcome: 'escalated', attempts: attemptsSeen };
         }
         const updated = t.updateIf(taskId, { status: 'in_review' }, { status: 'changes_requested' });
         if (!updated) return { outcome: 'task_update_race' };
-        await c.appendAudit({ kind: 'review_orchestration', changeId: change.id, action: 'review_fail_to_repair' });
+        await c.appendAudit({ kind: 'review_orchestration', changeId: change.id, action: 'review_fail_to_repair', sessionId: options.sessionId, revision: status.revision ?? null });
         return { outcome: 'repair' };
       })();
     },
@@ -559,65 +613,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
      * @param {{ spec?: object, launcherOptions?: object }} [options]
      */
     launchReviewer(taskId, options = {}) {
-      const t = requireTask();
-      const c = requireChange();
-      requireTaskId(taskId);
-      if (typeof t.createReviewerLauncher !== 'function') {
-        return Promise.reject(Object.assign(
-          new Error('taskOrchestrator facade does not expose createReviewerLauncher'),
-          { code: 'REVIEWER_LAUNCHER_UNAVAILABLE' },
-        ));
-      }
-      return (async () => {
-        const task = await Promise.resolve(t.get(taskId));
-        if (!task) throw Object.assign(new Error(`task not found: ${taskId}`), { code: 'TASK_NOT_FOUND' });
-        const change = await c.findByWorkItem(WORK_ITEM_SYSTEM, taskId);
-        if (!change) throw Object.assign(new Error(`no Change linked to task ${taskId}`), { code: 'CHANGE_NOT_FOUND' });
-        const launcher = /** @type {any} */ (t).createReviewerLauncher(options.launcherOptions ?? {});
-        const defaultPrompt = `You are the independent reviewer for task ${task.id}.
-Review the governed Change ${change.id} against its Plan and project task acceptance criteria. Read-only: do NOT modify any files. Inspect the worker's submitted proof and test log and decide PASS / FAIL / ESCALATE with a brief rationale.`;
-        const spec = options.spec ?? {
-          mode: 'session',
-          prompt: defaultPrompt,
-          agentPreset: task.reviewer_profile ?? 'reviewer',
-          // Parse 'provider/model' convention, same as worker_model elsewhere;
-          // bare 'model' leaves provider undefined and DSH host resolution fills
-          // it at session.selectModel time.
-          ...(typeof task.reviewer_model === 'string' && task.reviewer_model !== ''
-            ? (() => {
-                const s = task.reviewer_model;
-                const slash = s.indexOf('/');
-                if (slash < 1 || slash === s.length - 1) {
-                  throw Object.assign(
-                    new Error(`reviewer_model must be 'provider/model' (got: ${s})`),
-                    { code: 'REVIEWER_MODEL_MALFORMED' },
-                  );
-                }
-                return { model: { provider: s.slice(0, slash), model: s.slice(slash + 1) } };
-              })()
-            : {}),
-        };
-        const handle = await launcher.launch({ task, spec });
-        if (typeof handle?.sessionId !== 'string' || handle.sessionId === '') {
-          if (typeof handle?.terminate === 'function') {
-            try { await handle.terminate(); } catch { /* best-effort */ }
-          }
-          throw Object.assign(new Error('reviewer launcher returned no sessionId'), { code: 'SESSION_ID_MISSING' });
-        }
-        let binding;
-        try {
-          binding = await c.bindRole(change.id, handle.sessionId, 'reviewer');
-        } catch (error) {
-          // If binding fails the session would be orphaned: terminate it so
-          // there is no live reviewer session with no track record on the
-          // Change side.
-          if (typeof handle?.terminate === 'function') {
-            try { await handle.terminate(); } catch { /* best-effort */ }
-          }
-          throw error;
-        }
-        return { sessionId: handle.sessionId, changeId: change.id, binding, handle };
-      })();
+      return launchReviewerForTask(requireTask, requireChange, requireTaskId, taskId, options);
     },
 
     /**
@@ -792,4 +788,68 @@ Review the governed Change ${change.id} against its Plan and project task accept
     },
   };
   return Object.freeze(api);
+}
+
+
+/**
+ * Internal reviewer launch. Factored as a free function so runGovernedReview
+ * does not depend on the frozen-facade `this` binding.
+ *
+ * @param {() => TaskOrchestratorApi} requireTask
+ * @param {() => ChangeControlApi} requireChange
+ * @param {(taskId: any) => void} requireTaskId
+ * @param {string} taskId
+ * @param {{ spec?: object, launcherOptions?: object }} [options]
+ */
+function launchReviewerForTask(requireTask, requireChange, requireTaskId, taskId, options = {}) {
+  const t = requireTask();
+  const c = requireChange();
+  requireTaskId(taskId);
+  if (typeof t.createReviewerLauncher !== 'function') {
+    return Promise.reject(Object.assign(
+      new Error('taskOrchestrator facade does not expose createReviewerLauncher'),
+      { code: 'REVIEWER_LAUNCHER_UNAVAILABLE' },
+    ));
+  }
+  return (async () => {
+    const task = await Promise.resolve(t.get(taskId));
+    if (!task) throw Object.assign(new Error(`task not found: ${taskId}`), { code: 'TASK_NOT_FOUND' });
+    const change = await c.findByWorkItem(WORK_ITEM_SYSTEM, taskId);
+    if (!change) throw Object.assign(new Error(`no Change linked to task ${taskId}`), { code: 'CHANGE_NOT_FOUND' });
+    const launcher = /** @type {any} */ (t).createReviewerLauncher(options.launcherOptions ?? {});
+    const defaultPrompt = `You are the independent reviewer for task ${task.id}.
+Review the governed Change ${change.id} against its Plan and project task acceptance criteria. Read-only: do NOT modify any files. Inspect the worker's submitted proof and test log and decide PASS / FAIL / ESCALATE with a brief rationale.`;
+    const spec = options.spec ?? {
+      mode: 'session',
+      prompt: defaultPrompt,
+      agentPreset: task.reviewer_profile ?? 'reviewer',
+      ...(typeof task.reviewer_model === 'string' && task.reviewer_model !== ''
+        ? (() => {
+            const s = String(task.reviewer_model);
+            const slash = s.indexOf('/');
+            if (slash < 1 || slash === s.length - 1) {
+              throw Object.assign(new Error(`reviewer_model must be 'provider/model' (got: ${s})`), { code: 'REVIEWER_MODEL_MALFORMED' });
+            }
+            return { model: { provider: s.slice(0, slash), model: s.slice(slash + 1) } };
+          })()
+        : {}),
+    };
+    const handle = await launcher.launch({ task, spec });
+    if (typeof handle?.sessionId !== 'string' || handle.sessionId === '') {
+      if (typeof handle?.terminate === 'function') {
+        try { await handle.terminate(); } catch { /* best-effort */ }
+      }
+      throw Object.assign(new Error('reviewer launcher returned no sessionId'), { code: 'SESSION_ID_MISSING' });
+    }
+    let binding;
+    try {
+      binding = await c.bindRole(change.id, handle.sessionId, 'reviewer');
+    } catch (error) {
+      if (typeof handle?.terminate === 'function') {
+        try { await handle.terminate(); } catch { /* best-effort */ }
+      }
+      throw error;
+    }
+    return { sessionId: handle.sessionId, changeId: change.id, binding, handle };
+  })();
 }

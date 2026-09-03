@@ -1448,6 +1448,9 @@ export class ChangeStore {
       });
 
       // Worker implementation attempt (kept UNDER in-memory after reseed).
+      // we record BOTH the worker profile (workerId) AND the bound session
+      // so submitReview's REVIEWER_NOT_INDEPENDENT check is keyed on the
+      // session namespace — the profile alone would never match.
       {
         const attempts200 = this.#attempts.get(changeId) ?? [];
         const workerBinding501 = (this.#bindings.get(changeId) ?? []).find((b) => b.role === 'worker' && (expected.sessionId ? b.sessionId === expected.sessionId : true));
@@ -1455,6 +1458,7 @@ export class ChangeStore {
           changeId,
           attemptId: `${changeId}:${proof.commit_sha ?? 'unknown'}:${proof.afterRevision ?? 'unknown'}`,
           workerId: workerBinding501?.worker ?? expected.sessionId ?? 'unknown',
+          sessionId: expected.sessionId ?? workerBinding501?.sessionId ?? null,
           status: 'proof_submitted',
           revision: proof.afterRevision ?? null,
           recordedAt: new Date().toISOString(),
@@ -1834,7 +1838,7 @@ export class ChangeStore {
 
       // Reject if reviewer session appears as workerId in any recorded attempt (self-review)
       const attempts = this.#attempts.get(changeId) ?? [];
-      if (attempts.some((a) => a.workerId === sessionId)) {
+      if (attempts.some((a) => a.sessionId === sessionId || a.workerId === sessionId)) {
         throw Object.assign(new Error(`Session ${sessionId} has recorded implementation attempts on this change`), { code: 'REVIEWER_NOT_INDEPENDENT' });
       }
 
@@ -2208,7 +2212,24 @@ export class ChangeStore {
         ts: c.updatedAt,
       });
 
-      // Worker implementation attempt (kept UNDER in-memory after reseed).
+      // Worker implementation attempt: a repair is a fresh implementation
+      // round — revision is the new afterRevision, and we persist BOTH the
+      // worker profile and the bound session so reviewer independence can
+      // check sessionId namespaces at submitReview time.
+      {
+        const attempts300 = this.#attempts.get(changeId) ?? [];
+        const workerBindingRightNow = (this.#bindings.get(changeId) ?? []).find((b) => b.role === 'worker');
+        attempts300.push({
+          changeId,
+          attemptId: `${changeId}:repair:${repair.proof.afterRevision ?? 'unknown'}`,
+          workerId: workerBindingRightNow?.worker ?? 'unknown',
+          sessionId: workerBindingRightNow?.sessionId ?? null,
+          status: 'repair_submitted',
+          revision: repair.proof.afterRevision ?? null,
+          recordedAt: new Date().toISOString(),
+        });
+        this.#attempts.set(changeId, attempts300);
+      }
 
       await this.#persist();
 
