@@ -81,6 +81,8 @@ export function createChangeControlService(store) {
      */
     setRisk: (changeId, risk) => store.setRisk(changeId, risk),
 
+    transition: (changeId, toState, opts) => store.transition(changeId, toState, opts),
+
     /**
      * Canonical read-only status projection: state, risk, accepted plan,
      * bindings, revision, proof, preflight, open findings.

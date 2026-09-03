@@ -25,7 +25,7 @@ function unavailable(detail) {
 /**
  * Minimal typed views of the two domain services this package depends on.
  * @typedef {{ get: (id: string) => Promise<any>, update: (id: string, patch: any) => Promise<any>, createDispatcher: (options?: any) => any, createWorkerLauncher?: (options?: any) => any }} TaskOrchestratorApi
- * @typedef {{ get: (id: string) => Promise<any>, findByWorkItem: (system: string, id: string) => Promise<any>, findOrCreateForWorkItem: (input: { system: string, id: string, change: object }) => Promise<any> }} ChangeControlApi
+ * @typedef {{ get: (id: string) => Promise<any>, findByWorkItem: (system: string, id: string) => Promise<any>, findOrCreateForWorkItem: (input: { system: string, id: string, change: object }) => Promise<any>, resolveRole: (changeId: string, sessionId: string) => Promise<string>, submitProof: (changeId: string, proof: any) => Promise<any>, transition: (changeId: string, toState: string, opts?: any) => Promise<any> }} ChangeControlApi
  * @param {object} deps
  * @param {() => TaskOrchestratorApi | undefined} deps.taskOrchestrator accessor (may be absent)
  * @param {() => ChangeControlApi | undefined} deps.changeControl accessor (may be absent)
@@ -181,6 +181,90 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
             }
           : integrationGuard,
       });
+    },
+
+    /**
+     * T7.1 — Governed completion pipeline.
+     * Validates: active lease (owner matches), worker Change binding for the
+     * given sessionId, then submits Change-side proof, then moves the task to
+     * in_review with the matching commit/files/tests/blockers. Idempotent —
+     * repeat calls converge without duplicate proof events.
+     *
+     * @param {string} taskId
+     * @param {{ sessionId: string, worker: string, proof: object }} input
+     */
+    completeGovernedTask(taskId, /** @type {{ sessionId: string, worker: string, proof: any }} */ input) {
+      const taskOrchestrator = requireTask();
+      const c = requireChange();
+      return (async () => {
+        const sessionId = input.sessionId;
+        const worker = input.worker;
+        const proof = input.proof ?? {};
+        if (typeof sessionId !== 'string' || sessionId.trim() === '') {
+          throw Object.assign(new Error('sessionId is required'), { code: 'INVALID_SESSION' });
+        }
+        if (typeof worker !== 'string' || worker.trim() === '') {
+          throw Object.assign(new Error('worker is required'), { code: 'INVALID_WORKER' });
+        }
+        const task = await Promise.resolve(taskOrchestrator.get(taskId));
+        if (!task) throw Object.assign(new Error(`task not found: ${taskId}`), { code: 'TASK_NOT_FOUND' });
+
+        // Idempotency fast-path: already converged → return ok without mutation.
+        if (task.status === 'in_review') {
+          const existingLink = await c.findByWorkItem(WORK_ITEM_SYSTEM, taskId);
+          if (existingLink) {
+            const existing = await c.get(existingLink.id);
+            if (existing.state === 'PREFLIGHT') return { ok: true, taskId, changeId: existingLink.id };
+          }
+        }
+
+        // LEASE CHECK FIRST — never consult Change state on an unprepared task.
+        if (task.status !== 'claimed' && task.status !== 'running') {
+          throw Object.assign(new Error(`task not claim-held: status=${task.status}`), { code: 'TASK_LEASE_INVALID' });
+        }
+        if (task.claimed_by !== worker) {
+          throw Object.assign(new Error(`task is claimed by ${task.claimed_by}, not ${worker}`), { code: 'TASK_LEASE_INVALID' });
+        }
+        if (Number(task.lease_expires_at ?? 0) <= Date.now()) {
+          throw Object.assign(new Error('task claim lease has expired'), { code: 'TASK_LEASE_INVALID' });
+        }
+
+        const changed = await c.findByWorkItem(WORK_ITEM_SYSTEM, taskId);
+        if (!changed) throw Object.assign(new Error(`no Change linked for ${taskId}`), { code: 'WORK_ITEM_NOT_LINKED' });
+
+        // 2. Session must be bound as worker on this Change.
+        let boundRole = null;
+        try {
+          boundRole = await c.resolveRole(changed.id, sessionId);
+        } catch (error) {
+          throw Object.assign(
+            new Error(`session ${sessionId} is not bound as worker`),
+            { code: 'SESSION_NOT_BOUND', cause: error },
+          );
+        }
+        if (boundRole !== 'worker') {
+          throw Object.assign(new Error(`session ${sessionId} is not bound as worker (got ${boundRole})`), { code: 'SESSION_NOT_BOUND' });
+        }
+
+        // 3. Idempotent Change transition — only on IMPLEMENTING. Second pass = noop.
+        const change = await c.get(changed.id);
+        if (change.state === 'IMPLEMENTING') {
+          await c.submitProof(changed.id, { ...proof, sessionId });
+        } else if (change.state !== 'PREFLIGHT') {
+          throw Object.assign(new Error(`cannot complete from Change state ${change.state}`), { code: 'INVALID_STATE' });
+        }
+
+        // 4. Task-side reconciliation with the same structured information.
+        await Promise.resolve(taskOrchestrator.update(taskId, {
+          status: 'in_review',
+          commit_sha: proof.commit_sha,
+          files_changed: proof.files_changed ?? [],
+          tests_run: proof.tests_run ?? [],
+          remaining_blockers: proof.remaining_blockers ?? [],
+          result_summary: proof.summary ?? proof.title ?? 'governed completion',
+        }));
+        return { ok: true, taskId, changeId: changed.id };
+      })();
     },
 
     /** True when both domain services are resolvable right now. */
