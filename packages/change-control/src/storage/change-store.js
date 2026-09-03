@@ -653,6 +653,7 @@ export class ChangeStore {
       // Reseed from disk under lock immediately before assigning eventId,
       // so concurrent process writes are visible and no collision occurs.
       await reseedFromDisk(this.#file);
+
       this.#audit.push({
         eventId: nextEventId(),
         changeId: change.id,
@@ -1431,6 +1432,12 @@ export class ChangeStore {
       const before = c.state;
       c.transitionTo('PREFLIGHT');
 
+      // Record the worker's implementation attempt. Reviewer-independence
+      // (submitReview) reads the attempt list, so a review can never be
+      // submitted for a change that never had a worker-run.
+
+
+
       await reseedFromDisk(this.#file);
       this.#audit.push({
         eventId: nextEventId(),
@@ -1439,6 +1446,21 @@ export class ChangeStore {
         to: 'PREFLIGHT',
         ts: c.updatedAt,
       });
+
+      // Worker implementation attempt (kept UNDER in-memory after reseed).
+      {
+        const attempts200 = this.#attempts.get(changeId) ?? [];
+        const workerBinding501 = (this.#bindings.get(changeId) ?? []).find((b) => b.role === 'worker' && (expected.sessionId ? b.sessionId === expected.sessionId : true));
+        attempts200.push({
+          changeId,
+          attemptId: `${changeId}:${proof.commit_sha ?? 'unknown'}:${proof.afterRevision ?? 'unknown'}`,
+          workerId: workerBinding501?.worker ?? expected.sessionId ?? 'unknown',
+          status: 'proof_submitted',
+          revision: proof.afterRevision ?? null,
+          recordedAt: new Date().toISOString(),
+        });
+        this.#attempts.set(changeId, attempts200);
+      }
 
       // Store proof
       this.#proofs.set(changeId, structuredClone(proof));
@@ -2176,6 +2198,7 @@ export class ChangeStore {
       const before = c.state;
       c.transitionTo('PREFLIGHT');
 
+
       await reseedFromDisk(this.#file);
       this.#audit.push({
         eventId: nextEventId(),
@@ -2184,6 +2207,21 @@ export class ChangeStore {
         to: 'PREFLIGHT',
         ts: c.updatedAt,
       });
+
+      // Worker implementation attempt (kept UNDER in-memory after reseed).
+      {
+        const attempts200 = this.#attempts.get(changeId) ?? [];
+        const workerBinding501 = (this.#bindings.get(changeId) ?? []).find((b) => b.role === 'worker' && (expected.sessionId ? b.sessionId === expected.sessionId : true));
+        attempts200.push({
+          changeId,
+          attemptId: `${changeId}:${proof.commit_sha ?? 'unknown'}:${proof.afterRevision ?? 'unknown'}`,
+          workerId: workerBinding501?.worker ?? expected.sessionId ?? 'unknown',
+          status: 'proof_submitted',
+          revision: proof.afterRevision ?? null,
+          recordedAt: new Date().toISOString(),
+        });
+        this.#attempts.set(changeId, attempts200);
+      }
 
       await this.#persist();
 
