@@ -117,25 +117,86 @@ test('failed launch: no worker binding is created (nothing to clean up)', async 
   assert.equal(bindings.length, 0);
 });
 
-test('kill switch: cancelled/dispatched-off run unbinds through terminate', async (t) => {
+test('kill switch: terminate on the WIRED handle unbinds the binding (no leaked role)', async (t) => {
   const { ctx, taskStore, dir } = await compose(t);
   const { task, change } = await governedReadyTask(ctx, taskStore, dir);
+  const { createBindingLauncher } = await import('../src/binding.js');
   const launcher = fakeSessionLauncher({ sessionId: 'sess-kill' });
+  const wrapped = createBindingLauncher(launcher, ctx.get('changeControl'), SYSTEM);
+  const handle = await wrapped.launch({ task: { id: task.id }, spec: { mode: 'session' }, runId: 'run-kill' });
+  let s = await ctx.changeControl.status(change.id);
+  assert.ok(s.bindings.some((b) => b.sessionId === 'sess-kill'), 'bound pre-terminate');
+  await handle.terminate('SIGTERM');
+  s = await ctx.changeControl.status(change.id);
+  assert.deepEqual(s.bindings.filter((b) => b.sessionId === 'sess-kill'), [], 'post-terminate unbound');
+});
+
+test('importing an incidental sessionId on a HEADLESS spec does NOT bind', async (t) => {
+  const { ctx, taskStore, dir } = await compose(t);
+  const { task, change } = await governedReadyTask(ctx, taskStore, dir);
+  const { createBindingLauncher } = await import('../src/binding.js');
+  const raw = {
+    async launch() { return { sessionId: 'incidental-headless', wait: async () => ({ exitCode: 0 }) }; },
+  };
+  const wrapped = createBindingLauncher(raw, ctx.get('changeControl'), SYSTEM);
+  const handle = await wrapped.launch({ task: { id: task.id }, spec: { mode: 'headless-profile' }, runId: 'run-h' });
+  assert.equal(handle.sessionId, 'incidental-headless'); // pass through untouched
+  const s = await ctx.changeControl.status(change.id);
+  assert.equal(s.bindings.filter((b) => b.sessionId === 'incidental-headless').length, 0);
+});
+
+test('UNGOVERNED task: session launcher never creates bindings', async (t) => {
+  const { ctx, taskStore, dir } = await compose(t);
+  const task = await taskStore.create({
+    title: 'ungoverned sesh', description: 'd', status: 'ready', workspace: dir,
+    worker_profile: 'worker', acceptance_criteria: ['a'],
+  });
+  const launcher = fakeSessionLauncher({ sessionId: 'sess-ungoverned' });
   const dispatcher = ctx.taskChangeControl.createGovernedDispatcher({ launcher });
   const done = dispatcher.dispatchTask(task);
   await launcher.launchedResolved;
-  await new Promise((r) => setTimeout(r, 25));
-  // Expired lease / reassignment path: dispatcher handles it when the handle is terminated.
-  const handle = { terminate: async () => { launcher.resolveGate({ exitCode: null, signal: 'SIGTERM', stdout: '', stderr: 'kill' }); return true; } };
-  await handle.terminate();
-  await done;
-  const bindings = await ctx.changeControl.status(change.id).then((s) => s.bindings);
-  assert.equal(bindings.filter((b) => b.sessionId === 'sess-kill').length, 0);
+  launcher.resolveGate({ exitCode: 0, stdout: 'ok', stderr: '' });
+  const result = await done;
+  assert.equal(result.status, 'in_review');
+  // No Change exists at all, so no bindings anywhere on this context.
+  const list = await ctx.changeControl.list?.() ?? [];
+  for (const c of list) {
+    const s = await ctx.changeControl.status(c.id);
+    assert.equal(s.bindings.length, 0, 'ungoverned session never binds');
+  }
 });
 
-test('model surface: no change_bind* / change_create* tool exists on the integration', async (t) => {
+test('bind failure mid-launch TERMINATES the orphaned session before rethrow', async (t) => {
+  const { ctx, taskStore, dir } = await compose(t);
+  const { task } = await governedReadyTask(ctx, taskStore, dir);
+  const { createBindingLauncher } = await import('../src/binding.js');
+  let terminateCalls = 0;
+  const raw = {
+    async launch() {
+      return {
+        sessionId: 'sess-orphan',
+        wait: async () => ({ exitCode: 0 }),
+        async terminate() { terminateCalls++; return true; },
+      };
+    },
+  };
+  const broken = {
+    ...ctx.get('changeControl'),
+    bindRole: async () => { throw Object.assign(new Error('clash'), { code: 'ALREADY_BOUND' }); },
+  };
+  const wrapped = createBindingLauncher(raw, broken, SYSTEM);
+  await assert.rejects(
+    wrapped.launch({ task: { id: task.id }, spec: { mode: 'session' }, runId: 'run-orphan' }),
+    (error) => error && error.code === 'ALREADY_BOUND',
+  );
+  assert.equal(terminateCalls, 1, 'orphaned sessions must be terminated before rethrow');
+});
+
+test('model surface: zero change_bind* / change_create* / change_set* tool exists on the integration', async (t) => {
   const { ctx } = await compose(t);
   const names = [...ctx.tools.view().knownNames];
-  const agentsVisible = ['change_bind_task_session', 'change_bind', 'change_create', 'change_bind_worker'];
-  for (const n of agentsVisible) assert.ok(!names.includes(n), `${n} must not exist`);
+  for (const n of names) {
+    assert.ok(!n.startsWith('change_bind'), `${n} must not exist`);
+    assert.ok(!/change_(create|set_|bootstrap_state)/.test(n) || n === 'change_bootstrap_task', `${n} must not exist`);
+  }
 });

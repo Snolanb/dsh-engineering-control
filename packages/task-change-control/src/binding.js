@@ -24,12 +24,24 @@ export function createBindingLauncher(launcher, changeControl, WORK_ITEM_SYSTEM)
   return {
     async launch(input) {
       const handle = await launcher.launch(input);
-      if (!handle || typeof handle !== 'object' || !handle.sessionId) return handle; // headless / no session
-      // Session bound: task.id carries the governed key; resolve Change via
-      // the integration read path — findByWorkItem rehydrates against disk.
-      const change = await changeControl.findByWorkItem(WORK_ITEM_SYSTEM, input.task.id);
-      if (!change) return handle; // ungoverned dispatch: no binding to create
-      await changeControl.bindRole(change.id, handle.sessionId, 'worker');
+      if (input?.spec?.mode !== 'session') return handle; // headless: never bind
+      if (!handle || typeof handle !== 'object' || !handle.sessionId) {
+        // Session mode but the launcher produced no sessionId → fail closed,
+        // terminating whatever leaked so nothing surfaces unbound.
+        try { await handle?.terminate?.(); } catch {}
+        throw new Error('session launcher did not return sessionId');
+      }
+      let change;
+      try {
+        // Task → Change resolution via the canonical Change-side path.
+        change = await changeControl.findByWorkItem(WORK_ITEM_SYSTEM, input.task.id);
+        if (!change) return handle; // ungoverned: nothing to bind
+        await changeControl.bindRole(change.id, handle.sessionId, 'worker');
+      } catch (error) {
+        // On lookup/bind failure, the child session is orphaned. kill before rethrow.
+        try { await handle.terminate?.('SIGKILL'); } catch {}
+        throw error;
+      }
       // Chain-cleanup: whatever consumes wait() gets lifecycle-clean bindings.
       const wait = typeof handle.wait === 'function' ? handle.wait.bind(handle) : null;
       const unbind = async () => {

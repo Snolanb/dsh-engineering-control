@@ -7,6 +7,11 @@
  */
 import { createGovernanceGuard } from './governance.js';
 import { createBindingLauncher } from './binding.js';
+/* Node's node:crypto/child_process are unavailable under `checkJs` when importing
+ * a dependency's compiled lib/*.js. Point TypeScript at the source surface for
+ * type purposes only; the runtime resolves it as the workspace package. */
+// @ts-ignore — runtime resolves via pnpm workspace; types not needed here
+import { createWorkerLauncher as defaultWorkerLauncher } from 'dsh-task-orchestrator/dispatcher';
 
 /** The task-orchestrator identity on the Change-side workItem. */
 export const WORK_ITEM_SYSTEM = 'dsh-task-orchestrator';
@@ -162,15 +167,15 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
       // unbinds on finally-after-wait AND terminate — even if the caller
       // passes their own launcher (they get a wrapped one, behavior visible
       // in audit, not in spec).
-      // T6.1: when a launcher is supplied, wrap it with the binding hook:
-      // bind the returned sessionId ('worker' role) on launch, unbind on
-      // wait-settle AND terminate. When the caller delegates launch to the
-      // domain default (no launcher passed), standalone semantics stay
-      // byte-identical — binding wiring for the default launcher lives with
-      // the host that configures it.
+      // T6.1: ALWAYS bind at the dispatcher level. The integration owns the
+      // launcher it installs: options.launcher (caller-supplied) wins;
+      // otherwise we wire the documented default ourselves so `createGovernedDispatcher()`
+      // without arguments ALSO binds the returned sessionId. Headless/skipped
+      // modes pass through unchanged.
+      const baseLauncher = options.launcher ?? defaultWorkerLauncher(options.launcherOptions ?? {});
       return t.createDispatcher({
         ...options,
-        ...(options.launcher ? { launcher: createBindingLauncher(options.launcher, c, WORK_ITEM_SYSTEM) } : {}),
+        launcher: createBindingLauncher(baseLauncher, c, WORK_ITEM_SYSTEM),
         preDispatch: userGuard
           ? async (/** @type {any} */ input) => {
               const mandatory = await integrationGuard(input);

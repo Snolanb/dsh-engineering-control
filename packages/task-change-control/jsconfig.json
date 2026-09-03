@@ -7,7 +7,19 @@
     "esModuleInterop": true,
     "skipLibCheck": true,
     "checkJs": true,
-    "noEmit": true
+    "noEmit": true,
+    "paths": {
+      "dsh-task-orchestrator/dispatcher": [
+        "./src/dispatcher.d.ts"
+      ]
+    }
   },
-  "include": ["src/**/*.js"]
+  "include": [
+    "src/**/*.js",
+    "src/**/*.d.ts"
+  ],
+  "exclude": [
+    "../task-orchestrator/lib",
+    "../change-control/lib"
+  ]
 }

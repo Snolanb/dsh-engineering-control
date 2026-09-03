@@ -67,7 +67,7 @@ test('governed task WITHOUT accepted plan or READY Change is blocked with named 
     worker_profile: 'worker', acceptance_criteria: ['a'],
   });
   await ctx.taskChangeControl.bootstrapTask(task.id); // DRAFT, no plan
-  const dispatcher = ctx.taskChangeControl.createGovernedDispatcher();
+  const dispatcher = ctx.taskChangeControl.createGovernedDispatcher({ launcher: GOOD_LAUNCHER });
   const result = await dispatcher.dispatchTask(task);
   assert.equal(result.dispatched, false);
   assert.equal(result.reason, 'dispatch_not_governed');
@@ -143,7 +143,7 @@ test('fully governed task clears the guard and dispatches', async (t) => {
   t.after(() => rm(dir, { recursive: true, force: true }));
   const { ctx, taskStore } = await compose(t);
   const { task } = await makeReadyGovernedTask(t, ctx, taskStore, dir);
-  const dispatcher = ctx.taskChangeControl.createGovernedDispatcher();
+  const dispatcher = ctx.taskChangeControl.createGovernedDispatcher({ launcher: GOOD_LAUNCHER });
   const result = await dispatcher.dispatchTask(task);
   assert.equal(result.dispatched, true);
   assert.equal(result.status, 'in_review');
@@ -159,6 +159,7 @@ test('caller preDispatch may NOT replace the integration guard; it only composes
   });
   await ctx.taskChangeControl.bootstrapTask(task.id); // linked, DRAFT — MUST be blocked
   const laxed = ctx.taskChangeControl.createGovernedDispatcher({
+    launcher: GOOD_LAUNCHER,
     preDispatch: async () => ({ ok: true }), // attacker proposes "always allow"
   });
   const result = await laxed.dispatchTask(task);
@@ -174,7 +175,7 @@ test('ungoverned task passes the guard untouched (no Change, no failure)', async
     title: 'ungoverned', description: 'd', status: 'ready', workspace: dir,
     worker_profile: 'worker', acceptance_criteria: ['a'],
   });
-  const dispatcher = ctx.taskChangeControl.createGovernedDispatcher();
+  const dispatcher = ctx.taskChangeControl.createGovernedDispatcher({ launcher: GOOD_LAUNCHER });
   const result = await dispatcher.dispatchTask(task);
   assert.equal(result.dispatched, true);
   assert.equal(result.status, 'in_review');
