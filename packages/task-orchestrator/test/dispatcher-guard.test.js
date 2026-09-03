@@ -91,6 +91,32 @@ test('slow guard with expired lease never strands the task (claim restored)', as
   assert.notEqual(result.claim_cleanup, 'failed')
 })
 
+test('expired-lease rejection never clobbers a concurrent reclaimer', async t => {
+  const f = fixture(); t.after(() => f.cleanup())
+  const task = readyTask(f)
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+  const dispatcher = new WorkerDispatcher({
+    store: f.store,
+    registry: f.registry,
+    idFactory: () => 'run-race',
+    preflight: async () => ({ ok: true, spec: { ...f.registry.get('worker'), leaseSeconds: 1 } }),
+    launcher: { async launch() { throw new Error('must not launch') } },
+    preDispatch: async ({ task: t2 }) => {
+      await sleep(1300) // lease (1s) expires
+      // A second worker reclaims mid-guard.
+      const reclaim = f.store.claim(task.id, 'other-worker', { lease_seconds: 60, actor: 'reclaimer' })
+      assert.equal(reclaim.claimed, true)
+      return { ok: false, code: 'DISPATCH_NOT_GOVERNED', preconditions: [] }
+    },
+  })
+  const result = await dispatcher.dispatchTask(task)
+  assert.equal(result.dispatched, false)
+  assert.equal(result.claim_cleanup, 'held_by_other', 'must NOT clobber the concurrent claim')
+  const after = f.store.get(task.id)
+  assert.equal(after.status, 'claimed', 'second worker\'s claim survives')
+  assert.equal(after.claimed_by, 'other-worker')
+})
+
 test('approving preDispatch guard dispatches normally', async t => {
   const f = fixture(); t.after(() => f.cleanup())
   const task = readyTask(f)

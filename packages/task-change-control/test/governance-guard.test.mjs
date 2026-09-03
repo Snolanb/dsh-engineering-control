@@ -88,7 +88,7 @@ test('non-{ok:true} verdict (undefined/null/false) fails closed at the dispatche
     title: 'raw dispatcher', description: 'd', status: 'ready', workspace: dir,
     worker_profile: 'worker', acceptance_criteria: ['a'],
   });
-  for (const bad of [undefined, null, false, {}, 'ok']) {
+  for (const bad of [undefined, null, false, {}, 'ok', { ok: true, extra: 'unexpected' }, [], { ok: 1 }]) {
     const { WorkerDispatcher } = await import('dsh-task-orchestrator/dispatcher');
     const dispatcher = new WorkerDispatcher({
       store: taskStore, registry,

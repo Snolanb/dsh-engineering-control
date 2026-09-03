@@ -153,11 +153,20 @@ export class WorkerDispatcher {
       this.store.release(taskId, worker, { actor: this.actor })
       return 'released'
     } catch {
-      // Lease expired mid-guard: release refuses by design. Revert through the
-      // legal claimed→ready transition; its status event handler clears claim
-      // bookkeeping, so a guard delay can never strand the task.
+      // Lease likely expired mid-guard. Atomically RE-claim as this worker
+      // (claim() only succeeds if the lease is still expired or the task is
+      // claimable — a THIRD party holding a live lease forces already_claimed)
+      // then release under the fresh lease. Fully transactional: no window for
+      // another owner to be clobbered.
+      let reclaim
       try {
-        this.store.update(taskId, { status: 'ready' }, { actor: this.actor })
+        reclaim = this.store.claim(taskId, worker, { actor: this.actor })
+      } catch {
+        return 'failed'
+      }
+      if (!reclaim.claimed) return reclaim.reason === 'already_claimed' ? 'held_by_other' : 'failed'
+      try {
+        this.store.release(taskId, worker, { actor: this.actor })
         return 'reverted'
       } catch {
         return 'failed'
@@ -186,8 +195,13 @@ export class WorkerDispatcher {
       } catch (error) {
         verdict = { ok: false, code: 'GUARD_ERROR', error: errorText(error) }
       } finally {
-        // Fail-closed: anything but the exact { ok: true } shape counts as rejection.
-        if (!(verdict && verdict.ok === true)) {
+        // Fail-closed: ONLY the exact one-key shape { ok: true } counts as
+        // approval. Extra keys, missing ok, or non-object verdicts all reject.
+        const strictPass = verdict !== null
+          && typeof verdict === 'object'
+          && verdict.ok === true
+          && Object.keys(verdict).length === 1
+        if (!strictPass) {
           verdict = (verdict && typeof verdict === 'object' && verdict.ok === false)
             ? verdict
             : { ok: false, code: 'GUARD_REJECTED', detail: verdict ?? null }
