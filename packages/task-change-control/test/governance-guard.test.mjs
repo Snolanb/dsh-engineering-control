@@ -76,6 +76,33 @@ test('governed task WITHOUT accepted plan or READY Change is blocked with named 
   assert.equal((await taskStore.get(task.id)).status, 'ready', 'claim released');
 });
 
+test('non-{ok:true} verdict (undefined/null/false) fails closed at the dispatcher', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'tcc-guard-fco-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const { taskStore } = await compose(t);
+  // Direct WorkerDispatcher with a leaky callback — no integration layer involved.
+  const registry = new WorkerSpecRegistry({
+    worker: { mode: 'headless-profile', profile: 'wp', provider: 'ollama', model: 'm', workspacePolicy: 'any', timeoutMs: 1000, leaseSeconds: 30 },
+  });
+  const task = await taskStore.create({
+    title: 'raw dispatcher', description: 'd', status: 'ready', workspace: dir,
+    worker_profile: 'worker', acceptance_criteria: ['a'],
+  });
+  for (const bad of [undefined, null, false, {}, 'ok']) {
+    const { WorkerDispatcher } = await import('dsh-task-orchestrator/dispatcher');
+    const dispatcher = new WorkerDispatcher({
+      store: taskStore, registry,
+      preflight: async () => ({ ok: true, spec: registry.get('worker') }),
+      launcher: { async launch() { throw new Error('must not launch with fail-closed policy') } },
+      preDispatch: async () => bad,
+    });
+    const result = await dispatcher.dispatchTask(task);
+    assert.equal(result.dispatched, false, `${JSON.stringify(bad)} must fail closed`);
+    assert.equal(result.reason, 'dispatch_not_governed');
+    assert.equal((await taskStore.get(task.id)).status, 'ready', 'claim restored');
+  }
+});
+
 test('fully governed task clears the guard and dispatches', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'tcc-guard-go-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
@@ -85,6 +112,23 @@ test('fully governed task clears the guard and dispatches', async (t) => {
   const result = await dispatcher.dispatchTask(task);
   assert.equal(result.dispatched, true);
   assert.equal(result.status, 'in_review');
+});
+
+test('caller preDispatch may NOT replace the integration guard; it only composes', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'tcc-guard-override-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const { ctx, taskStore } = await compose(t);
+  const task = await taskStore.create({
+    title: 'override-attempt', description: 'd', status: 'ready', workspace: dir,
+    worker_profile: 'worker', acceptance_criteria: ['a'],
+  });
+  await ctx.taskChangeControl.bootstrapTask(task.id); // linked, DRAFT — MUST be blocked
+  const laxed = ctx.taskChangeControl.createGovernedDispatcher({
+    preDispatch: async () => ({ ok: true }), // attacker proposes "always allow"
+  });
+  const result = await laxed.dispatchTask(task);
+  assert.equal(result.dispatched, false, 'governance must be fail-closed even under override');
+  assert.equal(result.reason, 'dispatch_not_governed');
 });
 
 test('ungoverned task passes the guard untouched (no Change, no failure)', async (t) => {

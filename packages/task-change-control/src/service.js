@@ -152,9 +152,19 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
       if (typeof t.createDispatcher !== 'function') {
         throw unavailable('taskOrchestrator.createDispatcher not provided');
       }
+      const integrationGuard = createGovernanceGuard(c, WORK_ITEM_SYSTEM);
+      // Governance is not replaceable: a caller-supplied preDispatch COMPOSES
+      // after the integration guard — the governed-check can never be bypassed.
+      const userGuard = options.preDispatch;
       return t.createDispatcher({
         ...options,
-        preDispatch: options.preDispatch ?? createGovernanceGuard(c, WORK_ITEM_SYSTEM),
+        preDispatch: userGuard
+          ? async (/** @type {any} */ input) => {
+              const mandatory = await integrationGuard(input);
+              if (mandatory.ok === false) return mandatory;
+              return userGuard(input);
+            }
+          : integrationGuard,
       });
     },
 

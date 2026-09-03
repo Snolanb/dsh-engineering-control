@@ -69,6 +69,28 @@ test('rejected preDispatch guard aborts BEFORE launch, releases the claim, and c
   assert.equal(after.claimed_by, null)
 })
 
+test('slow guard with expired lease never strands the task (claim restored)', async t => {
+  const f = fixture(); t.after(() => f.cleanup())
+  // leaseSeconds grabbed from the worker spec; override to 1 and slow the guard past it.
+  const task = readyTask(f)
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+  const dispatcher = new WorkerDispatcher({
+    store: f.store,
+    registry: f.registry,
+    idFactory: () => 'run-slow',
+    preflight: async () => ({ ok: true, spec: { ...f.registry.get('worker'), leaseSeconds: 1 } }),
+    launcher: { async launch() { throw new Error('must never launch') } },
+    preDispatch: async () => { await sleep(2200); return { ok: false, code: 'DISPATCH_NOT_GOVERNED', preconditions: [] } },
+  })
+  const result = await dispatcher.dispatchTask(task)
+  assert.equal(result.dispatched, false)
+  assert.equal(result.reason, 'dispatch_not_governed')
+  const after = f.store.get(task.id)
+  assert.equal(after.status, 'ready', 'task restored even when the lease expired mid-guard')
+  assert.equal(after.claimed_by, null, 'claim bookkeeping cleared')
+  assert.notEqual(result.claim_cleanup, 'failed')
+})
+
 test('approving preDispatch guard dispatches normally', async t => {
   const f = fixture(); t.after(() => f.cleanup())
   const task = readyTask(f)

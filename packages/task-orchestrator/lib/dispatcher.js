@@ -143,6 +143,28 @@ export class WorkerDispatcher {
     return { dispatched: false, reason: 'no_ready_task', worker_profile: workerProfile }
   }
 
+  /**
+   * Release a held claim; if the lease expired mid-guard (release throws),
+   * revert the task row directly so it can never strand. Returns one of
+   * 'released' | 'reverted' | 'failed'.
+   */
+  releaseOrRevert(taskId, worker) {
+    try {
+      this.store.release(taskId, worker, { actor: this.actor })
+      return 'released'
+    } catch {
+      // Lease expired mid-guard: release refuses by design. Revert through the
+      // legal claimed→ready transition; its status event handler clears claim
+      // bookkeeping, so a guard delay can never strand the task.
+      try {
+        this.store.update(taskId, { status: 'ready' }, { actor: this.actor })
+        return 'reverted'
+      } catch {
+        return 'failed'
+      }
+    }
+  }
+
   async dispatchTask(task) {
     const workerProfile = task.worker_profile
     const preflight = await this.preflight({
@@ -163,16 +185,24 @@ export class WorkerDispatcher {
         verdict = await this.preDispatch({ task: claimed.task ?? task, worker, runId })
       } catch (error) {
         verdict = { ok: false, code: 'GUARD_ERROR', error: errorText(error) }
-      }
-      if (verdict && verdict.ok === false) {
-        try { this.store.release(task.id, worker, { actor: this.actor }) } catch {}
-        return { dispatched: false, reason: 'dispatch_not_governed', predispatch: verdict, task: this.store.get(task.id), run_id: runId, worker }
+      } finally {
+        // Fail-closed: anything but the exact { ok: true } shape counts as rejection.
+        if (!(verdict && verdict.ok === true)) {
+          verdict = (verdict && typeof verdict === 'object' && verdict.ok === false)
+            ? verdict
+            : { ok: false, code: 'GUARD_REJECTED', detail: verdict ?? null }
+          const restored = this.releaseOrRevert(task.id, worker)
+          return {
+            dispatched: false, reason: 'dispatch_not_governed', predispatch: verdict,
+            claim_cleanup: restored, task: this.store.get(task.id), run_id: runId, worker,
+          }
+        }
       }
     }
 
     let handle
     try {
-      handle = await this.launcher.launch({ task, spec, selection: spec.model, runId, worker })
+      handle = await this.launcher.launch({ task: claimed.task ?? task, spec, selection: spec.model, runId, worker })
       this.store.start(task.id, worker, { actor: this.actor })
     } catch (error) {
       await handle?.terminate?.()
