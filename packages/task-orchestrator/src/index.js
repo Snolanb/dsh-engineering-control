@@ -31,6 +31,7 @@ export function apply(ctx, config = {}) {
     get: store.get.bind(store),
     list: store.list.bind(store),
     update: store.update.bind(store),
+    updateIf: store.updateIf.bind(store),
     delete: store.delete.bind(store),
     claim: store.claim.bind(store),
     release: store.release.bind(store),

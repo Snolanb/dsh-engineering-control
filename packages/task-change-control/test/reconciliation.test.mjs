@@ -22,6 +22,7 @@ async function compose(t) {
   ctx.provide('taskOrchestrator', Object.freeze({
     get: taskStore.get.bind(taskStore),
     update: taskStore.update.bind(taskStore),
+    updateIf: (id, expected, patch) => taskStore.updateIf(id, expected, patch),
     complete: taskStore.complete.bind(taskStore),
   }));
   await ctx.plugin(changeControlPlugin, { storePath: join(dir, 'changes.json') });
@@ -57,7 +58,7 @@ async function governedRunning(ctx, taskStore, dir, { leaseSeconds = 300 } = {})
 test('orphan binding after task terminal → auto-repaired with audit record', async (t) => {
   const { ctx, taskStore, dir } = await compose(t);
   const { task, change, runId } = await governedRunning(ctx, taskStore, dir);
-  await taskStore.complete(task.id, { result_summary: 'done' }, { worker: runId });
+  await ctx.taskChangeControl.completeGovernedTask(task.id, { sessionId: 'sess-recon', worker: runId, proof: proofFor('done-real') });
   // Binding remains — orphaned.
   const report = await ctx.taskChangeControl.reconcileTaskChange(task.id);
   assert.ok(Array.isArray(report.repairs));
@@ -137,6 +138,7 @@ test('reclaimer race: a reclaim after initial read must not be clobbered by conv
   ctx.provide('taskOrchestrator', Object.freeze({
     get: taskStore.get.bind(taskStore),
     update: taskStore.update.bind(taskStore),
+    updateIf: (id, expected, patch) => taskStore.updateIf(id, expected, patch),
     complete: taskStore.complete.bind(taskStore),
   }));
   await ctx.plugin(changeControlPlugin, { storePath: join(dir, 'changes.json') });
@@ -189,7 +191,7 @@ test('reviewer bindings on in_review tasks survive reconciliation', async (t) =>
   const { ctx, taskStore, dir } = await compose(t);
   const { task, change, runId } = await governedRunning(ctx, taskStore, dir);
   await ctx.changeControl.bindRole(change.id, 'sess-host', 'reviewer');
-  await taskStore.complete(task.id, { commit_sha: 'ok' }, { worker: runId });
+  await ctx.taskChangeControl.completeGovernedTask(task.id, { sessionId: 'sess-recon', worker: runId, proof: proofFor('ok-real') });
   const report = await ctx.taskChangeControl.reconcileTaskChange(task.id);
   // The reviewer binding stays.
   const bindings = await ctx.changeControl.listRoleBindings();
@@ -241,7 +243,7 @@ test('proof without alignment fields sits in manual Intervention (not reconciled
   }, { sessionId: 'sess-m', expectedWorker: 'w-m' });
   await new Promise((resolve) => setTimeout(resolve, 1200));
   const report = await ctx.taskChangeControl.reconcileTaskChange(task.id);
-  assert.ok(report.manualIntervention.some((m) => m.issue === 'HALF_COMPLETION_PROOF_INCOMPLETE'));
+  assert.ok(report.manualIntervention.some((m) => m.issue === 'PROOF_ALIGNMENT_INCOMPLETE'));
   assert.ok(report.repairs.length === 0);
   assert.equal((await taskStore.get(task.id)).status, 'running');
 });

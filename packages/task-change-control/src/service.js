@@ -7,6 +7,7 @@
  */
 import { createGovernanceGuard } from './governance.js';
 import { createBindingLauncher } from './binding.js';
+import { validatePairing } from './lifecycle.js';
 
 /** The task-orchestrator identity on the Change-side workItem. */
 export const WORK_ITEM_SYSTEM = 'dsh-task-orchestrator';
@@ -24,7 +25,7 @@ function unavailable(detail) {
 
 /**
  * Minimal typed views of the two domain services this package depends on.
- * @typedef {{ get: (id: string) => any, update: (id: string, patch: any) => Promise<any>, complete?: (id: string, result: object, options?: any) => any, createDispatcher: (options?: any) => any, createWorkerLauncher?: (options?: any) => any }} TaskOrchestratorApi
+ * @typedef {{ get: (id: string) => any, update: (id: string, patch: any) => Promise<any>, updateIf: (id: string, expected: any, patch: any) => any, complete?: (id: string, result: object, options?: any) => any, createDispatcher: (options?: any) => any, createWorkerLauncher?: (options?: any) => any }} TaskOrchestratorApi
  * @typedef {{ get: (id: string) => Promise<any>, findByWorkItem: (system: string, id: string) => Promise<any>, findOrCreateForWorkItem: (input: { system: string, id: string, change: object }) => Promise<any>, resolveRole: (changeId: string, sessionId: string) => Promise<string>, getBinding: (changeId: string, sessionId: string) => Promise<any>, getBindingSync: (changeId: string, sessionId: string) => any, getBindingFromDisk: (changeId: string, sessionId: string) => any, listByWorkItem: (system: string, id: string) => Promise<any[]>, listRoleBindings: () => Promise<any[]>, status: (changeId: string) => Promise<any>, appendAudit: (event: any) => Promise<any>, submitProof: (changeId: string, proof: any, expected?: { sessionId?: string, expectedWorker?: string }) => Promise<any>, unbindRole: (changeId: string, sessionId: string, opts?: any) => Promise<any>, transition: (changeId: string, toState: string, opts?: any) => Promise<any> }} ChangeControlApi
  * @param {object} deps
  * @param {() => TaskOrchestratorApi | undefined} deps.taskOrchestrator accessor (may be absent)
@@ -423,145 +424,134 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
     },
 
     /**
-     * T7.2 — Reconciliation against both stores.
-     * Returns a report with:
-     *   - repairs:  provably-safe automatic repairs performed
-     *   - manualIntervention: entries the integration won't touch
-     * Every repair also lands an audit record on the Change-side store.
+     * T7.2 — Reconciliation between the task orchestrator and the Change Control
+     * side. Provably SAFE drift is repaired (with audit); anything else is
+     * reported as manualIntervention and the stores stay untouched.
      */
     reconcileTaskChange(/** @type {string} */ taskId) {
       const t = requireTask();
       const c = requireChange();
+      requireTaskId(taskId);
       return (async () => {
         const repairs = /** @type {any[]} */ ([]);
         const manualIntervention = /** @type {any[]} */ ([]);
         const task = await Promise.resolve(t.get(taskId));
         if (!task) throw Object.assign(new Error(`task not found: ${taskId}`), { code: 'TASK_NOT_FOUND' });
+
         const allChanges = await c.listByWorkItem(WORK_ITEM_SYSTEM, taskId);
         const nonTerminal = allChanges.filter((/** @type {any} */ chg) => !['APPROVED', 'REJECTED', 'CANCELLED'].includes(chg.state));
         if (nonTerminal.length > 1) {
-          manualIntervention.push({
-            issue: 'MULTIPLE_CHANGES',
-            changeIds: nonTerminal.map((chg) => chg.id),
-            detail: 'more than one nonterminal Change bound to this task',
-          });
+          manualIntervention.push({ issue: 'MULTIPLE_CHANGES', changeIds: nonTerminal.map((c2) => c2.id) });
           return { repairs, manualIntervention };
         }
-        // Terminal Changes linked to a TERMINAL task still qualify for R1
-        // orphan binding cleanup (they are no longer the active drift target,
-        // but their bindings can outlive the run).
         const change = nonTerminal[0] ?? allChanges[0] ?? null;
         if (!change) return { repairs, manualIntervention };
 
         const status = await c.status(change.id);
-        const proof = status.proof ?? null;
+        const proof = status?.proof ?? null;
         const bindings = (await c.listRoleBindings()).filter((/** @type {any} */ b) => b.changeId === change.id);
-        const now = Date.now();
+        const linkage = task?.metadata?.changeControl?.changeId ?? null;
 
-        // (R0) Linkage/projection repair: the task's metadata.changeControl
-        // pointer, if present, must agree with the authoritative Change-side
-        // workItem. Correction happens with an audit record.
-        const linkage = task?.metadata && task.metadata.changeControl && task.metadata.changeControl.changeId;
-        if (linkage && linkage !== change.id) {
-          const metadata = typeof task.metadata === 'object' && task.metadata ? { ...task.metadata } : {};
-          metadata.changeControl = { ...(task.metadata.changeControl ?? {}), changeId: change.id };
-          await Promise.resolve(t.update(taskId, { metadata }));
-          await c.appendAudit({ kind: 'reconciliation', changeId: change.id, action: 'projection_linkage_corrected', previousChangeId: linkage });
-          repairs.push({ kind: 'projection_linkage', previousChangeId: linkage, correctedTo: change.id });
+        // ── Phase 1: compile manual findings from the snapshot. No writes
+        // happen above this point.
+        const leaseExpired = Number(task.lease_expires_at ?? 0) <= Date.now();
+        const isHalfCompletionShape = (task.status === 'claimed' || task.status === 'running') && change.state === 'PREFLIGHT' && leaseExpired;
+        // The HALF-COMPLETION shape is the specific lifecycle pairing that
+        // T7.2 repairs — refuse to also bark LIFECYCLE_MISMATCH for it.
+        const pairing = isHalfCompletionShape ? { ok: true } : validatePairing(task.status, change.state);
+        if (!pairing.ok) {
+          manualIntervention.push({ issue: 'LIFECYCLE_MISMATCH', taskId, taskStatus: task.status, changeState: change.state });
+        }
+        const hasResult = Boolean(
+          task.result_summary || task.commit_sha
+          || (Array.isArray(task.files_changed) && task.files_changed.length)
+          || (Array.isArray(task.tests_run) && task.tests_run.length)
+          || (Array.isArray(task.remaining_blockers) && task.remaining_blockers.length),
+        );
+        const proofComplete = proof
+          && typeof proof.commit_sha === 'string' && proof.commit_sha.trim() !== ''
+          && Array.isArray(proof.files_changed)
+          && Array.isArray(proof.tests_run)
+          && Array.isArray(proof.remaining_blockers);
+        if (task.status === 'in_review' && !proof && hasResult) {
+          manualIntervention.push({ issue: 'TASK_RESULT_WITHOUT_PROOF', taskId });
+        }
+        if (proof && !proofComplete) {
+          manualIntervention.push({ issue: 'PROOF_ALIGNMENT_INCOMPLETE', taskId, detail: 'proof missing or mis-typed commit/files/tests/blockers' });
         }
 
-        // (R0') Lifecycle/pairing mismatches and result-vs-proof gaps are
-        // MANUAL findings — a driver should NOT act on them; reconcile only
-        // reports. Both facts are computed BEFORE any mutation.
-        if (task.status === 'running' && ['DRAFT', 'PLANNED', 'READY'].includes(change.state)) {
-          manualIntervention.push({
-            issue: 'LIFECYCLE_MISMATCH', taskId, detail: `task running with Change in ${change.state}`,
-          });
-        }
-        if (task.status === 'in_review' && ['DRAFT', 'READY', 'PLANNED'].includes(change.state)
-          && (task.result_summary || task.commit_sha || (task.files_changed ?? []).length)) {
-          manualIntervention.push({
-            issue: 'TASK_RESULT_WITHOUT_PROOF', taskId,
-            detail: 'task carries completion result while the linked Change has not been driven to PREFLIGHT',
-          });
-        }
-
-        // (R1) Orphaned bindings: task is in a terminal state but still has
-        // a session bound as worker → release + audit.
+        // R1 orphaned worker bindings on terminal tasks.
         if (['in_review', 'done', 'cancelled', 'failed'].includes(task.status)) {
-          for (const binding of bindings) {
-            if (binding.role !== 'worker') continue; // reviewer host bindings are owner-fenced
-            await c.unbindRole(change.id, binding.sessionId, { actor: 'reconciliation' });
-            await c.appendAudit({
-              kind: 'reconciliation',
-              changeId: change.id,
-              sessionId: binding.sessionId,
-              action: 'orphan_binding_unbound',
-            });
-            repairs.push({ kind: 'orphan_binding_unbound', sessionId: binding.sessionId });
+          for (const b of bindings) {
+            if (b.role !== 'worker') continue;
+            try { await c.unbindRole(change.id, b.sessionId, { actor: 'reconciliation' }); } catch { /* racing unbind */ }
+            await c.appendAudit({ kind: 'reconciliation', changeId: change.id, sessionId: b.sessionId, action: 'orphan_binding_unbound' });
+            repairs.push({ kind: 'orphan_binding_unbound', sessionId: b.sessionId });
           }
         }
 
-        // (R2) Half-completed governed completion: Change is PREFLIGHT but
-        // task is still claimed/running with a dead lease.
-        if (change.state === 'PREFLIGHT' && (task.status === 'claimed' || task.status === 'running')
-          && Number(task.lease_expires_at ?? 0) <= now) {
-          if (!proof || typeof proof.commit_sha !== 'string') {
-            manualIntervention.push({
-              issue: 'HALF_COMPLETION_PROOF_INCOMPLETE',
-              taskId, detail: 'Change is PREFLIGHT but proof has no required alignment fields',
-            });
-          } else if (!proof.files_changed || !Array.isArray(proof.files_changed)) {
-            manualIntervention.push({
-              issue: 'HALF_COMPLETION_PROOF_MALFORMED',
-              taskId, detail: 'proof.files_changed wrong shape',
-            });
-          } else {
-          // TOCTOU guard: the lease may have been re-claimed by another
-          // worker during the Change-side awaits above. Re-read atomically
-          // and bail rather than clobber their claim.
-          const finalTask = await Promise.resolve(t.get(taskId));
-          if (!finalTask
-            || finalTask.status !== task.status
-            || finalTask.claimed_by !== task.claimed_by
-            || Number(finalTask.lease_expires_at ?? 0) !== Number(task.lease_expires_at ?? 0)) {
-            manualIntervention.push({
-              issue: 'RECONCILE_RACE', taskId,
-              detail: `task claim changed mid-reconciliation; skipping repair`,
-            });
+
+        // ── Phase 2: repairs (only when no manual findings).
+        if (manualIntervention.length > 0) return { repairs, manualIntervention };
+
+        // R0 linkage / projection repair (metadata same-source-of-truth).
+        if (linkage && linkage !== change.id) {
+          const meta = { ...(task.metadata ?? {}), changeControl: { ...(task.metadata?.changeControl ?? {}), changeId: change.id } };
+          const patched = t.updateIf(
+            taskId,
+            { metadata_change_id: linkage },
+            { metadata: meta },
+          );
+          if (patched) {
+            await c.appendAudit({ kind: 'reconciliation', changeId: change.id, action: 'projection_linkage', previousChangeId: linkage });
+            repairs.push({ kind: 'projection_linkage', previousChangeId: linkage });
+          }
+        }
+
+        // R2 half-completed governed completion (expired lease, Change PREFLIGHT).
+        const now = Date.now();
+        if ((task.status === 'claimed' || task.status === 'running')
+          && Number(task.lease_expires_at ?? 0) <= now
+          && change.state === 'PREFLIGHT' && proofComplete) {
+          const converged = t.updateIf(
+            taskId,
+            { claimed_by: task.claimed_by, lease_expires_at: task.lease_expires_at, status: task.status },
+            {
+              status: 'in_review',
+              commit_sha: proof.commit_sha,
+              files_changed: proof.files_changed,
+              tests_run: proof.tests_run,
+              remaining_blockers: proof.remaining_blockers,
+              result_summary: proof.summary ?? 'reconciled completion',
+            },
+          );
+          if (!converged) {
+            manualIntervention.push({ issue: 'RECONCILE_RACE', taskId, detail: 'claim changed concurrently; skipped' });
             return { repairs, manualIntervention };
           }
-          await Promise.resolve(t.update(taskId, {
-            status: 'in_review',
-            commit_sha: proof.commit_sha,
-            files_changed: proof.files_changed ?? [],
-            tests_run: proof.tests_run ?? [],
-            remaining_blockers: proof.remaining_blockers ?? [],
-            result_summary: proof.summary ?? 'reconciled completion',
-          }));
           await c.appendAudit({ kind: 'reconciliation', changeId: change.id, action: 'half_completion_converged' });
           repairs.push({ kind: 'half_completion_converged' });
-          }
         }
 
-        // (R3) Projection mismatch on completed tasks: task fields disagree
-        // with the stored proof → task fields align to the proof.
-        if (task.status === 'in_review' && proof) {
+        // R3 projection mismatch on completed task.
+        if (task.status === 'in_review' && proofComplete) {
           const mismatch =
             task.commit_sha !== proof.commit_sha
-            || JSON.stringify(task.files_changed) !== JSON.stringify(proof.files_changed ?? [])
-            || JSON.stringify(task.tests_run) !== JSON.stringify(proof.tests_run ?? [])
-            || JSON.stringify(task.remaining_blockers) !== JSON.stringify(proof.remaining_blockers ?? []);
+            || JSON.stringify(task.files_changed) !== JSON.stringify(proof.files_changed)
+            || JSON.stringify(task.tests_run) !== JSON.stringify(proof.tests_run)
+            || JSON.stringify(task.remaining_blockers) !== JSON.stringify(proof.remaining_blockers);
           if (mismatch) {
-            await Promise.resolve(t.update(taskId, {
+            const patched = t.updateIf(taskId, { status: 'in_review', metadata_change_id: task?.metadata?.changeControl?.changeId ?? null }, {
               commit_sha: proof.commit_sha,
-              files_changed: proof.files_changed ?? [],
-              tests_run: proof.tests_run ?? [],
-              remaining_blockers: proof.remaining_blockers ?? [],
+              files_changed: proof.files_changed,
+              tests_run: proof.tests_run,
+              remaining_blockers: proof.remaining_blockers,
               result_summary: proof.summary ?? task.result_summary,
-            }));
-            await c.appendAudit({ kind: 'reconciliation', changeId: change.id, action: 'projection_realigned' });
-            repairs.push({ kind: 'projection_mismatch' });
+            });
+            if (patched) {
+              await c.appendAudit({ kind: 'reconciliation', changeId: change.id, action: 'projection_realigned' });
+              repairs.push({ kind: 'projection_mismatch' });
+            }
           }
         }
 
