@@ -25,7 +25,7 @@ function unavailable(detail) {
 /**
  * Minimal typed views of the two domain services this package depends on.
  * @typedef {{ get: (id: string) => Promise<any>, update: (id: string, patch: any) => Promise<any>, complete?: (id: string, result: object, options?: any) => Promise<any>, createDispatcher: (options?: any) => any, createWorkerLauncher?: (options?: any) => any }} TaskOrchestratorApi
- * @typedef {{ get: (id: string) => Promise<any>, findByWorkItem: (system: string, id: string) => Promise<any>, findOrCreateForWorkItem: (input: { system: string, id: string, change: object }) => Promise<any>, resolveRole: (changeId: string, sessionId: string) => Promise<string>, getBinding: (changeId: string, sessionId: string) => Promise<any>, submitProof: (changeId: string, proof: any) => Promise<any>, transition: (changeId: string, toState: string, opts?: any) => Promise<any> }} ChangeControlApi
+ * @typedef {{ get: (id: string) => Promise<any>, findByWorkItem: (system: string, id: string) => Promise<any>, findOrCreateForWorkItem: (input: { system: string, id: string, change: object }) => Promise<any>, resolveRole: (changeId: string, sessionId: string) => Promise<string>, getBinding: (changeId: string, sessionId: string) => Promise<any>, status: (changeId: string) => Promise<any>, submitProof: (changeId: string, proof: any) => Promise<any>, transition: (changeId: string, toState: string, opts?: any) => Promise<any> }} ChangeControlApi
  * @param {object} deps
  * @param {() => TaskOrchestratorApi | undefined} deps.taskOrchestrator accessor (may be absent)
  * @param {() => ChangeControlApi | undefined} deps.changeControl accessor (may be absent)
@@ -261,19 +261,23 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
           );
         }
 
-        // 3. Idempotent Change transition — only on IMPLEMENTING. Second pass = noop.
-        const change = await c.get(changed.id);
-        if (change.state === 'IMPLEMENTING') {
-          await c.submitProof(changed.id, { ...proof, sessionId });
-        } else if (change.state !== 'PREFLIGHT') {
-          throw Object.assign(new Error(`cannot complete from Change state ${change.state}`), { code: 'INVALID_STATE' });
+        // 3a. Alignment fields are mandatory BEFORE any Change mutation:
+        // the Change-side proof and the final task row MUST carry identical
+        // values. Omitting them yields task rows of null/[] next to a proof
+        // without the keys (or, on the idempotent path, a stale proof).
+        for (const key of ['commit_sha', 'files_changed', 'tests_run', 'remaining_blockers']) {
+          if (!(key in proof)) {
+            throw Object.assign(new Error(`proof field required: ${key}`), { code: 'PROOF_FIELD_REQUIRED', field: key });
+          }
         }
 
-        // 3.5. Criteria alignment: the current task's acceptance criteria must
-        // match the Change-side proof's criteria exactly. This catches the
-        // drift where the bootstrap snapshot and the canonical task row diverge.
+        // 3b. Criteria alignment — re-read the task FIRST so a concurrent
+        // acceptance_criteria mutation (F5 race) cannot pass a stale
+        // baseline through the proof.
         {
-          const taskCriteria = Array.isArray(task.acceptance_criteria) ? task.acceptance_criteria : [];
+          const liveTask = await Promise.resolve(taskOrchestrator.get(taskId));
+          if (!liveTask) throw Object.assign(new Error('task missing at proof time'), { code: 'TASK_NOT_FOUND' });
+          const taskCriteria = Array.isArray(liveTask.acceptance_criteria) ? liveTask.acceptance_criteria : [];
           const taskIds = new Set(taskCriteria.map(String));
           const proofIds = new Set((proof.criteria ?? []).map(/** @param {any} c */ (c) => (c && typeof c === 'object' ? c.id : c)));
           if (taskIds.size !== proofIds.size || [...taskIds].some((id) => !proofIds.has(id))) {
@@ -284,13 +288,28 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
           }
         }
 
-        // 4a. Alignment fields are mandatory: the Change-side proof and the
-        // final task row MUST carry identical values. Omitting them yields
-        // task rows of null/[] next to a proof without the keys.
-        for (const key of ['commit_sha', 'files_changed', 'tests_run', 'remaining_blockers']) {
-          if (!(key in proof)) {
-            throw Object.assign(new Error(`proof field required: ${key}`), { code: 'PROOF_FIELD_REQUIRED', field: key });
+        // 3c. Idempotent Change transition. For PREFLIGHT the stored proof
+        // MUST equal the caller's proof on the four integration fields —
+        // any mismatch means the prior submission persisted a stale proof.
+        const change = await c.get(changed.id);
+        if (change.state === 'IMPLEMENTING') {
+          await c.submitProof(changed.id, { ...proof, sessionId });
+        } else if (change.state === 'PREFLIGHT') {
+          const statusSnapshot = await c.status(changed.id).catch(() => null);
+          const existing = statusSnapshot && statusSnapshot.proof ? statusSnapshot.proof : null;
+          const same = existing
+            && existing.commit_sha === proof.commit_sha
+            && JSON.stringify(existing.files_changed) === JSON.stringify(proof.files_changed)
+            && JSON.stringify(existing.tests_run) === JSON.stringify(proof.tests_run)
+            && JSON.stringify(existing.remaining_blockers) === JSON.stringify(proof.remaining_blockers);
+          if (!same) {
+            throw Object.assign(
+              new Error(`stored Change proof differs from the current completion payload`),
+              { code: 'PROOF_MISMATCH', changeId: changed.id },
+            );
           }
+        } else {
+          throw Object.assign(new Error(`cannot complete from Change state ${change.state}`), { code: 'INVALID_STATE' });
         }
 
         // 4b. RE-VALIDATE the lease: all Change-side awaits above can span
