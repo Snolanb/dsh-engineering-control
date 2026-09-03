@@ -451,10 +451,22 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         const spec = options.spec ?? {
           mode: 'session',
           agentPreset: task.reviewer_profile ?? 'reviewer',
-          model: task.reviewer_model ? { provider: 'default', model: task.reviewer_model } : { provider: 'default', model: 'default' },
+          // Parse 'provider/model' convention, same as worker_model elsewhere;
+          // bare 'model' leaves provider undefined and DSH host resolution fills
+          // it at session.selectModel time.
+          ...(task.reviewer_model
+            ? (() => {
+                const s = String(task.reviewer_model);
+                const slash = s.indexOf('/');
+                return { model: slash < 1 ? { model: s } : { provider: s.slice(0, slash), model: s.slice(slash + 1) } };
+              })()
+            : {}),
         };
         const handle = await launcher.launch({ task, spec });
         if (typeof handle?.sessionId !== 'string' || handle.sessionId === '') {
+          if (typeof handle?.terminate === 'function') {
+            try { await handle.terminate(); } catch { /* best-effort */ }
+          }
           throw Object.assign(new Error('reviewer launcher returned no sessionId'), { code: 'SESSION_ID_MISSING' });
         }
         let binding;

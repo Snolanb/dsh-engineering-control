@@ -31,8 +31,6 @@ export function createReviewerLauncher({ rpc, sessionOptions = {} } = {}) {
         err.code = 'REVIEWER_MODE_UNSUPPORTED'
         return Promise.reject(err)
       }
-      // Intentionally not taking the dispatcher's full argument shape —
-      // there is no session/claim bookkeeping on this path.
       return session.launch({
         task: input.task,
         spec: input.spec,
