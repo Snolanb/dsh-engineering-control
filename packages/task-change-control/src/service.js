@@ -487,10 +487,21 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
             try {
               await c.unbindRole(change.id, b.sessionId, { actor: 'reconciliation' });
             } catch (/** @type {any} */ error) {
-              // Race-safe concurrency: unbind-by-other-party between the
-              // snapshot and our repair just pretends success to us; we check
-              // the post-condition before recording the audit.
-              const still = await c.getBinding(change.id, b.sessionId).catch(() => null);
+              // Race-tolerant concurrency: if someone else beat us to the
+              // unbind, the postcondition check proves the change actually
+              // landed. A FAILURE in the postcondition read itself means the
+              // observable state is unknown — surface manual attention instead
+              // of claiming a repair.
+              let still = null;
+              try {
+                still = await c.getBinding(change.id, b.sessionId);
+              } catch (/** @type {any} */ postReadError) {
+                manualIntervention.push({
+                  issue: 'UNBIND_FAILED', taskId,
+                  detail: `post-condition read failed after unbind error: ${postReadError?.message ?? String(postReadError)}`,
+                });
+                return { repairs, manualIntervention };
+              }
               if (still !== null) {
                 manualIntervention.push({
                   issue: 'UNBIND_FAILED', taskId,
