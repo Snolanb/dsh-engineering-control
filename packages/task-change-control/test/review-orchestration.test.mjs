@@ -179,3 +179,19 @@ test('reviewer independence: proof session CANNOT self-review (attestation recor
     (e) => e && e.code === 'REVIEWER_NOT_INDEPENDENT',
   );
 });
+
+test('rejected review (unbound session) leaves task NOT done and Change re-reviewable', async (t) => {
+  const { ctx, taskStore, dir } = await compose(t);
+  const { task } = await governedToPreflight(ctx, taskStore, dir, 'w-villain');
+  await taskStore.complete(task.id, { commit_sha: 'cv', files_changed: ['f'], tests_run: ['t'], remaining_blockers: [] }, { worker: 'w-villain' });
+  const rv = await ctx.taskChangeControl.runGovernedReview(task.id);
+  assert.equal(rv.outcome, 'review_started');
+  await assert.rejects(
+    ctx.taskChangeControl.applyReviewOutcome(task.id, { sessionId: 'nope-not-bound', verdict: 'pass' }),
+    (e) => e && (e.code === 'SESSION_NOT_BOUND' || e.code === 'SESSION_ID_MISSING'),
+  );
+  assert.equal((await taskStore.get(task.id)).status, 'in_review', 'task must NOT have moved to done');
+  // Change must still be reviewable
+  const rv2 = await ctx.taskChangeControl.runGovernedReview(task.id);
+  assert.equal(rv2.outcome, 'review_started');
+});

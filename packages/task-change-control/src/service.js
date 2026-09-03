@@ -457,8 +457,9 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
           const statusNow = await c.status(change.id);
           const proof = statusNow?.proof ?? null;
           const checkResults = (options.controllerPreflightOverride ?? proof?.controllerPreflight ?? []).map((/** @type {string} */ entry) => {
-            const name = String(entry);
-            return { name, passed: !/^(fail|failed|failing)/i.test(name.trim()), exitCode: /^(fail|failed|failing)/i.test(name.trim()) ? 1 : 0 };
+            const name = String(entry).trim();
+            const okLabel = /^(pass|ok)([:.\s]|$)/i.test(name);
+            return { name, passed: okLabel, exitCode: okLabel ? 0 : 1 };
           });
           let preflightPassed;
           try {
@@ -539,21 +540,44 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         // is comparisons against RETRIES ONLY — never the baseline review.
         const repairsDone = Math.max(0, attemptsSeen - 1);
         const escalate = options.verdict === 'fail' && repairsDone >= reviewCount;
-        if (options.verdict === 'pass') {
-          // Task first (atomic conditional patch): only if the task settles
-          // do we commit the irreversible Change approval. This ordering
-          // rules out lost races because a lost task race keeps the Change
-          // in REVIEW (repairable) rather than irreversible APPROVED.
-          const done = t.updateIf(taskId, { status: 'in_review' }, { status: 'done' });
-          if (!done) {
-            await c.appendAudit({ kind: 'review_orchestration', changeId: change.id, action: 'task_done_blocked' });
-            return { outcome: 'task_update_race' };
+        // Pre-validate EVERYTHING that could make submitReview throw BEFORE
+        // touching the task at all. This matters because a terminal task
+        // status (done/failed/...) is irreversible, whereas a Change left in
+        // REVIEW is repairable.
+        {
+          let binding = c.getBindingSync(change.id, options.sessionId) ?? null;
+          if (!binding) {
+            try { binding = c.getBindingFromDisk(change.id, options.sessionId); } catch { binding = null; }
+            if (binding && typeof binding.then === 'function') binding = await binding;
           }
+          if (!binding || binding.role !== 'reviewer') {
+            await c.appendAudit({ kind: 'review_orchestration', changeId: change.id, action: 'not_a_reviewer_session', sessionId: options.sessionId });
+            throw Object.assign(new Error(`no reviewer binding for session ${options.sessionId}`), { code: 'SESSION_NOT_BOUND' });
+          }
+          const attemptsNow = Array.isArray(status?.attempts) ? status.attempts : [];
+          if (attemptsNow.some((/** @type {any} */ a) => a.sessionId === options.sessionId || a.workerId === options.sessionId)) {
+            throw Object.assign(new Error(`session ${options.sessionId} wrote the proof being reviewed`), { code: 'REVIEWER_NOT_INDEPENDENT' });
+          }
+          const latestRevision = status?.revision ?? null;
+          if (latestRevision === null) {
+            throw Object.assign(new Error('no revision recorded yet'), { code: 'STALE_REVISION' });
+          }
+        }
+
+        if (options.verdict === 'pass') {
+          // Validation passed; submit the review. submitReview internally
+          // transitions REVIEW → APPROVED — if a late race lands the task
+          // update below first, the Change is not yet irreversibly moved.
           await c.submitReview(change.id, {
             verdict: 'pass',
             revision: status.revision ?? 'unknown',
             findings: [],
           }, { sessionId: options.sessionId });
+          const done = t.updateIf(taskId, { status: 'in_review' }, { status: 'done' });
+          if (!done) {
+            await c.appendAudit({ kind: 'review_orchestration', changeId: change.id, action: 'task_done_blocked', sessionId: options.sessionId });
+            return { outcome: 'task_update_race' };
+          }
           // submitReview already transitioned REVIEW → APPROVED internally.
           await c.appendAudit({ kind: 'review_orchestration', changeId: change.id, action: 'review_pass_approved', sessionId: options.sessionId, revision: status.revision ?? null });
           return { outcome: 'approved' };
@@ -571,12 +595,15 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
             await c.appendAudit({ kind: 'review_orchestration', changeId: change.id, action: 'escalated_task_race', sessionId: options.sessionId, revision: status.revision ?? null });
             return { outcome: 'task_update_race' };
           }
-          // Close the Change too — an escalated Change left in REPAIR would
-          // block re-linking and leave worker/reviewer bindings dangling.
-          try { await c.transition(change.id, 'REJECTED', { actor: 'review-orchestration' }); } catch { /* REVIEW/REPAIR → REJECTED may be unavailable */ }
+          // "Escalation" here is a manual hand-off, not a hidden terminal:
+          // TRANSITIONS (domain) does not engineer REJECTED, so the Change
+          // stays in REPAIR and a well-formed audit records the reason. A
+          // human resolves it via the change-control CLI. That is the
+          // deliberate domain rule — we don't secretly force it.
           await c.appendAudit({
             kind: 'review_orchestration', changeId: change.id, action: 'escalated',
             sessionId: options.sessionId, revision: status.revision ?? null, attempts: attemptsSeen,
+            note: 'repair attempts exhausted; change left in REPAIR for human disposition',
           });
           return { outcome: 'escalated', attempts: attemptsSeen };
         }
