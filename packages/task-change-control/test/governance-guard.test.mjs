@@ -90,6 +90,7 @@ test('non-{ok:true} verdict (undefined/null/false) fails closed at the dispatche
   });
   const inheritedOk = Object.create({ ok: true });
   const evilProxy = new Proxy({}, { getPrototypeOf() { throw new Error('proto trap') }, ownKeys() { throw new Error('ownKeys trap') } });
+  const getterVerdict = Object.defineProperty({ ok: true }, 'ok', { get() { throw new Error('ok getter trap') } });
   const badShapes = [
     evilProxy,
     undefined, null, false, {}, 'ok', { ok: true, extra: 'unexpected' }, { ok: 1 }, [],
@@ -99,7 +100,28 @@ test('non-{ok:true} verdict (undefined/null/false) fails closed at the dispatche
     (() => { const o = { ok: true }; o[Symbol('s')] = 1; return o; })(),  // symbol extra
     new (class { constructor() { this.ok = true; } })(),                  // custom prototype
     Object.freeze({ ok: false }),                                         // frozen false
+    getterVerdict,                                                        // throwing ok getter
   ];
+  // Null-prototype {ok:true} is a LEGITIMATE plain object and must pass.
+  {
+    const { WorkerDispatcher } = await import('dsh-task-orchestrator/dispatcher');
+    let launched = 0;
+    const ok = new WorkerDispatcher({
+      store: taskStore, registry,
+      preflight: async () => ({ ok: true, spec: registry.get('worker') }),
+      launcher: { async launch() { launched++; return { wait: async () => ({ exitCode: 0, stdout: 'ok', stderr: '' }) }; } },
+      preDispatch: async () => Object.assign(Object.create(null), { ok: true }),
+    });
+    const cleanTask = await taskStore.create({
+      title: 'null-proto', description: 'd', status: 'ready', workspace: dir,
+      worker_profile: 'worker', acceptance_criteria: ['a'],
+    });
+    const r = await ok.dispatchTask(cleanTask);
+    assert.equal(r.dispatched, true);
+    assert.equal(launched, 1);
+    // Recreate the same shape task for the main bad-shape loop.
+  }
+
   for (const bad of badShapes) {
     const { WorkerDispatcher } = await import('dsh-task-orchestrator/dispatcher');
     const dispatcher = new WorkerDispatcher({

@@ -166,19 +166,22 @@ export class WorkerDispatcher {
       }
       if (!reclaim.claimed) {
         if (reclaim.reason === 'already_claimed') return 'held_by_other'
-        // Blocked / not-claimable: take the atomic owner-checked expired-lease
-        // release — one SQL statement, NO window for anyone else.
-        if (reclaim.reason === 'blocked_by_dependencies' || reclaim.reason === 'not_claimable') {
-          try {
-            const expired = this.store.releaseExpiredClaim
-              ? this.store.releaseExpiredClaim(taskId, worker, { actor: this.actor })
-              : { released: false, reason: 'unavailable' }
-            return expired.released ? 'reverted' : (expired.reason === 'not_owner' ? 'held_by_other' : 'failed')
-          } catch {
-            return 'failed'
-          }
+        // For EVERY other failure (blocked_by_dependencies, not_claimable,
+        // max_attempts_exceeded, ...) run the atomic owner+expiry-checked
+        // release — one conditional SQL UPDATE, no TOCTOU window at all:
+        //   - released  → reverted
+        //   - not_owner → held_by_other
+        //   - lease_active / anything else → failed (someone else deals with it)
+        try {
+          const expired = this.store.releaseExpiredClaim
+            ? this.store.releaseExpiredClaim(taskId, worker, { actor: this.actor })
+            : { released: false, reason: 'unavailable' }
+          return expired.released
+            ? 'reverted'
+            : (expired.reason === 'not_owner' ? 'held_by_other' : 'failed')
+        } catch {
+          return 'failed'
         }
-        return 'failed'
       }
       try {
         this.store.release(taskId, worker, { actor: this.actor })
@@ -215,22 +218,25 @@ export class WorkerDispatcher {
         // or PROTOTYPE-inherited keys, and ok !== true all reject.
         // The guard may hand back ANY value — including a throwing Proxy. All
         // inspection stays in a try/catch and failure to validate = reject.
-        let strictPass = false
+        // Move the shape judgement + normalization INSIDE one try/catch so a
+        // throwing-proxy can never escape with the claim still held.
+        let normalized = null
         try {
-          const isPlainObject = (v) => v !== null && typeof v === 'object'
-            && Object.getPrototypeOf(v) !== null
-            && (Object.getPrototypeOf(v) === Object.prototype || Object.getPrototypeOf(v) === null)
-          strictPass = isPlainObject(verdict)
-            && verdict.ok === true
-            && Reflect.ownKeys(verdict).length === 1
-            && Reflect.ownKeys(verdict)[0] === 'ok'
+          const proto = verdict === null || typeof verdict !== 'object' ? null : Object.getPrototypeOf(verdict)
+          const isPlain = (proto === Object.prototype || proto === null) && verdict.ok === true
+          if (isPlain && Reflect.ownKeys(verdict).length === 1 && Reflect.ownKeys(verdict)[0] === 'ok') {
+            normalized = { ok: true } // exact shape; ok:true; only key 'ok'
+          } else if (verdict !== null && typeof verdict === 'object' && verdict.ok === false
+            && (proto === Object.prototype || proto === null)) {
+            normalized = verdict // structured failure — plain object the guard crafted
+          } else {
+            normalized = { ok: false, code: 'GUARD_REJECTED', detail: verdict ?? null }
+          }
         } catch {
-          strictPass = false
+          normalized = { ok: false, code: 'GUARD_REJECTED', detail: null }
         }
-        if (!strictPass) {
-          verdict = (verdict && typeof verdict === 'object' && verdict.ok === false)
-            ? verdict
-            : { ok: false, code: 'GUARD_REJECTED', detail: verdict ?? null }
+        if (normalized.ok !== true) {
+          verdict = normalized
           const restored = this.releaseOrRevert(task.id, worker)
           return {
             dispatched: false, reason: 'dispatch_not_governed', predispatch: verdict,
