@@ -143,3 +143,70 @@ test('worker structured result aligns with the stored proof bundle', async (t) =
   assert.deepEqual(tAfter.tests_run, status.proof.tests_run);
   assert.deepEqual(tAfter.remaining_blockers, status.proof.remaining_blockers);
 });
+
+test('PROOF_MISMATCH when PREFLIGHT retry carries different integration fields', async (t) => {
+  const { ctx, taskStore, dir } = await compose(t);
+  const { task, change, runId } = await runningGovernedTask(ctx, taskStore, dir);
+  const proof = {
+    beforeRevision: 'a', afterRevision: 'x',
+    commit_sha: 'a', files_changed: ['1'], tests_run: ['t'], remaining_blockers: [],
+    criteria: [{ id: 'ship', satisfied: true }], deviations: [], workerChecks: ['w'], controllerPreflight: ['cp'], summary: 's',
+  };
+  const res1 = await ctx.taskChangeControl.completeGovernedTask(task.id, { sessionId: 'sess-worker-1', worker: runId, proof });
+  assert.ok(res1.ok);
+  // PREFLIGHT now; complete again with different commit_sha — must be rejected.
+  await assert.rejects(
+    ctx.taskChangeControl.completeGovernedTask(task.id, { sessionId: 'sess-worker-1', worker: runId, proof: { ...proof, commit_sha: 'DIFFERENT' } }),
+    (e) => e?.code === 'PROOF_MISMATCH',
+  );
+  // The stored Change proof is intact (not clobbered by the rejected retry).
+  const status = await ctx.changeControl.status(change.id);
+  assert.equal(status.proof.commit_sha, 'a');
+});
+
+test('acceptance_criteria drift between claim and complete funnels to CRITERIA_MISMATCH', async (t) => {
+  const { ctx, taskStore, dir } = await compose(t);
+  const task = await taskStore.create({
+    title: 'g', description: 'd', status: 'ready', workspace: dir,
+    worker_profile: 'worker', acceptance_criteria: ['a', 'b'],
+  });
+  const { change } = await ctx.taskChangeControl.bootstrapTask(task.id);
+  const plan = await ctx.changeControl.submitPlan(change.id, { steps: ['s'] });
+  await ctx.changeControl.acceptPlan(change.id, plan.id, { authorized: true, actor: 'host' });
+  await ctx.changeControl.transition(change.id, 'IMPLEMENTING', {});
+  const claim = await taskStore.claim(task.id, 'w:cp1', { lease_seconds: 300 });
+  assert.ok(claim.claimed);
+  await taskStore.start(task.id, 'w:cp1', {});
+  await ctx.changeControl.bindRole(change.id, 'sess-binder', 'worker', { worker: 'w:cp1' });
+  const proof = {
+    beforeRevision: 'a', afterRevision: 'x',
+    commit_sha: 'abc', files_changed: ['x'], tests_run: ['t'], remaining_blockers: [],
+    criteria: [{ id: 'a', satisfied: true }], deviations: [], workerChecks: [], controllerPreflight: [], summary: 's',
+  };
+  await assert.rejects(
+    ctx.taskChangeControl.completeGovernedTask(task.id, { sessionId: 'sess-binder', worker: 'w:cp1', proof }),
+    (e) => e?.code === 'CRITERIA_MISMATCH',
+  );
+  const tAfter = await taskStore.get(task.id);
+  assert.equal(tAfter.status, 'running', 'task NOT completed');
+  const changeNow = await ctx.changeControl.get(change.id);
+  assert.equal(changeNow.state, 'IMPLEMENTING', 'Change NOT mutated by failed completion');
+});
+
+test('binding rebound to different worker during Change await -> SESSION_WORKER_MISMATCH', async (t) => {
+  const { ctx, taskStore, dir } = await compose(t);
+  const { task, change, runId } = await runningGovernedTask(ctx, taskStore, dir);
+  // Finish the binding-hijack BEFORE the completion call: rebind session to a different worker.
+  await ctx.changeControl.bindRole(change.id, 'sess-other', 'worker', { worker: 'worker:other' });
+  const proof = {
+    beforeRevision: 'a', afterRevision: 'x',
+    commit_sha: 'a', files_changed: ['f'], tests_run: ['t'], remaining_blockers: [],
+    criteria: [{ id: 'ship', satisfied: true }], deviations: [], workerChecks: ['w'], controllerPreflight: ['cp'], summary: 's',
+  };
+  await assert.rejects(
+    ctx.taskChangeControl.completeGovernedTask(task.id, { sessionId: 'sess-other', worker: runId, proof }),
+    (e) => e?.code === 'SESSION_WORKER_MISMATCH',
+  );
+  const tAfter = await taskStore.get(task.id);
+  assert.equal(tAfter.status, 'running');
+});

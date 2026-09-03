@@ -220,7 +220,26 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
           const existingLink = await c.findByWorkItem(WORK_ITEM_SYSTEM, taskId);
           if (existingLink) {
             const existing = await c.get(existingLink.id);
-            if (existing.state === 'PREFLIGHT') return { ok: true, taskId, changeId: existingLink.id };
+            if (existing.state === 'PREFLIGHT') {
+              // The completion already converged. Verify the stored proof
+              // matches THIS caller's payload on the integration fields —
+              // identical ok, different → PROOF_MISMATCH (retry after a
+              // legit repair retry should agree with the stored proof).
+              const s = await c.status(existingLink.id).catch(() => null);
+              const stored = s && s.proof ? s.proof : null;
+              const equal = stored
+                && stored.commit_sha === proof.commit_sha
+                && JSON.stringify(stored.files_changed) === JSON.stringify(proof.files_changed)
+                && JSON.stringify(stored.tests_run) === JSON.stringify(proof.tests_run)
+                && JSON.stringify(stored.remaining_blockers) === JSON.stringify(proof.remaining_blockers);
+              if (!equal) {
+                throw Object.assign(
+                  new Error(`stored Change proof does not match the completion payload`),
+                  { code: 'PROOF_MISMATCH', changeId: existingLink.id },
+                );
+              }
+              return { ok: true, taskId, changeId: existingLink.id };
+            }
           }
         }
 
@@ -312,18 +331,37 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
           throw Object.assign(new Error(`cannot complete from Change state ${change.state}`), { code: 'INVALID_STATE' });
         }
 
-        // 4b. RE-VALIDATE the lease: all Change-side awaits above can span
-        // longer than the lease. Never mark in_review unless the worker
-        // still owns an unexpired claim on the canonical TaskStore row.
-        const refreshed = await Promise.resolve(taskOrchestrator.get(taskId));
-        if (!refreshed
-          || refreshed.claimed_by !== worker
-          || (refreshed.status !== 'claimed' && refreshed.status !== 'running')
-          || Number(refreshed.lease_expires_at ?? 0) <= Date.now()) {
+        // 4b. FINAL atomic recheck — reads are synchronous on this store so
+        // a re-read followed by the mutation with no awaits in between is
+        // an atomic Cas-equivalent. Required for hostile-mutation scenarios:
+        // acceptance_criteria changed or session binding re-bound DURING
+        // the Change-side awaits above.
+        const finalTask = await Promise.resolve(taskOrchestrator.get(taskId));
+        const finalBinding = await c.getBinding(changed.id, sessionId).catch(() => null);
+        if (!finalTask
+          || finalTask.claimed_by !== worker
+          || (finalTask.status !== 'claimed' && finalTask.status !== 'running')
+          || Number(finalTask.lease_expires_at ?? 0) <= Date.now()) {
           throw Object.assign(
             new Error('lease invalidated during Change-side work'),
             { code: 'TASK_LEASE_INVALID', stage: 'post-proof' },
           );
+        }
+        if (!finalBinding || finalBinding.worker !== worker) {
+          throw Object.assign(
+            new Error(`session binding changed during Change-side work`),
+            { code: 'SESSION_WORKER_MISMATCH', changeId: changed.id },
+          );
+        }
+        {
+          const taskIds = new Set((Array.isArray(finalTask.acceptance_criteria) ? finalTask.acceptance_criteria : []).map(String));
+          const proofIds = new Set((proof.criteria ?? []).map(/** @param {any} c */ (c) => (c && typeof c === 'object' ? c.id : c)));
+          if (taskIds.size !== proofIds.size || [...taskIds].some((id) => !proofIds.has(id))) {
+            throw Object.assign(
+              new Error(`task acceptance criteria changed during completion`),
+              { code: 'CRITERIA_MISMATCH', task: [...taskIds] },
+            );
+          }
         }
 
         // 4c. Perform task completion via complete() — owner-checked by the
