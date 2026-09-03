@@ -95,3 +95,32 @@ test('reviewer role cannot submit proof (read-only gate)', async (t) => {
     (e) => e && /not bound as worker/.test(String(e?.message ?? '')) || e?.code === 'SESSION_WORKER_MISMATCH',
   );
 });
+
+test('launchReviewer terminates the spawned session when bind fails (no orphan)', async (t) => {
+  let terminated = 0;
+  const dir = mkdtempSync(join(tmpdir(), 'tcc-t81-orphan-'));
+  const ctx = new Context();
+  await ctx.plugin(SystemPrompt);
+  await ctx.plugin(ToolRuntime, {});
+  const taskStore = new TaskStore({ dbPath: join(dir, 'tasks.db') });
+  ctx.provide('taskOrchestrator', Object.freeze({
+    get: taskStore.get.bind(taskStore),
+    update: taskStore.update.bind(taskStore),
+    updateIf: (id, e, p) => taskStore.updateIf(id, e, p),
+    complete: taskStore.complete.bind(taskStore),
+    createReviewerLauncher: () => ({
+      async launch() { return { sessionId: 'sess-orphan', terminate: async () => { terminated += 1; return true; } }; },
+    }),
+  }));
+  await ctx.plugin(changeControlPlugin, { storePath: join(dir, 'changes.json') });
+  await ctx.plugin(plugin);
+  const task = await taskStore.create({ title: 'g', description: 'd', status: 'ready', workspace: dir, worker_profile: 'w', acceptance_criteria: ['a'] });
+  const { change } = await ctx.taskChangeControl.bootstrapTask(task.id);
+  // Pre-bind the same sessionId → ALREADY_BOUND on second bind.
+  await ctx.changeControl.bindRole(change.id, 'sess-orphan', 'reviewer');
+  await assert.rejects(
+    ctx.taskChangeControl.launchReviewer(task.id),
+    (e) => e && (e.code === 'ALREADY_BOUND' || /already bound/i.test(String(e?.message ?? ''))),
+  );
+  assert.equal(terminated, 1);
+});

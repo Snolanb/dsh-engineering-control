@@ -457,7 +457,18 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         if (typeof handle?.sessionId !== 'string' || handle.sessionId === '') {
           throw Object.assign(new Error('reviewer launcher returned no sessionId'), { code: 'SESSION_ID_MISSING' });
         }
-        const binding = await c.bindRole(change.id, handle.sessionId, 'reviewer');
+        let binding;
+        try {
+          binding = await c.bindRole(change.id, handle.sessionId, 'reviewer');
+        } catch (error) {
+          // If binding fails the session would be orphaned: terminate it so
+          // there is no live reviewer session with no track record on the
+          // Change side.
+          if (typeof handle?.terminate === 'function') {
+            try { await handle.terminate(); } catch { /* best-effort */ }
+          }
+          throw error;
+        }
         return { sessionId: handle.sessionId, changeId: change.id, binding, handle };
       })();
     },
