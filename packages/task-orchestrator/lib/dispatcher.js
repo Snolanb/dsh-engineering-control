@@ -390,6 +390,7 @@ export function createSessionLauncher({ rpc = createSessionRpcClient(), pollInte
       const created = await rpc.call('session.create', { cwd: task.workspace, agentPreset: spec.agentPreset })
       const sessionId = created?.sessionId
       if (typeof sessionId !== 'string' || sessionId === '') throw new WorkerDispatchError('session.create returned no session id', 'SESSION_ID_MISSING')
+      let baselineSeq = -1
       try {
         if (spec.model) {
           const selection = { provider: spec.model.provider, model: spec.model.model }
@@ -397,7 +398,7 @@ export function createSessionLauncher({ rpc = createSessionRpcClient(), pollInte
           await rpc.call('session.selectModel', { sessionId, ...selection })
         }
         const before = sessionEvents(await rpc.call('session.history', { sessionId, maxMessages: historyMaxMessages }))
-        const baselineSeq = before.reduce((max, event) => Math.max(max, Number.isSafeInteger(event.seq) ? event.seq : max), -1)
+        baselineSeq = before.reduce((max, event) => Math.max(max, Number.isSafeInteger(event.seq) ? event.seq : max), -1)
         await rpc.call('session.prompt', {
           sessionId,
           mode: 'queue',
