@@ -246,6 +246,12 @@ export class ChangeStore {
   #budgetPolicy = null;
   /** Per-project / per-workspace governance mode map (persisted). */
   #governanceModes = null;
+  /**
+   * Governance keys set by THIS store instance since the last successful
+   * persist. Persist overlays ONLY these keys, so a concurrent writer's
+   * newer entries survive (luna F7/F9).
+   */
+  #governanceDirty = new Set();
   /** @type {Map<string, object>} changeId -> budget record (counters, escalation, override) */
   #budgets = new Map();
 
@@ -601,10 +607,28 @@ export class ChangeStore {
       mergedRepairProofs[changeId] = proof;
     }
 
-    // Merge governance modes: any host-set value is authoritative; this
-    // store's copy is never silently overwritten by an older peers' store.
+    // Merge governance modes (per-KEY last-writer-wins): start fresh from
+    // disk; overlay ONLY the keys this store actually set since its last
+    // persist. Two stores writing DISJOINT keys can no longer silently
+    // drop each other's entries (F7 stale-governance overwrite).
     const diskGovernanceModes = diskData?.governanceModes && typeof diskData.governanceModes === 'object' ? diskData.governanceModes : null;
-    const mergedGovernanceModes = this.#governanceModes ?? diskGovernanceModes;
+    let mergedGovernanceModes = diskGovernanceModes
+      ? JSON.parse(JSON.stringify(diskGovernanceModes))
+      : { default: 'off', projects: {}, workspaces: {} };
+    if (mergedGovernanceModes.projects == null) mergedGovernanceModes.projects = {};
+    if (mergedGovernanceModes.workspaces == null) mergedGovernanceModes.workspaces = {};
+    const localModes = this.#governanceModes;
+    if (localModes) {
+      if (this.#governanceDirty.has('default') && typeof localModes.default === 'string') {
+        mergedGovernanceModes.default = localModes.default;
+      }
+      for (const [key, value] of Object.entries(localModes.projects ?? {})) {
+        if (this.#governanceDirty.has(`p:${key}`)) mergedGovernanceModes.projects[key] = value;
+      }
+      for (const [key, value] of Object.entries(localModes.workspaces ?? {})) {
+        if (this.#governanceDirty.has(`w:${key}`)) mergedGovernanceModes.workspaces[key] = value;
+      }
+    }
 
     // Merge budgets: union by changeId, prefer local. Local entries are
     // already disk-merged additively by #refreshBudgets under the write lock,
@@ -629,9 +653,15 @@ export class ChangeStore {
       repairClaims: mergedRepairClaims,
       repairProofs: mergedRepairProofs,
       budgets: mergedBudgets,
-      ...(mergedGovernanceModes ? { governanceModes: mergedGovernanceModes } : {}),
+      governanceModes: mergedGovernanceModes,
     });
+    // Sync the merged governance behavior into the in-memory snapshot so
+    // callers read consistent data post-persist; clear dirtiness only on
+    // successful write, so a future persist still overlays this writer's
+    // changes when a previous persist failed.
+    this.#governanceModes = mergedGovernanceModes;
     // Clear dirty flags after successful persist.
+    this.#governanceDirty.clear();
     this.#dirtyBindings.clear();
     this.#removedBindings.clear();
     this.#dirtyReviews.clear();
@@ -1833,6 +1863,8 @@ export class ChangeStore {
       if (projectId !== null) modes.projects = { ...(modes.projects ?? {}), [projectId]: mode };
       if (workspace !== null) modes.workspaces = { ...(modes.workspaces ?? {}), [workspace]: mode };
       this.#governanceModes = modes;
+      if (projectId !== null) this.#governanceDirty.add(`p:${projectId}`);
+      if (workspace !== null) this.#governanceDirty.add(`w:${workspace}`);
       await this.#persist();
       return { ok: true };
     } finally {

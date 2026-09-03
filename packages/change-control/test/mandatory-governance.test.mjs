@@ -37,7 +37,7 @@ function registerFakeTools(registry) {
     execute: async () => ({ content: [{ type: 'text', text: 'MUTATED' }] }),
   }));
   registry.register(defineTool({
-    name: 'reader',
+    name: 'read',
     description: 'fake read-only tool',
     parameters: { data: { type: 'string' } },
     output: { schema: { type: 'object', additionalProperties: true }, render: (_a, v) => v },
@@ -101,7 +101,7 @@ test('mode=off: no extra audit events are emitted for tool calls', async (t) => 
   const change = await ctx.changeControl.create({ title: 'audit-shape' });
   const before = await ctx.changeControl.history(change.id);
   await execTool(registry, 'mutator', 'sess-x');
-  await execTool(registry, 'reader', 'sess-x');
+  await execTool(registry, 'read', 'sess-x');
   const after = await ctx.changeControl.history(change.id);
   assert.deepEqual(
     after.map((e) => ({ type: e.type, reason: e.reason ?? null })),
@@ -186,9 +186,9 @@ test('read-only tools always allowed in required mode (even without binding)', a
   const { ctx, registry } = await compose(t, { registerProvider: 'good' });
   registerFakeTools(registry);
   await ctx.changeControl.setGovernanceMode({ projectId: 'proj-A', mode: 'required' });
-  const r1 = await execTool(registry, 'reader', 'sess-any', { projectId: 'proj-A' });
+  const r1 = await execTool(registry, 'read', 'sess-any', { projectId: 'proj-A' });
   assert.notEqual(r1.isError, true, `reader must pass, got ${asText(r1)}`);
-  const r2 = await execTool(registry, 'reader', 'sess-any', { path: '/tmp/nope' });
+  const r2 = await execTool(registry, 'read', 'sess-any', { path: '/tmp/nope' });
   assert.notEqual(r2.isError, true);
 });
 
@@ -213,20 +213,17 @@ test('F2: missing agent identity is fail-closed in required mode', async (t) => 
   assert.match(asText(out), /CHANGE_CONTROL_REQUIRED|no session identity/);
 });
 
-test('F3: real read-only tools (e.g. task_get/task_list) pass; sanity: unknown default is read-denied-fail-closed', async (t) => {
-  // Policy basis point — under required mode classification, task_get passthrough is
-  // read-only by NAME SHAPE, not by hard-coding a partial list.
-  // NB: the name-shape test only needs to ensure the classification function
-  // is sound; actual tool-wiring is covered by the rest of the suite.
-  const { isReadOnlyToolName: isRO } = await import('node:module')
-    .then(() => ({})).catch(() => ({}));
-  // Internal helpers are not exported; drive the real gate instead.
+test('F3/F12: name-shape suffix `_get` does NOT confer read-only', async (t) => {
   const { ctx, registry } = await compose(t, { registerProvider: 'good' });
   registerFakeTools(registry);
   await ctx.changeControl.setGovernanceMode({ projectId: 'proj-A', mode: 'required' });
-  const out = await execTool(registry, 'reader', 'sess-anything', { projectId: 'proj-A' });
-  assert.match(asText(out), /READ/);
+  registry.register(defineTool({ name: 'mutator_get', description: 'm', parameters: { data: { type: 'string' } }, output: { schema:{ type:'object', additionalProperties:true }, render: (_a,v)=>v }, execute: async () => ({ content: [{ type: 'text', text: 'MUTATED-GET' }] }) }));
+  // Stranger session — the classifier must NOT have treated it as read-only.
+  const out = await execTool(registry, 'mutator_get', 'sess-stranger', { projectId: 'proj-A' });
+  assert.match(asText(out), /CHANGE_CONTROL_REQUIRED/);
+  assert.doesNotMatch(asText(out), /MUTATED-GET/);
 });
+
 
 test('F8: role/state denials under required mode carry [CHANGE_CONTROL_REQUIRED] and a nextAction', async (t) => {
   const { ctx, registry } = await compose(t, { registerProvider: 'good' });
@@ -268,4 +265,17 @@ test('F11: unknown persisted mode values fail closed (treated as required)', asy
   // Mode 'typo' → treated as 'required' → absent provider → fail-closed deny.
   const out = await execTool(registry, 'mutator', 'sess-anything', { projectId: 'proj-A' });
   assert.match(asText(out), /GOVERNANCE_PROVIDER_MISSING|CHANGE_CONTROL_REQUIRED/);
+});
+
+test('F7 (luna): two ChangeStore instances writing DISJOINT governance keys merge, newest wins per-key', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 't91-f7-'));
+  const file = join(dir, 'changes.json');
+  const { ChangeStore } = await import('../src/storage/change-store.js');
+  const A = await ChangeStore.open(file);
+  const B = await ChangeStore.open(file);
+  await A.setGovernanceMode({ projectId: 'proj-p', mode: 'required' });
+  await B.setGovernanceMode({ projectId: 'proj-q', mode: 'required' }); // disjoint; B's map is stale about proj-p
+  const fresh = await ChangeStore.open(file);
+  assert.equal(await fresh.getGovernanceMode({ projectId: 'proj-p' }), 'required');
+  assert.equal(await fresh.getGovernanceMode({ projectId: 'proj-q' }), 'required');
 });

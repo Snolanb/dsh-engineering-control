@@ -183,6 +183,7 @@ export function createFilesystemPolicy(store, config) {
   // NOT covered by that switch — runtime governance modes (persisted in
   // the store) govern themselves and cannot be shut off from model config.
   const legacyGateDisabled = policyConfig?.enabled === false;
+  const isReadOnlyToolName = makeReadOnlyClassifier(policyConfig?.readOnlyToolNames);
   // Not configured at all: STILL return the gate — the T9.1 mandatory
   // governance mode uses this same hook and must be available from runtime
   // state alone. Mode resolution reads the store -> if every scope resolves
@@ -559,10 +560,20 @@ async function auditDenial(store, changeId, exec, sessionId, role, state, reason
  * Fidelity beats a hard-coded whitelist: unknown NEW read tools fall into
  * the deny bucket (fail-closed), never into an erroneous allow.
  */
-function isReadOnlyToolName(name) {
-  if (typeof name !== 'string' || name === '') return false;
-  if (['read', 'grep', 'glob', 'ls', 'cat', 'head', 'tail', 'find', 'search', 'reader'].includes(name)) return true;
-  return /(_get|_list|_read|_reads|_status|_history|_events)$/i.test(name);
+/**
+ * Read-only tool allow-list. STRICT: only explicitly enumerated names classify
+ * as read-only — a mutating tool MUST NOT be able to smuggle through with a
+ * `-get`-suffix or arbitrary "reader" name. Hosts running extra read-only
+ * tools can extend the list via `policy.readOnlyToolNames: string[]`.
+ */
+const READ_ONLY_TOOL_NAMES = new Set([
+  'read', 'grep', 'glob', 'ls', 'cat', 'head', 'tail', 'find', 'search',
+]);
+
+function makeReadOnlyClassifier(extraNames) {
+  const extras = Array.isArray(extraNames) ? extraNames.filter((n) => typeof n === 'string') : [];
+  const names = new Set([...READ_ONLY_TOOL_NAMES, ...extras]);
+  return (name) => typeof name === 'string' && name.length > 0 && names.has(name);
 }
 
 /**
@@ -600,6 +611,10 @@ async function resolveGovernanceScope(store, args) {
 
 const KNOWN_GOVERNANCE_ROLES = new Set(['planner', 'worker', 'reviewer']);
 
+
+/** Conservative static default (no host-configured extras). */
+const isReadOnlyToolByDefault = makeReadOnlyClassifier(null);
+
 /**
  * Mandatory mode enforcement: in 'required' mode every mutating call must
  * satisfy ALL of, in order:
@@ -616,7 +631,7 @@ const KNOWN_GOVERNANCE_ROLES = new Set(['planner', 'worker', 'reviewer']);
  */
 async function evaluateMandatoryGovernance(store, exec, agentId) {
   // Read-only tools are NEVER gated by mandatory mode (AC of T9.1).
-  if (isReadOnlyToolName(exec?.name)) return null;
+  if (isReadOnlyToolByDefault(exec?.name)) return null;
   // Store API predating T9.1 (legacy test fixtures / compositional callers
   // holding a pre-T9.1 store): mandatory governance is not enforceable.
   if (typeof store.getGovernanceMode !== 'function') return null;
