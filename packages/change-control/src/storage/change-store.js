@@ -244,6 +244,14 @@ export class ChangeStore {
   #preflightPolicy = null;
   /** Host-owned budget thresholds ({maxRepairAttempts?, maxReviewFailures?}) or null. */
   #budgetPolicy = null;
+  /** Per-project / per-workspace governance mode map (persisted). */
+  #governanceModes = null;
+  /**
+   * Governance keys set by THIS store instance since the last successful
+   * persist. Persist overlays ONLY these keys, so a concurrent writer's
+   * newer entries survive (luna F7/F9).
+   */
+  #governanceDirty = new Set();
   /** @type {Map<string, object>} changeId -> budget record (counters, escalation, override) */
   #budgets = new Map();
 
@@ -361,6 +369,9 @@ export class ChangeStore {
       }
     }
     // Budgets: keyed by changeId.
+    if (data.governanceModes && typeof data.governanceModes === 'object') {
+      this.#governanceModes = data.governanceModes;
+    }
     if (data.budgets && typeof data.budgets === 'object') {
       for (const [changeId, budget] of Object.entries(data.budgets)) {
         if (budget && typeof budget === 'object') this.#budgets.set(changeId, budget);
@@ -596,6 +607,29 @@ export class ChangeStore {
       mergedRepairProofs[changeId] = proof;
     }
 
+    // Merge governance modes (per-KEY last-writer-wins): start fresh from
+    // disk; overlay ONLY the keys this store actually set since its last
+    // persist. Two stores writing DISJOINT keys can no longer silently
+    // drop each other's entries (F7 stale-governance overwrite).
+    const diskGovernanceModes = diskData?.governanceModes && typeof diskData.governanceModes === 'object' ? diskData.governanceModes : null;
+    let mergedGovernanceModes = diskGovernanceModes
+      ? JSON.parse(JSON.stringify(diskGovernanceModes))
+      : { default: 'off', projects: {}, workspaces: {} };
+    if (mergedGovernanceModes.projects == null) mergedGovernanceModes.projects = {};
+    if (mergedGovernanceModes.workspaces == null) mergedGovernanceModes.workspaces = {};
+    const localModes = this.#governanceModes;
+    if (localModes) {
+      if (this.#governanceDirty.has('default') && typeof localModes.default === 'string') {
+        mergedGovernanceModes.default = localModes.default;
+      }
+      for (const [key, value] of Object.entries(localModes.projects ?? {})) {
+        if (this.#governanceDirty.has(`p:${key}`)) mergedGovernanceModes.projects[key] = value;
+      }
+      for (const [key, value] of Object.entries(localModes.workspaces ?? {})) {
+        if (this.#governanceDirty.has(`w:${key}`)) mergedGovernanceModes.workspaces[key] = value;
+      }
+    }
+
     // Merge budgets: union by changeId, prefer local. Local entries are
     // already disk-merged additively by #refreshBudgets under the write lock,
     // so preferring local here never drops an increment.
@@ -619,8 +653,15 @@ export class ChangeStore {
       repairClaims: mergedRepairClaims,
       repairProofs: mergedRepairProofs,
       budgets: mergedBudgets,
+      governanceModes: mergedGovernanceModes,
     });
+    // Sync the merged governance behavior into the in-memory snapshot so
+    // callers read consistent data post-persist; clear dirtiness only on
+    // successful write, so a future persist still overlays this writer's
+    // changes when a previous persist failed.
+    this.#governanceModes = mergedGovernanceModes;
     // Clear dirty flags after successful persist.
+    this.#governanceDirty.clear();
     this.#dirtyBindings.clear();
     this.#removedBindings.clear();
     this.#dirtyReviews.clear();
@@ -1797,6 +1838,79 @@ export class ChangeStore {
    * Used by PreflightRunner to commit controller results without going through a public mutation method.
    * @internal
    */
+  /**
+   * T9.1 — host-owned governance modes.
+   * Modes: 'off' | 'optional' | 'required'. Optionally scoped by projectId
+   * and/or workspace; the workspace entry overrides the project entry, the
+   * project entry overrides the store default. Both data sets persist.
+   */
+  async setGovernanceMode({ projectId = null, workspace = null, mode }) {
+    if (projectId === null && workspace === null) {
+      throw Object.assign(new Error('setGovernanceMode requires projectId or workspace'), { code: 'INVALID_GOVERNANCE_KEY' });
+    }
+    if (projectId !== null && (typeof projectId !== 'string' || projectId === '')) {
+      throw Object.assign(new Error('projectId must be a non-empty string'), { code: 'INVALID_GOVERNANCE_KEY' });
+    }
+    if (workspace !== null && (typeof workspace !== 'string' || !workspace.startsWith('/'))) {
+      throw Object.assign(new Error('workspace must be an absolute path'), { code: 'INVALID_GOVERNANCE_KEY' });
+    }
+    if (!['off', 'optional', 'required'].includes(mode)) {
+      throw Object.assign(new Error(`invalid governance mode: ${mode}`), { code: 'INVALID_GOVERNANCE_MODE' });
+    }
+    const release = await acquireLock(this.#file);
+    try {
+      const modes = this.#governanceModes ?? { default: 'off', projects: {}, workspaces: {} };
+      if (projectId !== null) modes.projects = { ...(modes.projects ?? {}), [projectId]: mode };
+      if (workspace !== null) modes.workspaces = { ...(modes.workspaces ?? {}), [workspace]: mode };
+      this.#governanceModes = modes;
+      if (projectId !== null) this.#governanceDirty.add(`p:${projectId}`);
+      if (workspace !== null) this.#governanceDirty.add(`w:${workspace}`);
+      await this.#persist();
+      return { ok: true };
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Resolve the effective governance mode for a (projectId?, workspace?)
+   * pair. Precedence: workspace override > project > store default > 'off'.
+   */
+  async getGovernanceMode({ projectId = null, workspace = null, path = null } = {}) {
+    if (projectId !== null && typeof projectId !== 'string') {
+      throw Object.assign(new Error('projectId must be a string'), { code: 'INVALID_GOVERNANCE_KEY' });
+    }
+    if (workspace !== null && typeof workspace !== 'string') {
+      throw Object.assign(new Error('workspace must be a string'), { code: 'INVALID_GOVERNANCE_KEY' });
+    }
+    if (path !== null && typeof path !== 'string') {
+      throw Object.assign(new Error('path must be a string'), { code: 'INVALID_GOVERNANCE_KEY' });
+    }
+    // Fresh_disk read: the mandatory-governance gate must not be bypassed by
+    // a stale in-memory snapshot written by a racing store instance.
+    let modes = this.#governanceModes;
+    try {
+      const disk = await readJson(this.#file);
+      if (disk?.governanceModes && typeof disk.governanceModes === 'object') modes = disk.governanceModes;
+    } catch { /* a corrupt or missing store must not WEAKEN enforcement */ }
+    if (!modes) return 'off';
+    const sanitize = (m) => (['off', 'optional', 'required'].includes(m) ? m : 'required');
+    if (workspace !== null && typeof modes.workspaces?.[workspace] === 'string') return sanitize(modes.workspaces[workspace]);
+    // A path falls back to the governing workspace that contains it.
+    if (path !== null && modes.workspaces) {
+      const hits = Object.entries(modes.workspaces)
+        .filter(([ws]) => typeof ws === 'string' && typeof path === 'string' && (path === ws || path.startsWith(ws + '/')));
+      if (hits.length > 0) {
+        // Longest containment wins.
+        hits.sort((a, b) => b[0].length - a[0].length);
+        return sanitize(hits[0][1]);
+      }
+    }
+    if (projectId !== null && typeof modes.projects?.[projectId] === 'string') return sanitize(modes.projects[projectId]);
+    if (typeof modes.default === 'string') return sanitize(modes.default);
+    return 'off';
+  }
+
   async _persist() {
     await this.#persist();
   }

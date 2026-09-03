@@ -1,4 +1,5 @@
 // @ts-nocheck
+import { getGovernanceProvider } from '../service/governance-provider.js';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { realpath } from 'node:fs/promises';
 
@@ -97,7 +98,7 @@ async function evaluateRisk(policyConfig, store, binding, exec) {
   const args = exec?.arguments ?? {};
 
   // Explicit opt-in escape hatch for genuinely legacy store paths.
-  if (policyConfig.allowLegacyRisklessChanges === true && binding.risk == null) {
+  if (policyConfig?.allowLegacyRisklessChanges === true && binding.risk == null) {
     return null;
   }
 
@@ -119,7 +120,7 @@ async function evaluateRisk(policyConfig, store, binding, exec) {
   // profiles are configured at all there is nothing to enforce; when they
   // are configured, an absent/undeclared profile for the effective risk
   // fails closed.
-  const profiles = policyConfig.riskProfiles;
+  const profiles = policyConfig?.riskProfiles;
   if (profiles == null || typeof profiles !== 'object') return null;
 
   // Only implementation-capable actions consume gates: change-tool
@@ -177,10 +178,17 @@ async function evaluateRisk(policyConfig, store, binding, exec) {
  */
 export function createFilesystemPolicy(store, config) {
   const policyConfig = config?.policy;
-  // Explicitly disabled: no interception.
-  if (policyConfig?.enabled === false) return null;
-  // Not configured at all: preserve backward-compatible unrestricted behavior.
-  if (policyConfig == null) return null;
+  // `policy.enabled === false` disables ONLY the legacy (policy-functional)
+  // branches below; the T9.1 mandatory-governance branch is deliberately
+  // NOT covered by that switch — runtime governance modes (persisted in
+  // the store) govern themselves and cannot be shut off from model config.
+  const legacyGateDisabled = policyConfig?.enabled === false;
+  const isReadOnlyToolName = makeReadOnlyClassifier(policyConfig?.readOnlyToolNames);
+  // Not configured at all: STILL return the gate — the T9.1 mandatory
+  // governance mode uses this same hook and must be available from runtime
+  // state alone. Mode resolution reads the store -> if every scope resolves
+  // 'off', the gate is a pure pass-through.
+
 
   /**
    * Pre-execute interceptor. Called by the ToolRuntime for every tool call.
@@ -188,12 +196,25 @@ export function createFilesystemPolicy(store, config) {
    */
   async function policyGate(exec, next) {
     const agentId = exec?.agent?.id;
+
+    // T9.1: mandatory governance. Mode is resolved from the PERSISTED
+    // governance modes map; the default is 'off' (fully backward compatible).
+    // Runs BEFORE the unidentifiable-session early return — a missing
+    // agent identity is exactly the case where mandatory mode matters.
+    const mgDecision = await evaluateMandatoryGovernance(store, exec, agentId, isReadOnlyToolName);
+    if (mgDecision) return mgDecision;
+    // Mandatory gate approved this required-mode call (all preconditions
+    // already verified there) — legacy policy must not re-litigate.
+    if (exec?.['__mgHandled']) return next();
+
+    // The legacy policy path requires an agent identity (bindings lookups).
     if (!agentId) return next();
+    if (!policyConfig || legacyGateDisabled) return next();
 
     // Host-owned governance layer: active only when the policy names a
     // governed project. Runs before role/change-tool pass-through so that
     // repository content can never bypass authoritative checks.
-    if (policyConfig.projectId) {
+    if (policyConfig?.projectId) {
       const decision = await evaluateGovernance(policyConfig, exec);
       await auditGovernance(store, exec, agentId, decision, policyConfig);
       if (decision) {
@@ -525,4 +546,181 @@ async function auditDenial(store, changeId, exec, sessionId, role, state, reason
   } catch {
     // Non-fatal: audit failures must not break tool execution flow
   }
+}
+
+
+// ─── T9.1 — mandatory governance mode ───────────────────────────────────────
+
+/**
+ * Read-only name shape, not an enumerated allow-list:
+ *  - the classic file readers;
+ *  - every '*_get', '*_list', '*_read', '*_status', '*_history', '*_events'
+ *    tool from task/change/change-control is read-only by construction;
+ *  - all other names are treated as mutating-capable by mandatory mode.
+ * Fidelity beats a hard-coded whitelist: unknown NEW read tools fall into
+ * the deny bucket (fail-closed), never into an erroneous allow.
+ */
+/**
+ * Read-only tool allow-list. STRICT: only explicitly enumerated names classify
+ * as read-only — a mutating tool MUST NOT be able to smuggle through with a
+ * `-get`-suffix or arbitrary "reader" name. Hosts running extra read-only
+ * tools can extend the list via `policy.readOnlyToolNames: string[]`.
+ */
+const READ_ONLY_TOOL_NAMES = new Set([
+  'read', 'grep', 'glob', 'ls', 'cat', 'head', 'tail', 'find', 'search',
+  // Read-only change-control / task-orchestrator surface (Phase 9 catalogue):
+  'change_get', 'task_get', 'task_list', 'project_get', 'project_list',
+  'milestone_get', 'milestone_list', 'task_events', 'task_list_links',
+  'task_ready_to_run', 'task_board_list',
+  // Actions catalogue confirmed READ-ONLY via task-orchestrator tooling
+  'task_list_children', 'task_list_descendants', 'task_blocked_by_dependencies',
+  'plan_import_preview',
+]);""
+
+
+function makeReadOnlyClassifier(extraNames) {
+  const extras = Array.isArray(extraNames) ? extraNames.filter((n) => typeof n === 'string') : [];
+  const names = new Set([...READ_ONLY_TOOL_NAMES, ...extras]);
+  return (name) => typeof name === 'string' && name.length > 0 && names.has(name);
+}
+
+/**
+ * Normalize caller-supplied arg keys — snake_case / camelCase / plain —
+ * so scope resolution accepts the actual tool-surface spellings
+ * (projectId AND project_id, workdir AND work_dir AND cwd, …).
+ */
+function normalizeGovernanceArgKey(key) {
+  return String(key).toLowerCase().replace(/_/g, '');
+}
+
+function pickKey(args, canonical) {
+  if (!args || typeof args !== 'object') return undefined;
+  for (const [k, v] of Object.entries(args)) {
+    if (normalizeGovernanceArgKey(k) === canonical && typeof v === 'string') return v;
+  }
+  return undefined;
+}
+
+/** Resolve the governance scope a tool call is acting on. */
+async function resolveGovernanceScope(store, args) {
+  const workspace = pickKey(args, 'workspace')
+    ?? pickKey(args, 'workspacepath')
+    ?? pickKey(args, 'workdir')
+    ?? pickKey(args, 'workdirpath')
+    ?? pickKey(args, 'cwd')
+    ?? null;
+  const projectId = pickKey(args, 'projectid') ?? null;
+  // A path-bearing mutating tool targets the containing workspace when the
+  // mode map configures one whose prefix contains the path.
+  const path = pickKey(args, 'path') ?? pickKey(args, 'filepath') ?? null;
+  const mode = await store.getGovernanceMode({ projectId, workspace, path });
+  return { projectId, workspace, path, mode };
+}
+
+const KNOWN_GOVERNANCE_ROLES = new Set(['planner', 'worker', 'reviewer']);
+
+
+/** Conservative static default (no host-configured extras). */
+const isReadOnlyToolByDefault = makeReadOnlyClassifier(null);
+
+/**
+ * Mandatory mode enforcement: in 'required' mode every mutating call must
+ * satisfy ALL of, in order:
+ *   1) governance mode resolution works (fail-closed when the lookup ends
+ *      with a store error);
+ *   2) the executing session is identifiable (no agent id → not associateable
+ *      with a governed task → denied);
+ *   3) a task-context provider is registered (integration package);
+ *   4) the provider associates this session with a governed task;
+ *   5) the session has a KNOWN role binding on an ACTIVE, NON-TERMINAL
+ *      Change; unknown roles are denied outright (role confusion).
+ * The 'optional' mode is informational: nothing is denied, nothing is
+ * required (today).
+ */
+async function evaluateMandatoryGovernance(store, exec, agentId, isReadOnlyToolName = isReadOnlyToolByDefault) {
+  // Read-only tools are NEVER gated by mandatory mode (AC of T9.1).
+  if (isReadOnlyToolName(exec?.name)) return null;
+  // Store API predating T9.1 (legacy test fixtures / compositional callers
+  // holding a pre-T9.1 store): mandatory governance is not enforceable.
+  if (typeof store.getGovernanceMode !== 'function') return null;
+  let mode;
+  try {
+    const resolved = await resolveGovernanceScope(store, exec?.arguments ?? {});
+    mode = resolved.mode;
+  } catch (err) {
+    // Fail-closed: a store error on mode resolution must not silently open
+    // the mutation path.
+    return deny('GOVERNANCE_MODE_LOOKUP_FAILED',
+      `[GOVERNANCE_MODE_LOOKUP_FAILED] governance mode resolution failed: ${err?.message ?? err}`);
+  }
+  if (mode !== 'required') return null;
+
+  if (typeof agentId !== 'string' || agentId.length === 0) {
+    return deny('CHANGE_CONTROL_REQUIRED',
+      '[CHANGE_CONTROL_REQUIRED] mandatory governance: no session identity available; cannot relate this call to a governed task.');
+  }
+
+  const provider = getGovernanceProvider(store);
+  if (!provider) {
+    return deny('GOVERNANCE_PROVIDER_MISSING',
+      '[GOVERNANCE_PROVIDER_MISSING] mandatory governance is required but no task-context provider is registered; operation denied (fail-closed).');
+  }
+
+  /** @type {{ taskId?: string|null, taskStatus?: string|null, changeId?: string|null, role?: string|null } | null} */
+  let taskCtx = null;
+  try {
+    taskCtx = await provider.lookup({ sessionId: agentId });
+  } catch (err) {
+    return deny('GOVERNANCE_PROVIDER_FAILURE', `[GOVERNANCE_PROVIDER_FAILURE] task-context provider failed: ${err?.message ?? err}`);
+  }
+  if (!taskCtx || typeof taskCtx.taskId !== 'string' || !taskCtx.taskId) {
+    return deny('CHANGE_CONTROL_REQUIRED',
+      '[CHANGE_CONTROL_REQUIRED] session is not associated with a governed task; bind before mutating. nextAction: claim the governed task and complete governed dispatch.');
+  }
+
+  // Role + Change-state enforcement. The legacy branches below are skipped
+  // in required mode, so this gate OWNS role/state decisions.
+  let bindings = [];
+  try {
+    bindings = await store.listRoleBindings();
+  } catch (err) {
+    return deny('GOVERNANCE_BINDINGS_LOOKUP_FAILED', `[GOVERNANCE_BINDINGS_LOOKUP_FAILED] ${err?.message ?? err}`);
+  }
+  const bySession = bindings.filter((b) => b.sessionId === agentId);
+  const requestedChangeId = exec?.arguments?.changeId ?? null;
+  let binding = null;
+  let change = null;
+  if (requestedChangeId) {
+    binding = bySession.find((b) => b.changeId === requestedChangeId) ?? null;
+  } else if (bySession.length === 1) {
+    binding = bySession[0];
+  } else if (bySession.length > 1) {
+    return deny('CHANGE_CONTROL_REQUIRED',
+      '[CHANGE_CONTROL_REQUIRED] session is bound to multiple Changes; tool must specify changeId. nextAction: add changeId.');
+  }
+  if (!binding) {
+    return deny('CHANGE_CONTROL_REQUIRED',
+      '[CHANGE_CONTROL_REQUIRED] session is not bound to the target Change. nextAction: bindRole as worker/reviewer/planner first.');
+  }
+  if (typeof binding.role !== 'string' || !KNOWN_GOVERNANCE_ROLES.has(binding.role)) {
+    return deny('CHANGE_CONTROL_REQUIRED',
+      `[CHANGE_CONTROL_REQUIRED] role "${binding.role}" is invalid; only planner/worker/reviewer may mutate. nextAction: re-bind an allowed role.`);
+  }
+  try {
+    change = await store.get(binding.changeId);
+  } catch (err) {
+    return deny('GOVERNANCE_CHANGE_LOOKUP_FAILED', `[GOVERNANCE_CHANGE_LOOKUP_FAILED] ${err?.message ?? err}`);
+  }
+  const state = change?.state;
+  if (binding.role === 'planner' || binding.role === 'reviewer') {
+    return deny('CHANGE_CONTROL_REQUIRED',
+      `[CHANGE_CONTROL_REQUIRED] role "${binding.role}" is read-only in mandatory mode; tool "${exec?.name}" is denied. nextAction: have a worker session execute the mutation.`);
+  }
+  if (!['IMPLEMENTING', 'REPAIR'].includes(state)) {
+    return deny('CHANGE_CONTROL_REQUIRED',
+      `[CHANGE_CONTROL_REQUIRED] Change ${change?.id} is in ${state}; workers may mutate only in IMPLEMENTING/REPAIR. nextAction: move the Change to IMPLEMENTING or REPAIR.`);
+  }
+  // Mark the exec as governance-cleared so the legacy branches skip.
+  if (exec && typeof exec === 'object') exec.__mgHandled = true;
+  return null;
 }

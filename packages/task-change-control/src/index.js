@@ -21,6 +21,30 @@ export default {
     });
     ctx.provide('taskChangeControl', service);
 
+    // T9.1 — mandatory governance provider: resolves sessionId → task
+    // context using the bindings graph (session → change → workItem).
+    // Install only when the change-control facade exposes the hook
+    // (older/static change-control compositions ignore this).
+    const changeControl = ctx.get('changeControl');
+    if (changeControl && typeof changeControl.registerGovernanceProvider === 'function') {
+      changeControl.registerGovernanceProvider({
+        lookup: async (/** @type {{sessionId: string}} */ { sessionId }) => {
+          const bindings = await changeControl.listRoleBindings();
+          const hit = bindings.find((/** @type {any} */ b) => b.sessionId === sessionId);
+          if (!hit) return null;
+          const change = await changeControl.get(hit.changeId);
+          const taskId = change?.workItem?.system === 'task-orchestrator' ? change.workItem.id : null;
+          const t = ctx.get('taskOrchestrator');
+          let taskStatus = null;
+          if (taskId && t && typeof t.get === 'function') {
+            const task = await t.get(taskId);
+            taskStatus = task?.status ?? null;
+          }
+          return { changeId: hit.changeId, taskId, taskStatus, role: hit.role };
+        },
+      });
+    }
+
     // Model-facing surface: exactly two tools, registered only when a tools
     // registry exists (probed defensively, same pattern as change-control's
     // host commands). Registry health errors fail loudly.
