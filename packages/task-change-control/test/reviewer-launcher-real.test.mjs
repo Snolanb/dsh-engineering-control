@@ -139,3 +139,16 @@ test('setup failure after session.create cancels the session (no orphan)', async
   await assert.rejects(ctx.taskChangeControl.launchReviewer(task.id));
   assert.ok(rpcLog.some((r) => r.op === 'session.cancel'), 'cancel must be issued');
 });
+
+test('default reviewer prompt is reviewer-scoped (no worker-you-are language)', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'tcc-t81-real6-'));
+  const { ctx, taskStore, rpcLog } = await compose(t, dir);
+  const task = await taskStore.create({ title: 'g', description: 'd', status: 'ready', workspace: dir, worker_profile: 'w', acceptance_criteria: ['a'] });
+  await ctx.taskChangeControl.bootstrapTask(task.id);
+  await ctx.taskChangeControl.launchReviewer(task.id);
+  const promptRpc = rpcLog.find((r) => r.op === 'session.prompt');
+  assert.ok(promptRpc, 'prompt sent');
+  const text = promptRpc.args.content[0].text;
+  assert.match(text, /reviewer/);
+  assert.ok(!/You are worker/.test(text), 'not worker-shaped prompt');
+});

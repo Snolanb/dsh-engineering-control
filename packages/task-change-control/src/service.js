@@ -448,8 +448,11 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         const change = await c.findByWorkItem(WORK_ITEM_SYSTEM, taskId);
         if (!change) throw Object.assign(new Error(`no Change linked to task ${taskId}`), { code: 'CHANGE_NOT_FOUND' });
         const launcher = /** @type {any} */ (t).createReviewerLauncher(options.launcherOptions ?? {});
+        const defaultPrompt = `You are the independent reviewer for task ${task.id}.
+Review the governed Change ${change.id} against its Plan and project task acceptance criteria. Read-only: do NOT modify any files. Inspect the worker's submitted proof and test log and decide PASS / FAIL / ESCALATE with a brief rationale.`;
         const spec = options.spec ?? {
           mode: 'session',
+          prompt: defaultPrompt,
           agentPreset: task.reviewer_profile ?? 'reviewer',
           // Parse 'provider/model' convention, same as worker_model elsewhere;
           // bare 'model' leaves provider undefined and DSH host resolution fills
