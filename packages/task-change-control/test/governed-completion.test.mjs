@@ -11,6 +11,7 @@ import changeControlPlugin from 'dsh-change-control';
 import plugin from '../src/index.js';
 
 const SYSTEM = 'dsh-task-orchestrator';
+const WORKER_RUN = 'worker:run-c1';
 
 async function compose(t) {
   const dir = await mkdtemp(join(tmpdir(), 'tcc-complete-'));
@@ -22,6 +23,7 @@ async function compose(t) {
   ctx.provide('taskOrchestrator', Object.freeze({
     get: taskStore.get.bind(taskStore),
     update: taskStore.update.bind(taskStore),
+    complete: taskStore.complete.bind(taskStore),
   }));
   await ctx.plugin(changeControlPlugin, { storePath: join(dir, 'changes.json') });
   await ctx.plugin(plugin);
@@ -42,7 +44,7 @@ async function runningGovernedTask(ctx, taskStore, dir) {
   const claimed = await taskStore.claim(task.id, runId, { lease_seconds: 300, actor: 'host' });
   assert.ok(claimed.claimed);
   await taskStore.start(task.id, runId, { actor: 'host' });
-  await ctx.changeControl.bindRole(change.id, 'sess-worker-1', 'worker');
+  await ctx.changeControl.bindRole(change.id, 'sess-worker-1', 'worker', { worker: WORKER_RUN });
   return { task, change, runId };
 }
 

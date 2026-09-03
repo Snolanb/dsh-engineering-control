@@ -24,8 +24,8 @@ function unavailable(detail) {
 
 /**
  * Minimal typed views of the two domain services this package depends on.
- * @typedef {{ get: (id: string) => Promise<any>, update: (id: string, patch: any) => Promise<any>, createDispatcher: (options?: any) => any, createWorkerLauncher?: (options?: any) => any }} TaskOrchestratorApi
- * @typedef {{ get: (id: string) => Promise<any>, findByWorkItem: (system: string, id: string) => Promise<any>, findOrCreateForWorkItem: (input: { system: string, id: string, change: object }) => Promise<any>, resolveRole: (changeId: string, sessionId: string) => Promise<string>, submitProof: (changeId: string, proof: any) => Promise<any>, transition: (changeId: string, toState: string, opts?: any) => Promise<any> }} ChangeControlApi
+ * @typedef {{ get: (id: string) => Promise<any>, update: (id: string, patch: any) => Promise<any>, complete?: (id: string, result: object, options?: any) => Promise<any>, createDispatcher: (options?: any) => any, createWorkerLauncher?: (options?: any) => any }} TaskOrchestratorApi
+ * @typedef {{ get: (id: string) => Promise<any>, findByWorkItem: (system: string, id: string) => Promise<any>, findOrCreateForWorkItem: (input: { system: string, id: string, change: object }) => Promise<any>, resolveRole: (changeId: string, sessionId: string) => Promise<string>, getBinding: (changeId: string, sessionId: string) => Promise<any>, submitProof: (changeId: string, proof: any) => Promise<any>, transition: (changeId: string, toState: string, opts?: any) => Promise<any> }} ChangeControlApi
  * @param {object} deps
  * @param {() => TaskOrchestratorApi | undefined} deps.taskOrchestrator accessor (may be absent)
  * @param {() => ChangeControlApi | undefined} deps.changeControl accessor (may be absent)
@@ -197,6 +197,12 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
       const taskOrchestrator = requireTask();
       const c = requireChange();
       return (async () => {
+        if (typeof taskId !== 'string' || taskId.trim() === '') {
+          throw Object.assign(new Error('taskId is required'), { code: 'INVALID_TASK_ID' });
+        }
+        if (!input || typeof input !== 'object') {
+          throw Object.assign(new Error(`completeGovernedTask input is required for ${taskId}`), { code: 'INVALID_INPUT' });
+        }
         const sessionId = input.sessionId;
         const worker = input.worker;
         const proof = input.proof ?? {};
@@ -233,17 +239,26 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         if (!changed) throw Object.assign(new Error(`no Change linked for ${taskId}`), { code: 'WORK_ITEM_NOT_LINKED' });
 
         // 2. Session must be bound as worker on this Change.
-        let boundRole = null;
+        let binding = null;
         try {
-          boundRole = await c.resolveRole(changed.id, sessionId);
+          binding = await c.getBinding(changed.id, sessionId);
         } catch (error) {
           throw Object.assign(
             new Error(`session ${sessionId} is not bound as worker`),
             { code: 'SESSION_NOT_BOUND', cause: error },
           );
         }
-        if (boundRole !== 'worker') {
-          throw Object.assign(new Error(`session ${sessionId} is not bound as worker (got ${boundRole})`), { code: 'SESSION_NOT_BOUND' });
+        if (!binding || binding.role !== 'worker') {
+          throw Object.assign(new Error(`session ${sessionId} is not bound as worker`), { code: 'SESSION_NOT_BOUND' });
+        }
+        // T7.1 fix for F2: the binding's remembered worker identity must be
+        // the dispatcher's claimed worker — otherwise the session-swap attack
+        // (worker:A completes with sessionId bound to worker:B) passes.
+        if (binding.worker !== worker) {
+          throw Object.assign(
+            new Error(`session ${sessionId} belongs to ${binding.worker}, not ${worker}`),
+            { code: 'SESSION_WORKER_MISMATCH', changeId: changed.id },
+          );
         }
 
         // 3. Idempotent Change transition — only on IMPLEMENTING. Second pass = noop.
@@ -254,15 +269,64 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
           throw Object.assign(new Error(`cannot complete from Change state ${change.state}`), { code: 'INVALID_STATE' });
         }
 
-        // 4. Task-side reconciliation with the same structured information.
-        await Promise.resolve(taskOrchestrator.update(taskId, {
-          status: 'in_review',
-          commit_sha: proof.commit_sha,
-          files_changed: proof.files_changed ?? [],
-          tests_run: proof.tests_run ?? [],
-          remaining_blockers: proof.remaining_blockers ?? [],
-          result_summary: proof.summary ?? proof.title ?? 'governed completion',
-        }));
+        // 3.5. Criteria alignment: the current task's acceptance criteria must
+        // match the Change-side proof's criteria exactly. This catches the
+        // drift where the bootstrap snapshot and the canonical task row diverge.
+        {
+          const taskCriteria = Array.isArray(task.acceptance_criteria) ? task.acceptance_criteria : [];
+          const taskIds = new Set(taskCriteria.map(String));
+          const proofIds = new Set((proof.criteria ?? []).map(/** @param {any} c */ (c) => (c && typeof c === 'object' ? c.id : c)));
+          if (taskIds.size !== proofIds.size || [...taskIds].some((id) => !proofIds.has(id))) {
+            throw Object.assign(
+              new Error(`proof criteria do not match task acceptance_criteria`),
+              { code: 'CRITERIA_MISMATCH', task: [...taskIds], proof: [...proofIds] },
+            );
+          }
+        }
+
+        // 4a. Alignment fields are mandatory: the Change-side proof and the
+        // final task row MUST carry identical values. Omitting them yields
+        // task rows of null/[] next to a proof without the keys.
+        for (const key of ['commit_sha', 'files_changed', 'tests_run', 'remaining_blockers']) {
+          if (!(key in proof)) {
+            throw Object.assign(new Error(`proof field required: ${key}`), { code: 'PROOF_FIELD_REQUIRED', field: key });
+          }
+        }
+
+        // 4b. RE-VALIDATE the lease: all Change-side awaits above can span
+        // longer than the lease. Never mark in_review unless the worker
+        // still owns an unexpired claim on the canonical TaskStore row.
+        const refreshed = await Promise.resolve(taskOrchestrator.get(taskId));
+        if (!refreshed
+          || refreshed.claimed_by !== worker
+          || (refreshed.status !== 'claimed' && refreshed.status !== 'running')
+          || Number(refreshed.lease_expires_at ?? 0) <= Date.now()) {
+          throw Object.assign(
+            new Error('lease invalidated during Change-side work'),
+            { code: 'TASK_LEASE_INVALID', stage: 'post-proof' },
+          );
+        }
+
+        // 4c. Perform task completion via complete() — owner-checked by the
+        // TaskStore. If this throws the Change is PREFLIGHT and the task is
+        // still running; report as RECOVERABLE_PARTIAL for reconciliation.
+        try {
+          await Promise.resolve(taskOrchestrator.complete?.(taskId, {
+            result_summary: proof.summary ?? proof.title ?? 'governed completion',
+            commit_sha: proof.commit_sha,
+            files_changed: proof.files_changed,
+            tests_run: proof.tests_run,
+            remaining_blockers: proof.remaining_blockers,
+          }, { worker }));
+          if (typeof taskOrchestrator.complete !== 'function') {
+            throw Object.assign(new Error('taskOrchestrator.complete missing'), { code: 'INCOMPLETE_FACADE' });
+          }
+        } catch (error) {
+          throw Object.assign(
+            new Error(`task completion failed after proof: ${error instanceof Error ? error.message : String(error)}`),
+            { code: 'GOVERNED_COMPLETION_PARTIAL', changeId: changed.id, cause: error },
+          );
+        }
         return { ok: true, taskId, changeId: changed.id };
       })();
     },

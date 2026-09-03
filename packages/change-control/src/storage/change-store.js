@@ -1034,7 +1034,9 @@ export class ChangeStore {
         if (opts.rebind) {
           // Replace the existing binding with the new role
           const idx = changeBindings.indexOf(existing);
-          changeBindings[idx] = { changeId, sessionId, role };
+          changeBindings[idx] = opts.worker !== undefined
+            ? { changeId, sessionId, role, worker: opts.worker ?? null }
+            : { changeId, sessionId, role };
           this.#bindings.set(changeId, changeBindings);
           this.#dirtyBindings.add(`${changeId}:${sessionId}`);
           await this.#persist();
@@ -1043,7 +1045,9 @@ export class ChangeStore {
         throw Object.assign(new Error(`Session ${sessionId} is already bound to role ${existing.role} on change ${changeId}`), { code: 'ALREADY_BOUND' });
       }
 
-      const binding = { changeId, sessionId, role };
+      const binding = opts.worker !== undefined
+        ? { changeId, sessionId, role, worker: opts.worker ?? null }
+        : { changeId, sessionId, role };
       changeBindings.push(binding);
       this.#bindings.set(changeId, changeBindings);
       this.#dirtyBindings.add(`${changeId}:${sessionId}`);
@@ -1096,6 +1100,22 @@ export class ChangeStore {
    * Resolve a session's binding for a role on a Change.
    * Returns the role string or throws if no binding exists.
    */
+  /**
+   * Full binding record for (changeId, sessionId) or null. Includes the
+   * optional run-level worker identity bound by the controller at dispatch
+   * time. Read-only surface — callers must not mutate.
+   */
+  async getBinding(changeId, sessionId) {
+    const release = await acquireLock(this.#file);
+    try {
+      await this.#refreshBindingsAndAttempts();
+      const hit = (this.#bindings.get(changeId) ?? []).find((b) => b.sessionId === sessionId) ?? null;
+      return hit ? structuredClone(hit) : null;
+    } finally {
+      release();
+    }
+  }
+
   async resolveRole(changeId, sessionId) {
     const release = await acquireLock(this.#file);
     try {
@@ -1201,7 +1221,9 @@ export class ChangeStore {
     this.#bindings = new Map();
     const put = (b) => {
       if (!this.#bindings.has(b.changeId)) this.#bindings.set(b.changeId, []);
-      this.#bindings.get(b.changeId).push({ changeId: b.changeId, sessionId: b.sessionId, role: b.role });
+      this.#bindings.get(b.changeId).push(
+        'worker' in b ? { changeId: b.changeId, sessionId: b.sessionId, role: b.role, worker: b.worker } : { changeId: b.changeId, sessionId: b.sessionId, role: b.role },
+      );
     };
     if (Array.isArray(data.bindings)) {
       for (const b of data.bindings) {

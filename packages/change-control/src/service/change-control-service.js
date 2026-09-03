@@ -59,6 +59,9 @@ export function createChangeControlService(store) {
     /** Resolve the role of a session on a Change. */
     resolveRole: (changeId, sessionId) => store.resolveRole(changeId, sessionId),
 
+    /** Full binding record (role + bound worker identity) for a session. */
+    getBinding: (changeId, sessionId) => store.getBinding(changeId, sessionId),
+
     /** Submit a proof bundle (IMPLEMENTING → PREFLIGHT). */
     submitProof: (changeId, proof) => store.submitProof(changeId, proof),
 
