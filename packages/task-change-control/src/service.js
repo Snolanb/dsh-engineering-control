@@ -25,7 +25,7 @@ function unavailable(detail) {
 /**
  * Minimal typed views of the two domain services this package depends on.
  * @typedef {{ get: (id: string) => any, update: (id: string, patch: any) => Promise<any>, complete?: (id: string, result: object, options?: any) => any, createDispatcher: (options?: any) => any, createWorkerLauncher?: (options?: any) => any }} TaskOrchestratorApi
- * @typedef {{ get: (id: string) => Promise<any>, findByWorkItem: (system: string, id: string) => Promise<any>, findOrCreateForWorkItem: (input: { system: string, id: string, change: object }) => Promise<any>, resolveRole: (changeId: string, sessionId: string) => Promise<string>, getBinding: (changeId: string, sessionId: string) => Promise<any>, getBindingSync: (changeId: string, sessionId: string) => any, getBindingFromDisk: (changeId: string, sessionId: string) => any, status: (changeId: string) => Promise<any>, submitProof: (changeId: string, proof: any, expected?: { sessionId?: string, expectedWorker?: string }) => Promise<any>, transition: (changeId: string, toState: string, opts?: any) => Promise<any> }} ChangeControlApi
+ * @typedef {{ get: (id: string) => Promise<any>, findByWorkItem: (system: string, id: string) => Promise<any>, findOrCreateForWorkItem: (input: { system: string, id: string, change: object }) => Promise<any>, resolveRole: (changeId: string, sessionId: string) => Promise<string>, getBinding: (changeId: string, sessionId: string) => Promise<any>, getBindingSync: (changeId: string, sessionId: string) => any, getBindingFromDisk: (changeId: string, sessionId: string) => any, listByWorkItem: (system: string, id: string) => Promise<any[]>, listRoleBindings: () => Promise<any[]>, status: (changeId: string) => Promise<any>, appendAudit: (event: any) => Promise<any>, submitProof: (changeId: string, proof: any, expected?: { sessionId?: string, expectedWorker?: string }) => Promise<any>, unbindRole: (changeId: string, sessionId: string, opts?: any) => Promise<any>, transition: (changeId: string, toState: string, opts?: any) => Promise<any> }} ChangeControlApi
  * @param {object} deps
  * @param {() => TaskOrchestratorApi | undefined} deps.taskOrchestrator accessor (may be absent)
  * @param {() => ChangeControlApi | undefined} deps.changeControl accessor (may be absent)
@@ -419,6 +419,95 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
           );
         }
         return { ok: true, taskId, changeId: changed.id };
+      })();
+    },
+
+    /**
+     * T7.2 — Reconciliation against both stores.
+     * Returns a report with:
+     *   - repairs:  provably-safe automatic repairs performed
+     *   - manualIntervention: entries the integration won't touch
+     * Every repair also lands an audit record on the Change-side store.
+     */
+    reconcileTaskChange(/** @type {string} */ taskId, /** @type {any} */ options = {}) {
+      const t = requireTask();
+      const c = requireChange();
+      return (async () => {
+        const repairs = /** @type {any[]} */ ([]);
+        const manualIntervention = /** @type {any[]} */ ([]);
+        const task = await Promise.resolve(t.get(taskId));
+        if (!task) throw Object.assign(new Error(`task not found: ${taskId}`), { code: 'TASK_NOT_FOUND' });
+        const allChanges = await c.listByWorkItem(WORK_ITEM_SYSTEM, taskId);
+        const nonTerminal = allChanges.filter((/** @type {any} */ chg) => !['APPROVED', 'REJECTED', 'CANCELLED'].includes(chg.state));
+        if (nonTerminal.length > 1) {
+          manualIntervention.push({
+            issue: 'MULTIPLE_CHANGES',
+            changeIds: nonTerminal.map((chg) => chg.id),
+            detail: 'more than one nonterminal Change bound to this task',
+          });
+          return { repairs, manualIntervention };
+        }
+        const change = nonTerminal[0] ?? null;
+        if (!change) return { repairs, manualIntervention };
+
+        const status = await c.status(change.id);
+        const proof = status.proof ?? null;
+        const bindings = (await c.listRoleBindings()).filter((/** @type {any} */ b) => b.changeId === change.id);
+        const now = Number(options.simulatedExpiryAt ?? Date.now());
+
+        // (R1) Orphaned bindings: task is in a terminal state but still has
+        // a session bound as worker → release + audit.
+        if (['in_review', 'done', 'cancelled', 'failed'].includes(task.status)) {
+          for (const binding of bindings) {
+            await c.unbindRole(change.id, binding.sessionId, { actor: 'reconciliation' });
+            await c.appendAudit({
+              kind: 'reconciliation',
+              changeId: change.id,
+              sessionId: binding.sessionId,
+              action: 'orphan_binding_unbound',
+            });
+            repairs.push({ kind: 'orphan_binding_unbound', sessionId: binding.sessionId });
+          }
+        }
+
+        // (R2) Half-completed governed completion: Change is PREFLIGHT but
+        // task is still claimed/running with a dead lease.
+        if (change.state === 'PREFLIGHT' && (task.status === 'claimed' || task.status === 'running')
+          && Number(task.lease_expires_at ?? 0) <= now && proof) {
+          await Promise.resolve(t.update(taskId, {
+            status: 'in_review',
+            commit_sha: proof.commit_sha,
+            files_changed: proof.files_changed ?? [],
+            tests_run: proof.tests_run ?? [],
+            remaining_blockers: proof.remaining_blockers ?? [],
+            result_summary: proof.summary ?? 'reconciled completion',
+          }));
+          await c.appendAudit({ kind: 'reconciliation', changeId: change.id, action: 'half_completion_converged' });
+          repairs.push({ kind: 'half_completion_converged' });
+        }
+
+        // (R3) Projection mismatch on completed tasks: task fields disagree
+        // with the stored proof → task fields align to the proof.
+        if (task.status === 'in_review' && proof) {
+          const mismatch =
+            task.commit_sha !== proof.commit_sha
+            || JSON.stringify(task.files_changed) !== JSON.stringify(proof.files_changed ?? [])
+            || JSON.stringify(task.tests_run) !== JSON.stringify(proof.tests_run ?? [])
+            || JSON.stringify(task.remaining_blockers) !== JSON.stringify(proof.remaining_blockers ?? []);
+          if (mismatch) {
+            await Promise.resolve(t.update(taskId, {
+              commit_sha: proof.commit_sha,
+              files_changed: proof.files_changed ?? [],
+              tests_run: proof.tests_run ?? [],
+              remaining_blockers: proof.remaining_blockers ?? [],
+              result_summary: proof.summary ?? task.result_summary,
+            }));
+            await c.appendAudit({ kind: 'reconciliation', changeId: change.id, action: 'projection_realigned' });
+            repairs.push({ kind: 'projection_mismatch' });
+          }
+        }
+
+        return { repairs, manualIntervention };
       })();
     },
 

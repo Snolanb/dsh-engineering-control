@@ -34,6 +34,9 @@ export function createChangeControlService(store) {
      */
     findByWorkItem: (system, id) => store.findByWorkItem(system, id),
 
+    /** ALL changes for a work item (reconciliation). */
+    listByWorkItem: (system, id) => store.listByWorkItem(system, id),
+
     /**
      * Idempotent find-or-create for a work item: at most one nonterminal
      * Change per (system, id). Concurrent calls converge on one Change.
@@ -82,6 +85,12 @@ export function createChangeControlService(store) {
 
     /** Append-only audit history for a Change. */
     history: (changeId) => store.history(changeId),
+
+    /** Append-only audit entry — for reconciliation repair records. */
+    appendAudit: (event) => store.appendAudit(event),
+
+    /** All role bindings across all changes (for lifecycle reconciliation). */
+    listRoleBindings: () => store.listRoleBindings(),
 
     /**
      * Host-owned risk classification (audit, downgrade protection, gate
