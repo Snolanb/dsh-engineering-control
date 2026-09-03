@@ -367,7 +367,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         // mutation by a different ChangeStore on the same JSON file is
         // observed AT THE READ, before TaskStore.complete (also sync).
         const finalBinding = c.getBindingFromDisk(changed.id, sessionId);
-        if (!finalBinding || finalBinding.worker !== worker) {
+        if (!finalBinding || finalBinding.role !== 'worker' || finalBinding.worker !== worker) {
           throw Object.assign(
             new Error(`session binding changed during Change-side work`),
             { code: 'SESSION_WORKER_MISMATCH', changeId: changed.id },
