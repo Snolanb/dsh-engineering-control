@@ -180,6 +180,16 @@ export class TaskOrchestratorClient {
   async applyPlanImport(markdown, options = {}) {
     return await this.request('/plan-import/apply', { method: 'POST', body: JSON.stringify({ markdown, ...options }), headers: { 'content-type': 'application/json' } })
   }
+  /**
+   * T10.1 — read-only governance projection for the task,
+   * produced by the integration package when loaded.
+   * @returns governance snapshot or null when integration absent.
+   */
+  async describeTaskGovernance(id) {
+    const res = await this.request('/tasks/' + encodeURIComponent(id) + '/governance')
+    return res?.governance ?? null
+  }
+
 }
 
 export function createTaskOrchestratorClient(fetcher, prefix) {

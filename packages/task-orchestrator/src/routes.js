@@ -109,6 +109,26 @@ export async function handleRequest(store, req, res, dependencies = {}) {
     else if (parts[0] === 'tasks' && parts[2] === 'block' && method === 'POST') result = { task: store.block(parts[1], input.reason, { ...input }) }
     else if (parts[0] === 'tasks' && parts[2] === 'unblock' && method === 'POST') result = { task: store.unblock(parts[1], input) }
     else if (parts[0] === 'tasks' && parts[2] === 'request-changes' && method === 'POST') result = { task: store.requestChanges(parts[1], input.reason, input) }
+    else if (parts[0] === 'tasks' && parts[2] === 'governance' && method === 'GET') {
+      // PROJECTED READ-ONLY Change state for this task, surfaced through the
+      // integration service when loaded. Returns a null projection when the
+      // integration is absent so degradation is unambiguous.
+      const task = store.get(parts[1])
+      if (task === null) return json(res, 404, { error: 'task not found', code: 'TASK_NOT_FOUND' })
+      const resolve = dependencies?.governanceAdapter
+      if (typeof resolve !== 'function') {
+        result = { governance: null, degraded: true, reason: 'integration-unavailable' }
+      } else {
+        let governance = null
+        try {
+          governance = await Promise.resolve(resolve(parts[1]))
+        } catch (error) {
+          if (error && error.code === 'TASK_NOT_FOUND') return json(res, 404, { error: 'task not found', code: 'TASK_NOT_FOUND' })
+          throw error
+        }
+        result = { governance, degraded: governance === null }
+      }
+    }
     else if (parts[0] === 'tasks' && parts[2] === 'events' && method === 'GET') result = { events: store.events(parts[1], { limit: Number(requestUrl.searchParams.get('limit') ?? 100), before_id: requestUrl.searchParams.get('before_id') === null ? undefined : Number(requestUrl.searchParams.get('before_id')) }) }
     else if (parts[0] === 'tasks' && parts[2] === 'children' && method === 'GET') result = { tasks: store.listChildren(parts[1], { descendants: requestUrl.searchParams.get('descendants') === 'true' }) }
     else if (parts[0] === 'tasks' && parts[2] === 'children' && method === 'POST') { const { actor, ...child } = input; result = { task: store.addChild(parts[1], child, { actor }) } }

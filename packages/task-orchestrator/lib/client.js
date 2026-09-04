@@ -268,6 +268,14 @@ var TaskOrchestratorClient = class {
 			headers: { "content-type": "application/json" }
 		});
 	}
+	/**
+	* T10.1 — read-only governance projection for the task,
+	* produced by the integration package when loaded.
+	* @returns governance snapshot or null when integration absent.
+	*/
+	async describeTaskGovernance(id) {
+		return (await this.request("/tasks/" + encodeURIComponent(id) + "/governance"))?.governance ?? null;
+	}
 };
 //#endregion
 //#region src/project-helpers.js
@@ -1361,6 +1369,7 @@ var TaskBoardView = class {
 			className: "dsh-to-muted",
 			text: task.description || "No description."
 		}));
+		this.appendChangePanel(task);
 		this.detail.append(node("div", { className: "dsh-to-form-row" }, [statusSelect(task.status, (value) => this.run(() => this.client.update(task.id, { status: value }), task.id)), button("Reload", () => this.refresh())]));
 		this.detail.append(node("section", { className: "dsh-to-section" }, [node("h4", { text: "Acceptance criteria" }), task.acceptance_criteria?.length ? node("ul", { className: "dsh-to-list" }, task.acceptance_criteria.map((value) => node("li", { text: value }))) : node("div", {
 			className: "dsh-to-muted",
@@ -1378,6 +1387,38 @@ var TaskBoardView = class {
 		this.appendDependencies(task);
 		this.appendLinks(task);
 		this.appendEvents(task);
+	}
+	/** Render the read-only Change panel for a governed task. Silently omitted
+	when the integration is unavailable (Projection route → degraded). */
+	async appendChangePanel(task) {
+		try {
+			const data = await this.client.describeTaskGovernance(task.id);
+			if (!data || data === null) return;
+			if (this.selectedId !== task.id) return;
+			const panel = node("section", { className: "dsh-to-section" });
+			panel.append(node("h4", { text: "Governance (Change Control)" }));
+			if (data.linked !== true) panel.append(node("div", {
+				className: "dsh-to-muted",
+				text: "task not linked to any Change."
+			}));
+			else {
+				const bits = [];
+				bits.push("Change " + (data.changeId ?? "unknown"));
+				bits.push("state " + (data.state ?? "unknown"));
+				bits.push("risk " + (data.risk ?? "unset"));
+				bits.push("plan " + (data.plan && data.plan.status ? String(data.plan.status) : "none recorded"));
+				bits.push("preflight " + (data.preflight ? String(data.preflight) : "not evaluated"));
+				bits.push("open findings " + (typeof data.openFindings === "number" ? String(data.openFindings) : "0"));
+				if (data.attempts && typeof data.attempts.total === "number") bits.push("attempts " + data.attempts.total + " (repairs " + (data.attempts.repairs ?? 0) + ")");
+				if (data.escalated === true) bits.push("ESCALATED");
+				bits.push("mode " + String(data.governanceMode ?? "off"));
+				panel.append(node("div", {
+					className: "dsh-to-muted",
+					text: bits.join(" · ")
+				}));
+			}
+			this.detail.append(panel);
+		} catch {}
 	}
 	renderProjectDetail(project) {
 		this.detail.append(node("h3", { text: project.name ?? project.title }), node("div", {

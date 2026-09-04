@@ -26,7 +26,7 @@ function unavailable(detail) {
 /**
  * Minimal typed views of the two domain services this package depends on.
  * @typedef {{ get: (id: string) => any, update: (id: string, patch: any) => Promise<any>, updateIf: (id: string, expected: any, patch: any) => any, complete?: (id: string, result: object, options?: any) => any, createDispatcher: (options?: any) => any, createWorkerLauncher?: (options?: any) => any, createReviewerLauncher?: (options?: any) => any }} TaskOrchestratorApi
- * @typedef {{ get: (id: string) => Promise<any>, findByWorkItem: (system: string, id: string) => Promise<any>, findOrCreateForWorkItem: (input: { system: string, id: string, change: object }) => Promise<any>, resolveRole: (changeId: string, sessionId: string) => Promise<string>, getBinding: (changeId: string, sessionId: string) => Promise<any>, getBindingSync: (changeId: string, sessionId: string) => any, getBindingFromDisk: (changeId: string, sessionId: string) => any, listByWorkItem: (system: string, id: string) => Promise<any[]>, listRoleBindings: () => Promise<any[]>, status: (changeId: string) => Promise<any>, appendAudit: (event: any) => Promise<any>, submitProof: (changeId: string, proof: any, expected?: { sessionId?: string, expectedWorker?: string }) => Promise<any>, bindRole: (changeId: string, sessionId: string, role: string, opts?: any) => Promise<any>, submitReview: (changeId: string, review: any, opts: any) => Promise<any>, runPreflight: (changeId: string, input?: any) => Promise<any>, unbindRole: (changeId: string, sessionId: string, opts?: any) => Promise<any>, transition: (changeId: string, toState: string, opts?: any) => Promise<any> }} ChangeControlApi
+ * @typedef {{ get: (id: string) => Promise<any>, findByWorkItem: (system: string, id: string) => Promise<any>, findOrCreateForWorkItem: (input: { system: string, id: string, change: object }) => Promise<any>, resolveRole: (changeId: string, sessionId: string) => Promise<string>, getBinding: (changeId: string, sessionId: string) => Promise<any>, getBindingSync: (changeId: string, sessionId: string) => any, getBindingFromDisk: (changeId: string, sessionId: string) => any, listByWorkItem: (system: string, id: string) => Promise<any[]>, listRoleBindings: () => Promise<any[]>, status: (changeId: string) => Promise<any>, appendAudit: (event: any) => Promise<any>, submitProof: (changeId: string, proof: any, expected?: { sessionId?: string, expectedWorker?: string }) => Promise<any>, bindRole: (changeId: string, sessionId: string, role: string, opts?: any) => Promise<any>, submitReview: (changeId: string, review: any, opts: any) => Promise<any>, runPreflight: (changeId: string, input?: any) => Promise<any>, history: (changeId?: string) => Promise<any[]>, getGovernanceMode?: (scope: { projectId?: string|null, workspace?: string|null }) => Promise<string>, unbindRole: (changeId: string, sessionId: string, opts?: any) => Promise<any>, transition: (changeId: string, toState: string, opts?: any) => Promise<any> }} ChangeControlApi
  * @param {object} deps
  * @param {() => TaskOrchestratorApi | undefined} deps.taskOrchestrator accessor (may be absent)
  * @param {() => ChangeControlApi | undefined} deps.changeControl accessor (may be absent)
@@ -43,6 +43,69 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
   };
 
   const api = {
+    /**
+     * T10.1 — read-only dashboard projection for a governed task.
+     * Never mutates; degrades via { linked: false } when the task is not
+     * governed. Fields the dashboard renders: changeId, Change state, risk,
+     * plan status, preflight status, openFinding count, attempt summary
+     * plus the escalated flag.
+     */
+    describeTaskGovernance(/** @type {string} */ taskId) {
+      const t = requireTask();
+      const c = requireChange();
+      requireTaskId(taskId);
+      return (async () => {
+        const task = await Promise.resolve(t.get(taskId));
+        if (!task) throw Object.assign(new Error(`task not found: ${taskId}`), { code: 'TASK_NOT_FOUND' });
+        // Terminal Changes are excluded by findByWorkItem; fall back to any
+        // linkage record so completed tasks still display their Change.
+        let change = await c.findByWorkItem(WORK_ITEM_SYSTEM, taskId);
+        if (!change) {
+          const all = typeof c.listByWorkItem === 'function' ? await c.listByWorkItem(WORK_ITEM_SYSTEM, taskId) : [];
+          if (Array.isArray(all) && all.length > 0) {
+            change = all[all.length - 1];
+          }
+        }
+        const governanceMode = (typeof c.getGovernanceMode === 'function')
+          ? await c.getGovernanceMode({ projectId: task.project_id ?? null, workspace: task.workspace ?? null })
+          : 'off';
+        if (!change) {
+          return {
+            linked: false, taskId, governanceMode,
+            changeId: null, state: null, risk: null, plan: null, preflight: null,
+            openFindings: 0, attempts: { total: 0, repairs: 0 }, escalated: false,
+          };
+        }
+        const status = await c.status(change.id);
+        const attempts = Array.isArray(status?.attempts) ? status.attempts : [];
+        const repairs = attempts.filter((/** @type {any} */ a) => typeof a?.attemptId === 'string' && a.attemptId.includes(':repair:')).length;
+        const history = await c.history(change.id);
+        const escalated = history.some((/** @type {any} */ e) => e.kind === 'review_orchestration' && e.action === 'escalated');
+        const acceptedPlan = status?.acceptedPlan ?? null;
+        const plan = acceptedPlan ? { id: acceptedPlan.id ?? acceptedPlan.planId ?? null, status: 'accepted' } : null;
+        // Canonical preflight record shape:
+        //   { allowed: boolean, state: string, controllerResults: ... }
+        // Map to a plain string the dashboard can render. When no result of
+        // preflight is yet persisted, leave it null — the UI draws
+        // 'not evaluated'.
+        const preflightRecord = status?.preflight && typeof status.preflight === 'object' ? status.preflight : null;
+        const preflight = preflightRecord === null
+          ? null
+          : (preflightRecord.allowed === true ? 'passed'
+            : preflightRecord.allowed === false ? 'failed'
+            : (preflightRecord.state ?? 'pending'));
+        const openFindings = Array.isArray(status?.openFindings) ? status.openFindings.length : 0;
+        return {
+          linked: change !== null, taskId, governanceMode,
+          changeId: change?.id ?? null, state: change?.state ?? null, risk: change?.risk ?? null,
+          plan, preflight,
+          openFindings,
+          attempts: { total: attempts.length, repairs },
+          escalated,
+        };
+      })();
+    },
+
     /**
      * Resolve the Change for a task. Change-side workItem is authoritative;
      * the task metadata projection is a hint only. Returns the public Change

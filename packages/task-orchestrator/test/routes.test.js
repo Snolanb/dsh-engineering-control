@@ -193,3 +193,15 @@ test('plan-import preview and apply routes are idempotent and reject bad identit
   assert.equal(dryRun.body.dry_run, true)
   assert.equal(dryRun.body.project, null)
 })
+test('governance projection route surfaces integration output (or 404when task unknown)', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-gov-route-'))
+  t.after(() => { rmSync(dir, { recursive: true, force: true }) })
+  const store = new TaskStore({ dbPath: join(dir, 't.db') })
+  await store.create({ id: 't-1', title: 'governed', status: 'ready' })
+  const snapshot = { linked: true, changeId: 'c1', state: 'REVIEW', risk: 'low', plan: { id: 'p' }, preflight: 'passed', openFindings: 0, attempts: { total: 1, repairs: 0 }, escalated: false }
+  const hit = await request(store, 'GET', '/api/task-orchestrator/tasks/t-1/governance', undefined, '127.0.0.1', {
+    governanceAdapter: async (taskId) => (taskId === 't-1' ? snapshot : null),
+  })
+  assert.equal(hit.status, 200)
+  assert.deepEqual(hit.body, { governance: snapshot, degraded: false })
+})

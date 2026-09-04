@@ -89,7 +89,17 @@ export function apply(ctx, config = {}) {
   })
   ctx.provide(TASK_ORCHESTRATOR_SERVICE, api)
   ctx.effect(() => {
-    const routeDisposers = makeRoutes(store, { registry: workerRegistry, preflight }).map(route => ctx.webServer.register(route))
+    const routeDisposers = makeRoutes(store, {
+      registry: workerRegistry,
+      preflight,
+      // T10.1: tasks/:id/governance is a read-only projection served by the
+      // integration package's Cordis service when loaded; null otherwise.
+      governanceAdapter: async (taskId) => {
+        const integration = ctx.get('taskChangeControl')
+        if (!integration || typeof integration.describeTaskGovernance !== 'function') return null
+        return integration.describeTaskGovernance(taskId)
+      },
+    }).map(route => ctx.webServer.register(route))
     const toolDisposers = createTaskTools(store).map(tool => ctx.tools.register(tool))
     return () => {
       for (const dispose of routeDisposers) dispose()
