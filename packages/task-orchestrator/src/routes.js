@@ -119,10 +119,14 @@ export async function handleRequest(store, req, res, dependencies = {}) {
       if (typeof resolve !== 'function') {
         result = { governance: null, degraded: true, reason: 'integration-unavailable' }
       } else {
-        result = await resolve(parts[1]).then((governance) => ({ governance, degraded: false })).catch((error) => {
-          if (error && error.code === 'TASK_NOT_FOUND') return null
+        let governance = null
+        try {
+          governance = await Promise.resolve(resolve(parts[1]))
+        } catch (error) {
+          if (error && error.code === 'TASK_NOT_FOUND') return json(res, 404, { error: 'task not found', code: 'TASK_NOT_FOUND' })
           throw error
-        })
+        }
+        result = { governance, degraded: governance === null }
       }
     }
     else if (parts[0] === 'tasks' && parts[2] === 'events' && method === 'GET') result = { events: store.events(parts[1], { limit: Number(requestUrl.searchParams.get('limit') ?? 100), before_id: requestUrl.searchParams.get('before_id') === null ? undefined : Number(requestUrl.searchParams.get('before_id')) }) }

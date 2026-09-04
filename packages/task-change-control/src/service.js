@@ -57,7 +57,15 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
       return (async () => {
         const task = await Promise.resolve(t.get(taskId));
         if (!task) throw Object.assign(new Error(`task not found: ${taskId}`), { code: 'TASK_NOT_FOUND' });
-        const change = await c.findByWorkItem(WORK_ITEM_SYSTEM, taskId);
+        // Terminal Changes are excluded by findByWorkItem; fall back to any
+        // linkage record so completed tasks still display their Change.
+        let change = await c.findByWorkItem(WORK_ITEM_SYSTEM, taskId);
+        if (!change) {
+          const all = typeof c.listByWorkItem === 'function' ? await c.listByWorkItem(WORK_ITEM_SYSTEM, taskId) : [];
+          if (Array.isArray(all) && all.length > 0) {
+            change = all[all.length - 1];
+          }
+        }
         const governanceMode = (typeof c.getGovernanceMode === 'function')
           ? await c.getGovernanceMode({ projectId: task.project_id ?? null, workspace: task.workspace ?? null })
           : 'off';
@@ -72,14 +80,22 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         const attempts = Array.isArray(status?.attempts) ? status.attempts : [];
         const repairs = attempts.filter((/** @type {any} */ a) => typeof a?.attemptId === 'string' && a.attemptId.includes(':repair:')).length;
         const history = await c.history(change.id);
-        const escalated = history.some((/** @type {any} */ e) => e.type === 'review_orchestration' && e.action === 'escalated');
-        const accepted = status?.acceptedPlan ?? null;
-        const plan = accepted ? { id: accepted.id ?? accepted.planId ?? null, status: 'accepted' } : null;
+        const escalated = history.some((/** @type {any} */ e) => e.kind === 'review_orchestration' && e.action === 'escalated');
+        const acceptedPlan = status?.acceptedPlan ?? null;
+        const plan = acceptedPlan ? { id: acceptedPlan.id ?? acceptedPlan.planId ?? null, status: 'accepted' } : null;
+        // change-control status().preflight returns the canonical
+        // preflight record — the status field of that record, not a nested
+        // `status.status` — so leaf reads are legal here.
+        const preflight = status?.preflight && typeof status.preflight === 'object'
+          ? (status.preflight.passed === true ? 'passed'
+            : status.preflight.passed === false ? 'failed'
+            : (status.preflight.state ?? null))
+          : null;
         const openFindings = Array.isArray(status?.openFindings) ? status.openFindings.length : 0;
         return {
-          linked: true, taskId, governanceMode,
-          changeId: change.id, state: change.state, risk: change.risk ?? null,
-          plan, preflight: status?.preflight?.status ?? null,
+          linked: change !== null, taskId, governanceMode,
+          changeId: change?.id ?? null, state: change?.state ?? null, risk: change?.risk ?? null,
+          plan, preflight,
           openFindings,
           attempts: { total: attempts.length, repairs },
           escalated,

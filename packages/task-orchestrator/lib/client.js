@@ -1407,6 +1407,7 @@ var TaskBoardView = class {
 				bits.push("state " + (data.state ?? "unknown"));
 				bits.push("risk " + (data.risk ?? "unset"));
 				if (data.plan && data.plan.status) bits.push("plan " + String(data.plan.status));
+				if (data.preflight) bits.push("preflight " + String(data.preflight));
 				if (typeof data.openFindings === "number") bits.push("open findings " + data.openFindings);
 				if (data.attempts && typeof data.attempts.total === "number") bits.push("attempts " + data.attempts.total + " (repairs " + (data.attempts.repairs ?? 0) + ")");
 				if (data.escalated === true) bits.push("ESCALATED");
