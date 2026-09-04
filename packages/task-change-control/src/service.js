@@ -83,14 +83,17 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         const escalated = history.some((/** @type {any} */ e) => e.kind === 'review_orchestration' && e.action === 'escalated');
         const acceptedPlan = status?.acceptedPlan ?? null;
         const plan = acceptedPlan ? { id: acceptedPlan.id ?? acceptedPlan.planId ?? null, status: 'accepted' } : null;
-        // change-control status().preflight returns the canonical
-        // preflight record — the status field of that record, not a nested
-        // `status.status` — so leaf reads are legal here.
-        const preflight = status?.preflight && typeof status.preflight === 'object'
-          ? (status.preflight.passed === true ? 'passed'
-            : status.preflight.passed === false ? 'failed'
-            : (status.preflight.state ?? null))
-          : null;
+        // Canonical preflight record shape:
+        //   { allowed: boolean, state: string, controllerResults: ... }
+        // Map to a plain string the dashboard can render. When no result of
+        // preflight is yet persisted, leave it null — the UI draws
+        // 'not evaluated'.
+        const preflightRecord = status?.preflight && typeof status.preflight === 'object' ? status.preflight : null;
+        const preflight = preflightRecord === null
+          ? null
+          : (preflightRecord.allowed === true ? 'passed'
+            : preflightRecord.allowed === false ? 'failed'
+            : (preflightRecord.state ?? 'pending'));
         const openFindings = Array.isArray(status?.openFindings) ? status.openFindings.length : 0;
         return {
           linked: change !== null, taskId, governanceMode,
