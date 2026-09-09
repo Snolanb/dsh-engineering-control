@@ -11,6 +11,7 @@ import { WorkerDispatcher } from 'dsh-task-orchestrator/dispatcher';
 import { WorkerSpecRegistry } from 'dsh-task-orchestrator/worker-specs';
 import changeControlPlugin from 'dsh-change-control';
 import plugin from '../src/index.js';
+import { createBindingLauncher } from '../src/binding.js';
 
 const SYSTEM = 'dsh-task-orchestrator';
 const WORKER_RUN = 'worker:run-c1';
@@ -473,4 +474,73 @@ test('ungoverned task via createGovernedDispatcher uses store.complete fallback 
   // Task should be completed.
   const finalTask = await taskStore.get(task.id);
   assert.equal(finalTask.status, 'in_review');
+});
+
+// T-H3 RED regressions: the real session handle settles before governed
+// completion, so binding cleanup must not race the completion proof.
+test('T-H3: governed hold keeps binding through wait and releases only once', async () => {
+  const events = [];
+  const changeControl = {
+    async findByWorkItem() { return { id: 'change-h3' }; },
+    async bindRole(changeId, sessionId, role, options) {
+      events.push(['bind', changeId, sessionId, role, options.worker]);
+    },
+    async unbindRole(changeId, sessionId) {
+      events.push(['unbind', changeId, sessionId]);
+    },
+  };
+  const wrapped = createBindingLauncher({
+    async launch() {
+      return {
+        sessionId: 'session-h3',
+        wait: async () => { events.push(['wait']); return { exitCode: 0 }; },
+        async terminate() { events.push(['terminate']); return true; },
+      };
+    },
+  }, changeControl, SYSTEM);
+  const handle = await wrapped.launch({ task: { id: 'task-h3' }, spec: { mode: 'session' }, worker: 'worker:h3' });
+
+  handle._governedHold();
+  await handle.wait();
+  assert.deepEqual(events, [['bind', 'change-h3', 'session-h3', 'worker', 'worker:h3'], ['wait']], 'wait must not unbind before governed completion');
+  await handle._governedRelease();
+  await handle._governedRelease();
+  assert.deepEqual(events.at(-1), ['unbind', 'change-h3', 'session-h3']);
+  assert.equal(events.filter(([kind]) => kind === 'unbind').length, 1, 'cleanup is idempotent');
+});
+
+test('T-H3: explicit termination unbinds even when governed hold is active', async () => {
+  const events = [];
+  const changeControl = {
+    async findByWorkItem() { return { id: 'change-h3-kill' }; },
+    async bindRole() { events.push('bind'); },
+    async unbindRole() { events.push('unbind'); },
+  };
+  const wrapped = createBindingLauncher({
+    async launch() {
+      return { sessionId: 'session-h3-kill', wait: async () => new Promise(() => {}), async terminate() { events.push('terminate'); return true; } };
+    },
+  }, changeControl, SYSTEM);
+  const handle = await wrapped.launch({ task: { id: 'task-h3-kill' }, spec: { mode: 'session' }, worker: 'worker:h3-kill' });
+  handle._governedHold();
+  await handle.terminate('SIGTERM');
+  assert.deepEqual(events, ['bind', 'terminate', 'unbind'], 'termination is an abnormal path and must clean immediately');
+});
+
+test('T-H3: stale cleanup cannot unbind a reassigned worker session', async () => {
+  const events = [];
+  const changeControl = {
+    async findByWorkItem() { return { id: 'change-h3-reassign' }; },
+    async bindRole() { events.push('bind'); },
+    async getBinding() { return { changeId: 'change-h3-reassign', sessionId: 'session-h3-reassign', role: 'worker', worker: 'worker:new' }; },
+    async unbindRole() { events.push('unbind'); },
+  };
+  const wrapped = createBindingLauncher({
+    async launch() {
+      return { sessionId: 'session-h3-reassign', wait: async () => ({ exitCode: 0 }), async terminate() { return true; } };
+    },
+  }, changeControl, SYSTEM);
+  const handle = await wrapped.launch({ task: { id: 'task-h3-reassign' }, spec: { mode: 'session' }, worker: 'worker:old' });
+  await handle._governedRelease();
+  assert.deepEqual(events, ['bind'], 'cleanup for the old attempt must not remove the new worker binding');
 });
