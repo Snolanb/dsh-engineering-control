@@ -479,9 +479,19 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         // MUST equal the caller's proof on the four integration fields —
         // any mismatch means the prior submission persisted a stale proof.
         const change = await c.get(changed.id);
-        if (change.state === 'IMPLEMENTING') {
+        let currentState = change.state;
+        if (currentState === 'READY') {
+          // T-H5 PR1-01: a production launcher NEVER mutates the Change; the
+          // preDispatch guard already demanded READY. The controller owns the
+          // host-side READY→IMPLEMENTING so a real governed worker's success
+          // can be completed (submit source proof) without test-only mutation.
+          // Authority stays with Change Control — we only invoke its transition.
+          await c.transition(changed.id, 'IMPLEMENTING', { actor: 'task-change-control' });
+          currentState = 'IMPLEMENTING';
+        }
+        if (currentState === 'IMPLEMENTING') {
           await c.submitProof(changed.id, { ...proof, sessionId }, { sessionId, expectedWorker: worker });
-        } else if (change.state === 'PREFLIGHT') {
+        } else if (currentState === 'PREFLIGHT') {
           const statusSnapshot = await c.status(changed.id).catch(() => null);
           const existing = statusSnapshot && statusSnapshot.proof ? statusSnapshot.proof : null;
           const same = existing
@@ -624,18 +634,20 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
           }
           await c.appendAudit({ kind: 'review_orchestration', changeId: change.id, action: 'preflight_passed' });
         }
-        // Existing reviewer binding? Reuse the session id (repair rounds
-        // re-enter runGovernedReview on the SAME Change). Otherwise launch
-        // a fresh reviewer and bind BEFORE transitioning so a thrown
-        // launcher never wedges the Change.
-        const existing = (await c.listRoleBindings()).find((b) => b.changeId === change.id && b.role === 'reviewer');
-        let sessionId;
-        if (existing) {
-          sessionId = existing.sessionId;
-        } else {
+        // T-H5 PR1-02: serialize check→launch→bind for ONE Change under a
+        // per-Change reservation lock so concurrent (or resumed) controller
+        // calls cannot both observe "no reviewer binding" and launch separate
+        // reviewers. The first caller launches and binds; any later caller
+        // re-checks under the lock and reuses the persisted reviewer session.
+        // Cross-process is covered by the store's atomic bindRole + the read
+        // of the already-persisted binding; this lock closes the in-process
+        // read-then-write race.
+        const sessionId = await withReviewerReservation(change.id, async () => {
+          const existing = (await c.listRoleBindings()).find((b) => b.changeId === change.id && b.role === 'reviewer');
+          if (existing) return existing.sessionId;
           const launched = await launchReviewerForTask(requireTask, requireChange, requireTaskId, taskId);
-          sessionId = launched.sessionId;
-        }
+          return launched.sessionId;
+        });
         // A successful store runPreflight is authoritative for the state
         // move: under a real preflight policy the store itself performed
         // PREFLIGHT→REVIEW. Re-read the live state and transition ONLY in
@@ -1151,6 +1163,27 @@ function parseControllerPreflightEntry(entry) {
     return { name, passed, exitCode: passed ? 0 : 1 };
   }
   return { name: trimmed || 'ok', passed: false, exitCode: 1 };
+}
+
+const reviewerReservationLocks = new Map(); // changeId -> tail promise
+/**
+ * Per-Change reviewer reservation lock. Serializes the check→launch→bind
+ * critical section per Change (see the map above).
+ * @param {string} changeId
+ * @param {() => Promise<string>} fn the launch-and-bind critical section
+ */
+function withReviewerReservation(changeId, fn) {
+  const prev = reviewerReservationLocks.get(changeId) ?? Promise.resolve();
+  const next = prev.then(() => fn());
+  // Trim the map once this tail settles so a dead Change never leaks a lock.
+  // The derived finally-promise mirrors `next` (incl. rejection) but is not
+  // what callers await, so swallow it to avoid an unhandled rejection when
+  // fn throws — the original `next` still rejects for the awaited caller.
+  next.finally(() => {
+    if (reviewerReservationLocks.get(changeId) === next) reviewerReservationLocks.delete(changeId);
+  }).catch(() => {});
+  reviewerReservationLocks.set(changeId, next);
+  return next;
 }
 
 /**
