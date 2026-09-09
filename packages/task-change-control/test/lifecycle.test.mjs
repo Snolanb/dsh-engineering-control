@@ -16,10 +16,12 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Context } from '@deepseek-ai/cordis';
 import { SystemPrompt } from '@deepseek-ai/dsh-system-prompt';
 import { ToolRuntime } from '@deepseek-ai/dsh-tools';
@@ -29,6 +31,9 @@ import { WorkerSpecRegistry } from 'dsh-task-orchestrator/worker-specs';
 import changeControlPlugin from 'dsh-change-control';
 import plugin from '../src/index.js';
 import { createTaskChangeControlService } from '../src/service.js';
+
+/** Package root — the multi-process child script CWD so its bare imports resolve. */
+const PKG_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
 
 const REVIEWER_SESSION = 'sess-review-th5';
 const WORKER_SPEC = {
@@ -502,5 +507,130 @@ test('T-H5 PR1-02: concurrent runGovernedSdlc calls launch and bind exactly ONE 
   const reviewers = (await ctx.changeControl.listRoleBindings())
     .filter((b) => b.changeId === change.id && b.role === 'reviewer');
   assert.equal(reviewers.length, 1, 'exactly one reviewer binding persisted');
+  assert.equal((await ctx.changeControl.get(change.id)).state, 'REVIEW');
+});
+
+// ─── T-H5 PR2-01 — durable cross-process reviewer claim ───────────────────────
+
+/**
+ * Durable claim-file convention (mirrors src/service.js, T-H5 PR2-01):
+ *   <task.workspace>/.dsh-governance/reviewer-claims/reviewer-claim-<changeId>
+ * Exclusive-create claims it; atomic rewrites record the launched session
+ * BEFORE binding so a crashed owner's reviewer is adopted, not re-launched.
+ */
+function reviewerClaimFileFor(task, change) {
+  const base = typeof task?.workspace === 'string' && task.workspace.trim() !== '' ? task.workspace : tmpdir();
+  return join(base, '.dsh-governance', 'reviewer-claims', `reviewer-claim-${String(change.id)}`);
+}
+
+/** Self-contained host process: same composition as compose(), racing runGovernedSdlc. */
+const REVIEWER_CHILD_SCRIPT = `
+import { Context } from '@deepseek-ai/cordis';
+import { SystemPrompt } from '@deepseek-ai/dsh-system-prompt';
+import { ToolRuntime } from '@deepseek-ai/dsh-tools';
+import { TaskStore } from 'dsh-task-orchestrator/store';
+import changeControlPlugin from 'dsh-change-control';
+import plugin from './src/index.js';
+import { appendFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+const dir = process.env.TCC_DIR;
+const taskId = process.env.TCC_TASK_ID;
+const taskStore = new TaskStore({ dbPath: join(dir, 'tasks.db') });
+let launches = 0;
+const taskOrchestrator = Object.freeze({
+  get: taskStore.get.bind(taskStore),
+  update: taskStore.update.bind(taskStore),
+  updateIf: (id, expected, patch) => taskStore.updateIf(id, expected, patch),
+  createReviewerLauncher: () => ({
+    async launch() {
+      launches += 1;
+      const sessionId = 'sess-child-' + process.pid + '-' + launches;
+      appendFileSync(join(dir, 'reviewer-launches.log'), sessionId + '\\n');
+      // Widen the cross-process race window deliberately.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      return { sessionId, wait: async () => ({ exitCode: 0 }), terminate: async () => true };
+    },
+  }),
+});
+const ctx = new Context();
+await ctx.plugin(SystemPrompt);
+await ctx.plugin(ToolRuntime, {});
+ctx.provide('taskOrchestrator', taskOrchestrator);
+await ctx.plugin(changeControlPlugin, { storePath: join(dir, 'changes.json') });
+await ctx.plugin(plugin);
+const result = await ctx.taskChangeControl.runGovernedSdlc(taskId, { controllerPreflightOverride: ['pass:build'] });
+process.stdout.write(JSON.stringify({ outcome: result.outcome, sessionId: result.sessionId ?? null }) + '\\n');
+`;
+
+/** Spawn one host process driving runGovernedSdlc against the shared store dir. */
+function spawnReviewerProcess(dir, taskId) {
+  const child = spawn(process.execPath, ['--input-type=module', '-e', REVIEWER_CHILD_SCRIPT], {
+    cwd: PKG_DIR,
+    env: { ...process.env, TCC_DIR: dir, TCC_TASK_ID: taskId },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (d) => { stdout += d; });
+  child.stderr.on('data', (d) => { stderr += d; });
+  return new Promise((resolve) => {
+    child.on('error', (err) => resolve({ code: -1, stdout: stdout.trim(), stderr: stderr + String(err) }));
+    child.on('close', (code) => resolve({ code, stdout: stdout.trim(), stderr }));
+  });
+}
+
+test('T-H5 PR2-01: two host processes on one store launch exactly ONE reviewer (durable cross-process claim)', async (t) => {
+  const { ctx, taskStore, dir } = await compose(t);
+  const { task, change } = await governedReadyTask(ctx, taskStore, dir);
+  // Land in PREFLIGHT with the task in_review and NO reviewer yet, exactly
+  // like the in-process PR1-02 race — then race TWO SEPARATE processes.
+  await dispatchGovernedSuccess(ctx, taskStore, dir, change, { preflight: ['FAIL: build'] });
+  assert.equal((await ctx.changeControl.get(change.id)).state, 'PREFLIGHT');
+
+  const [a, b] = await Promise.all([
+    spawnReviewerProcess(dir, task.id),
+    spawnReviewerProcess(dir, task.id),
+  ]);
+  assert.equal(a.code, 0, `host process A must complete: ${a.stderr || a.stdout}`);
+  assert.equal(b.code, 0, `host process B must complete: ${b.stderr || b.stdout}`);
+  const ra = JSON.parse(a.stdout);
+  const rb = JSON.parse(b.stdout);
+  assert.equal(ra.outcome, 'review_pending');
+  assert.equal(rb.outcome, 'review_pending');
+  assert.equal(ra.sessionId, rb.sessionId, 'both processes converge on the SAME reviewer session');
+  // The durable cross-process claim must have produced exactly ONE reviewer
+  // launch and ONE persisted reviewer binding — the pre-fix race launched
+  // one reviewer PER PROCESS (and left the loser's session orphaned).
+  const launchLines = readFileSync(join(dir, 'reviewer-launches.log'), 'utf8').trim().split('\n').filter(Boolean);
+  assert.equal(launchLines.length, 1, 'concurrent host processes must launch exactly one reviewer');
+  const reviewers = (await ctx.changeControl.listRoleBindings())
+    .filter((x) => x.changeId === change.id && x.role === 'reviewer');
+  assert.equal(reviewers.length, 1, 'exactly one reviewer binding persisted');
+  assert.equal(reviewers[0].sessionId, ra.sessionId);
+  assert.equal((await ctx.changeControl.get(change.id)).state, 'REVIEW');
+});
+
+test('T-H5 PR2-01: crashed claim owner\'s recorded reviewer session is adopted on restart (no relaunch, no orphan)', async (t) => {
+  const { ctx, taskStore, dir, reviewerLaunches } = await compose(t);
+  const { task, change } = await governedReadyTask(ctx, taskStore, dir);
+  await dispatchGovernedSuccess(ctx, taskStore, dir, change, { preflight: ['FAIL: build'] });
+  // Simulate a crashed owner: its durable claim records a launched session
+  // that was never bound (crash between launch and bind), lease expired.
+  const claimFile = reviewerClaimFileFor(task, change);
+  await mkdir(dirname(claimFile), { recursive: true });
+  await writeFile(claimFile, JSON.stringify({
+    claimant: 'dead-host:4242',
+    sessionId: 'sess-crashed-reviewer',
+    updatedAt: Date.now() - 2 * 10 * 60 * 1000, // stale: beyond the 10-minute claim lease
+  }), 'utf8');
+
+  const result = await ctx.taskChangeControl.runGovernedSdlc(task.id, { controllerPreflightOverride: ['pass:build'] });
+  assert.equal(result.outcome, 'review_pending');
+  assert.equal(reviewerLaunches(), 0, 'a recorded session is adopted, never re-launched');
+  const reviewers = (await ctx.changeControl.listRoleBindings())
+    .filter((x) => x.changeId === change.id && x.role === 'reviewer');
+  assert.equal(reviewers.length, 1, 'the adopted session becomes the one and only reviewer binding');
+  assert.equal(reviewers[0].sessionId, 'sess-crashed-reviewer');
   assert.equal((await ctx.changeControl.get(change.id)).state, 'REVIEW');
 });
