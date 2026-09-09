@@ -37,6 +37,57 @@ const WORKER_SPEC = {
   timeoutMs: 5000, leaseSeconds: 300, name: 'worker',
 };
 
+/**
+ * T-H5 repair-r2 — composition with a REAL host preflight policy. The
+ * store's runPreflight then evaluates `policy.requiredChecks` (name-
+ * matched against the controller check results) and, on success,
+ * performs the PREFLIGHT→REVIEW transition itself.
+ */
+async function composeWithPolicy(t, { storePrefix = 'tcc-th5-policy-' } = {}) {
+  const dir = await mkdtemp(join(tmpdir(), storePrefix));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const ctx = new Context();
+  await ctx.plugin(SystemPrompt);
+  await ctx.plugin(ToolRuntime);
+  const taskStore = new TaskStore({ dbPath: join(dir, 'tasks.db') });
+  let reviewerLaunches = 0;
+  const taskOrchestrator = Object.freeze({
+    get: taskStore.get.bind(taskStore),
+    update: taskStore.update.bind(taskStore),
+    updateIf: (id, e, p) => taskStore.updateIf(id, e, p),
+    complete: taskStore.complete.bind(taskStore),
+    claim: taskStore.claim.bind(taskStore),
+    start: taskStore.start.bind(taskStore),
+    release: taskStore.release.bind(taskStore),
+    createDispatcher: (options = {}) => new WorkerDispatcher({
+      store: taskStore,
+      registry: new WorkerSpecRegistry({ worker: WORKER_SPEC }),
+      launcher: options.launcher,
+      preflight: options.preflight ?? (async () => ({ ok: true, spec: WORKER_SPEC })),
+      preDispatch: options.preDispatch ?? null,
+      completionHook: options.completionHook ?? null,
+    }),
+    createReviewerLauncher: () => ({
+      async launch() {
+        reviewerLaunches += 1;
+        return {
+          sessionId: REVIEWER_SESSION,
+          wait: async () => ({ exitCode: 0 }),
+          terminate: async () => true,
+        };
+      },
+    }),
+  });
+  ctx.provide('taskOrchestrator', taskOrchestrator);
+  const storePath = join(dir, 'changes.json');
+  await ctx.plugin(changeControlPlugin, {
+    storePath,
+    policy: { preflightPolicy: { requiredChecks: ['build'], protectedPaths: [] } },
+  });
+  await ctx.plugin(plugin);
+  return { ctx, taskStore, dir, storePath, taskOrchestrator, reviewerLaunches: () => reviewerLaunches };
+}
+
 async function compose(t, { withReviewerLauncher = true, storePrefix = 'tcc-th5-' } = {}) {
   const dir = await mkdtemp(join(tmpdir(), storePrefix));
   t.after(() => rm(dir, { recursive: true, force: true }));
@@ -347,4 +398,47 @@ test('T-H5: repair routing without a worker is resumable across a restart', asyn
   assert.equal(r2.outcome, 'approved');
   assert.equal((await taskStore.get(task.id)).status, 'done');
   assert.equal((await ctx.changeControl.get(change.id)).state, 'APPROVED');
+});
+
+test('T-H5 repair-r2: real preflightPolicy.requiredChecks — production trigger traverses PREFLIGHT→REVIEW with one reviewer bind', async (t) => {
+  const { ctx, taskStore, dir, reviewerLaunches } = await composeWithPolicy(t);
+  const { task, change } = await governedReadyTask(ctx, taskStore, dir);
+  const result = await dispatchGovernedSuccess(ctx, taskStore, dir, change, { preflight: ['pass:build'] });
+
+  // With a real host preflight policy the STORE runPreflight is
+  // authoritative: it name-matches the required check ('build') against
+  // the controller's parsed check results and performs the state move
+  // itself on success.
+  assert.equal(result.status, 'in_review');
+  const status = await ctx.changeControl.status(change.id);
+  assert.equal(status.state, 'REVIEW');
+  const controllerResults = status.preflight?.controllerResults ?? [];
+  assert.deepEqual(controllerResults.map((r) => r.name), ['build'],
+    'the parsed check name matches the host requiredChecks entry exactly');
+  assert.equal(controllerResults[0]?.passed, true);
+
+  // Exactly ONE reviewer bind and ONE PREFLIGHT→REVIEW audit transition:
+  // the controller must not re-transition a state move the store already
+  // performed.
+  const reviewers = (await ctx.changeControl.listRoleBindings())
+    .filter((b) => b.changeId === change.id && b.role === 'reviewer');
+  assert.equal(reviewers.length, 1, 'exactly one reviewer bound');
+  assert.equal(reviewerLaunches(), 1);
+  const transitions = (await ctx.changeControl.history(change.id))
+    .filter((e) => e.from === 'PREFLIGHT' && e.to === 'REVIEW');
+  assert.equal(transitions.length, 1, 'exactly one PREFLIGHT→REVIEW transition');
+});
+
+test('T-H5 repair-r2: failing required check under a real policy fails closed (no REVIEW, no reviewer)', async (t) => {
+  const { ctx, taskStore, dir, reviewerLaunches } = await composeWithPolicy(t);
+  const { task, change } = await governedReadyTask(ctx, taskStore, dir);
+  const result = await dispatchGovernedSuccess(ctx, taskStore, dir, change, { preflight: ['fail:build'] });
+
+  assert.equal(result.status, 'in_review', 'governed completion still converges');
+  assert.equal(result.task?.sdlc?.outcome ?? result.sdlc?.outcome, 'preflight_failed');
+  assert.equal((await ctx.changeControl.get(change.id)).state, 'PREFLIGHT');
+  assert.equal(reviewerLaunches(), 0, 'no reviewer on failed required checks');
+  const transitions = (await ctx.changeControl.history(change.id))
+    .filter((e) => e.from === 'PREFLIGHT' && e.to === 'REVIEW');
+  assert.equal(transitions.length, 0, 'failed required checks never move to REVIEW');
 });
