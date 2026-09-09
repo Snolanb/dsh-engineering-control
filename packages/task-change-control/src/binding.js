@@ -45,33 +45,61 @@ export function createBindingLauncher(launcher, changeControl, WORK_ITEM_SYSTEM)
         try { await handle.terminate?.('SIGKILL'); } catch {}
         throw error;
       }
-      // Chain-cleanup: whatever consumes wait() gets lifecycle-clean bindings.
-      // sessionId is snapshotted once at bind; the returned handle MUST expose
-      // the same value we bound — no lazy getter can re-read differently.
+      // sessionId and worker are snapshotted at bind; the returned handle MUST
+      // use those identities for all later cleanup. A replacement dispatch that
+      // reuses a session ID must not be unbound by an older handle.
       const wait = typeof handle.wait === 'function' ? handle.wait.bind(handle) : null;
-      const unbind = async () => {
-        try { await changeControl.unbindRole(change.id, sessionId); } catch { /* audited elsewhere */ }
+      const expectedWorker = input.worker ?? input.runId ?? null;
+      let cleanupPromise = null;
+      const unbind = () => {
+        if (cleanupPromise) return cleanupPromise;
+        cleanupPromise = (async () => {
+          // Read the binding before removing it. If this session was rebound
+          // to another worker, the old handle has lost ownership of cleanup.
+          if (expectedWorker !== null
+            && (typeof changeControl.getBindingFromDisk === 'function'
+              || typeof changeControl.getBindingSync === 'function'
+              || typeof changeControl.getBinding === 'function')) {
+            let current;
+            try {
+              current = typeof changeControl.getBindingFromDisk === 'function'
+                ? changeControl.getBindingFromDisk(change.id, sessionId)
+                : typeof changeControl.getBindingSync === 'function'
+                  ? changeControl.getBindingSync(change.id, sessionId)
+                  : await changeControl.getBinding(change.id, sessionId);
+            } catch {
+              // Fail closed: an unknown binding must not be removed by a stale
+              // attempt. Reconciliation can retry once the store is readable.
+              return;
+            }
+            if (!current || current.role !== 'worker' || current.worker !== expectedWorker) return;
+          }
+          try { await changeControl.unbindRole(change.id, sessionId); } catch { /* audited elsewhere */ }
+        })();
+        return cleanupPromise;
       };
-      // trackedUnbind: when a completion hook is present (governed dispatch),
-      // the hook runs AFTER wait() resolves but BEFORE unbind fires. This
-      // handle exposes `_governedHold` to prevent the finally-unbind, then
-      // `_governedRelease` to perform it after the hook completes.
-      const trackedUnbind = { pending: false };
+      // Governed completion holds the worker binding after wait() resolves so
+      // completeGovernedTask can validate the actual session identity. Cleanup
+      // remains a single promise: release, timeout, and explicit termination
+      // are safe to race and safe to repeat.
+      let governedHold = false;
       return {
         ...handle,
         sessionId, // pinned to what we bound
         pid: handle.pid ?? null,
         wait: wait
-          ? async () => { try { return await wait(); } finally { if (!trackedUnbind.pending) await unbind(); } }
+          ? async () => { try { return await wait(); } finally { if (!governedHold) await unbind(); } }
           : undefined,
         terminate: async (signal) => {
-          try { return await (handle.terminate?.(signal) ?? true); } finally { if (!trackedUnbind.pending) await unbind(); }
+          // Termination is always abnormal. Do not retain the governed hold;
+          // timeout, lease loss, and operator kill all clean immediately.
+          governedHold = false;
+          try { return await (handle.terminate?.(signal) ?? true); } finally { await unbind(); }
         },
-        // Called BEFORE the completion hook to prevent wait/terminate from
-        // unbinding — keeps the binding alive for completeGovernedTask validation.
-        _governedHold: () => { trackedUnbind.pending = true; },
-        // Called AFTER the completion hook returns to actually remove the binding.
-        _governedRelease: async () => { await unbind(); },
+        // Called BEFORE waiting so governed completion can still read the
+        // worker binding; called AFTER completion to remove it.
+        _governedHold: () => { governedHold = true; },
+        _governedRelease: async () => { governedHold = false; await unbind(); },
       };
     },
   };

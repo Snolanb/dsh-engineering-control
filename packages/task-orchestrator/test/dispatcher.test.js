@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { TaskStore } from '../src/store.js'
 import { WorkerDispatcher, buildTaskPrompt, createSessionLauncher, createSessionRpcClient } from '../src/dispatcher.js'
+import { createBindingLauncher } from '../../task-change-control/src/binding.js'
 import { WorkerSpecRegistry } from '../src/worker-specs.js'
 
 function fixture() {
@@ -250,6 +251,50 @@ test('raw store.complete is used when completionHook is absent (backwards compat
   const result = await dispatcher.dispatchOnce({ workerProfile: 'worker' })
   assert.equal(result.status, 'in_review')
   assert.equal(rawCompleteCalled, true, 'raw store.complete is called when no hook is provided')
+})
+
+test('governed completion observes the bound session before cleanup', async t => {
+  const f = fixture(); t.after(() => f.cleanup())
+  const task = readyTask(f, 'dispatch-governed-lifetime')
+  const registry = new WorkerSpecRegistry({
+    worker: {
+      name: 'session-worker', mode: 'session', profile: 'worker-profile', agentPreset: 'worker', provider: 'ollama', model: 'worker-model',
+      workspacePolicy: 'any', timeoutMs: 1000, leaseSeconds: 30,
+    },
+  })
+  const events = []
+  const changeControl = {
+    async findByWorkItem() { return { id: 'change-lifetime' } },
+    async bindRole() { events.push('bind') },
+    getBindingSync() { return { changeId: 'change-lifetime', sessionId: 'session-lifetime', role: 'worker', worker: 'worker:run-lifetime' } },
+    async unbindRole() { events.push('unbind') },
+  }
+  const rawLauncher = {
+    async launch() {
+      return {
+        sessionId: 'session-lifetime',
+        wait: async () => { events.push('wait'); return { exitCode: 0, stdout: 'done', stderr: '' } },
+        async terminate() { return true },
+      }
+    },
+  }
+  const dispatcher = new WorkerDispatcher({
+    store: f.store,
+    registry,
+    idFactory: () => 'run-lifetime',
+    preflight: async () => ({ ok: true, spec: registry.get('worker') }),
+    launcher: createBindingLauncher(rawLauncher, changeControl, 'dsh-task-orchestrator'),
+    completionHook: async (taskId, result, options) => {
+      assert.equal(options.sessionId, 'session-lifetime')
+      assert.equal(changeControl.getBindingSync('change-lifetime', options.sessionId).worker, options.worker)
+      const completed = f.store.complete(taskId, result, { worker: options.worker, actor: 'test-dispatcher' })
+      events.push('completion')
+      return completed
+    },
+  })
+  const result = await dispatcher.dispatchOnce({ workerProfile: 'worker' })
+  assert.equal(result.status, 'in_review')
+  assert.deepEqual(events, ['bind', 'wait', 'completion', 'unbind'])
 })
 
 test('session RPC client sends DSH envelopes and surfaces structured errors', async () => {
