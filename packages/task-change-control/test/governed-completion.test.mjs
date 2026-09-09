@@ -267,7 +267,8 @@ test('governed dispatcher success routes through completeGovernedTask: proof →
         // Transition to IMPLEMENTING AFTER the guard has already passed but
         // BEFORE the completion hook runs (i.e., during the worker's execution).
         if (!implemented) { implemented = true; await ctx.changeControl.transition(change.id, 'IMPLEMENTING', {}); }
-        return { exitCode: 0, stdout: 'done', stderr: '' };
+        // Return a realistic worker result with commit_sha and proof fields.
+        return { exitCode: 0, stdout: 'done', stderr: '', commit_sha: 'abc123', files_changed: ['src/foo.js'], tests_run: ['test/foo.test.js'] };
       }, async terminate() { return true; } }
     },
   };
@@ -307,4 +308,114 @@ test('binding rebound to different worker during Change await -> SESSION_WORKER_
   );
   const tAfter = await taskStore.get(task.id);
   assert.equal(tAfter.status, 'running');
+});
+
+test('governed dispatcher releases binding on timeout (TH2-R1-01)', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'tcc-t H2-timeout-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const ctx = new Context();
+  await ctx.plugin(SystemPrompt);
+  await ctx.plugin(ToolRuntime);
+  const taskStore = new TaskStore({ dbPath: join(dir, 'tasks.db') });
+  ctx.provide('taskOrchestrator', Object.freeze({
+    get: taskStore.get.bind(taskStore),
+    update: taskStore.update.bind(taskStore),
+    complete: taskStore.complete.bind(taskStore),
+    createDispatcher(options = {}) {
+      return new WorkerDispatcher({
+        store: taskStore,
+        registry: new WorkerSpecRegistry({
+          worker: { mode: 'session', profile: 'wp', agentPreset: 'worker', provider: 'ollama', model: 'm', workspacePolicy: 'any', timeoutMs: 50, leaseSeconds: 300 },
+        }),
+        launcher: options.launcher,
+        preflight: options.preflight ?? (async () => ({ ok: true, spec: { mode: 'session', profile: 'wp', agentPreset: 'worker', provider: 'ollama', model: 'm', workspacePolicy: 'any', timeoutMs: 50, leaseSeconds: 300, name: 'worker' } })),
+        preDispatch: options.preDispatch ?? null,
+        completionHook: options.completionHook ?? null,
+      });
+    },
+  }));
+  await ctx.plugin(changeControlPlugin, { storePath: join(dir, 'changes.json') });
+  await ctx.plugin(plugin);
+
+  const task = await taskStore.create({ title: 'tH2-timeout', description: 'd', status: 'ready', workspace: dir, worker_profile: 'worker', acceptance_criteria: ['ship'] });
+  const { change } = await ctx.taskChangeControl.bootstrapTask(task.id);
+  const plan = await ctx.changeControl.submitPlan(change.id, { steps: ['s'] });
+  await ctx.changeControl.acceptPlan(change.id, plan.id, { authorized: true, actor: 'host' });
+
+  // Launcher that never resolves (simulates timeout)
+  const launcher = {
+    async launch() {
+      return { sessionId: 'sess-timeout-1', wait: async () => new Promise(() => {}), async terminate() { return true; } };
+    },
+  };
+  const dispatcher = ctx.taskChangeControl.createGovernedDispatcher({ launcher });
+  const result = await dispatcher.dispatchOnce({ workerProfile: 'worker' });
+
+  // Task should be in failed status due to timeout
+  assert.equal(result.dispatched, true);
+  assert.equal(result.status, 'failed', 'governed timeout should result in failed status');
+
+  // Binding should be released after timeout (no leaked binding)
+  const bindings = await ctx.changeControl.listRoleBindings();
+  const thisBinding = bindings.find(b => b.sessionId === 'sess-timeout-1');
+  assert.equal(thisBinding, undefined, 'binding should be released after timeout');
+
+  // Change should still be in READY (not progressed)
+  const changeState = await ctx.changeControl.get(change.id);
+  assert.equal(changeState.state, 'READY', 'Change should remain in READY after timeout');
+});
+
+test('governed dispatcher rejects fabricated proof without commit_sha (TH2-R1-03)', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'tcc-t H2-noproof-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const ctx = new Context();
+  await ctx.plugin(SystemPrompt);
+  await ctx.plugin(ToolRuntime);
+  const taskStore = new TaskStore({ dbPath: join(dir, 'tasks.db') });
+  ctx.provide('taskOrchestrator', Object.freeze({
+    get: taskStore.get.bind(taskStore),
+    update: taskStore.update.bind(taskStore),
+    complete: taskStore.complete.bind(taskStore),
+    createDispatcher(options = {}) {
+      return new WorkerDispatcher({
+        store: taskStore,
+        registry: new WorkerSpecRegistry({
+          worker: { mode: 'session', profile: 'wp', agentPreset: 'worker', provider: 'ollama', model: 'm', workspacePolicy: 'any', timeoutMs: 5000, leaseSeconds: 300 },
+        }),
+        launcher: options.launcher,
+        preflight: options.preflight ?? (async () => ({ ok: true, spec: { mode: 'session', profile: 'wp', agentPreset: 'worker', provider: 'ollama', model: 'm', workspacePolicy: 'any', timeoutMs: 5000, leaseSeconds: 300, name: 'worker' } })),
+        preDispatch: options.preDispatch ?? null,
+        completionHook: options.completionHook ?? null,
+      });
+    },
+  }));
+  await ctx.plugin(changeControlPlugin, { storePath: join(dir, 'changes.json') });
+  await ctx.plugin(plugin);
+
+  const task = await taskStore.create({ title: 'tH2-noproof', description: 'd', status: 'ready', workspace: dir, worker_profile: 'worker', acceptance_criteria: ['ship'] });
+  const { change } = await ctx.taskChangeControl.bootstrapTask(task.id);
+  const plan = await ctx.changeControl.submitPlan(change.id, { steps: ['s'] });
+  await ctx.changeControl.acceptPlan(change.id, plan.id, { authorized: true, actor: 'host' });
+
+  // Launcher returns success but NO commit_sha (fabricated proof scenario)
+  let implemented = false;
+  const launcher = {
+    async launch() {
+      return { sessionId: 'sess-noproof-1', wait: async () => {
+        if (!implemented) { implemented = true; await ctx.changeControl.transition(change.id, 'IMPLEMENTING', {}); }
+        return { exitCode: 0, stdout: 'done', stderr: '' }; // No commit_sha!
+      }, async terminate() { return true; } };
+    },
+  };
+  const dispatcher = ctx.taskChangeControl.createGovernedDispatcher({ launcher });
+  const result = await dispatcher.dispatchOnce({ workerProfile: 'worker' });
+
+  // Should fail because commit_sha is missing
+  assert.equal(result.dispatched, true);
+  assert.equal(result.status, 'failed', 'governed completion without commit_sha should fail');
+  assert.ok(result.error?.includes('commit_sha'), 'error should mention missing commit_sha');
+
+  // Change should NOT be in PREFLIGHT
+  const changeState = await ctx.changeControl.get(change.id);
+  assert.notEqual(changeState.state, 'PREFLIGHT', 'Change should not reach PREFLIGHT without valid proof');
 });

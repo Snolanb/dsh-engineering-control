@@ -273,11 +273,21 @@ export class WorkerDispatcher {
 
     // If a completion hook is configured (governed dispatch), hold the binding
     // before wait() so the hook can validate session identity via completeGovernedTask.
+    let governedHoldAcquired = false
     if (this.completionHook) {
       await handle?._governedHold?.()
+      governedHoldAcquired = true
     }
 
-    return await this.monitor(task, spec, handle, { runId, worker })
+    try {
+      return await this.monitor(task, spec, handle, { runId, worker })
+    } finally {
+      // Always release the governed binding when the hold was acquired, regardless
+      // of success/failure/lease-lost/timeout — prevents leaked worker role bindings.
+      if (governedHoldAcquired) {
+        await handle?._governedRelease?.()
+      }
+    }
   }
 
   async monitor(task, spec, handle, { runId, worker }) {
@@ -330,6 +340,18 @@ export class WorkerDispatcher {
       files_changed: [],
       tests_run: [],
       remaining_blockers: timedOut ? ['worker timeout'] : outcome.exitCode === 0 ? [] : ['worker exited unsuccessfully'],
+      // Thread any structured proof fields from the worker's raw outcome so the
+      // governed completion hook can use them instead of fabricating defaults.
+      ...(outcome?.commit_sha ? { commit_sha: outcome.commit_sha } : {}),
+      ...(Array.isArray(outcome?.files_changed) ? { files_changed: outcome.files_changed } : {}),
+      ...(Array.isArray(outcome?.tests_run) ? { tests_run: outcome.tests_run } : {}),
+      ...(Array.isArray(outcome?.remaining_blockers) ? { remaining_blockers: outcome.remaining_blockers } : {}),
+      ...(outcome?.beforeRevision ? { beforeRevision: outcome.beforeRevision } : {}),
+      ...(outcome?.afterRevision ? { afterRevision: outcome.afterRevision } : {}),
+      ...(Array.isArray(outcome?.criteria) ? { criteria: outcome.criteria } : {}),
+      ...(Array.isArray(outcome?.deviations) ? { deviations: outcome.deviations } : {}),
+      ...(Array.isArray(outcome?.workerChecks) ? { workerChecks: outcome.workerChecks } : {}),
+      ...(Array.isArray(outcome?.controllerPreflight) ? { controllerPreflight: outcome.controllerPreflight } : {}),
     }
     if (timedOut || outcome.exitCode !== 0 || outcome.error) {
       const failed = this.store.fail(task.id, result, { worker, actor: this.actor })
@@ -345,9 +367,11 @@ export class WorkerDispatcher {
     if (this.completionHook) {
       try {
         completed = await this.completionHook(task.id, result, completionOpts)
-      } finally {
-        // Release the binding after the hook completes (success or failure).
-        await handle?._governedRelease?.()
+      } catch (error) {
+        // Funnel completionHook errors to store.fail so the task lands in failed
+        // (not running) and the error propagates to the dispatcher result.
+        const failed = this.store.fail(task.id, result, { worker, actor: this.actor })
+        return { dispatched: true, status: 'failed', task: failed, run_id: runId, worker, error: error.message }
       }
     } else {
       completed = this.store.complete(task.id, result, { worker, actor: this.actor })
