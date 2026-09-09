@@ -38,7 +38,7 @@ test('provider lookup resolves session → change → task, null for unknown ses
 
   // Build the same production provider via its exported factory and invoke
   // the lookup behavior directly. The integration plugin's own registered
-  // instance is exercised end-to-end by mandatory-governance-real.test.mjs.
+  // instance is exercised end-to-end by mandatory-governance.test.mjs.
   const provider = createMandatoryGovernanceProvider({
     taskOrchestrator: () => ctx.get('taskOrchestrator'),
     changeControl: () => ctx.get('changeControl'),
