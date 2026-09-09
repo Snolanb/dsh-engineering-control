@@ -259,6 +259,19 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
           const taskRecord = await Promise.resolve(requireTask().get(taskId));
           const acceptanceCriteria = Array.isArray(taskRecord?.acceptance_criteria) ? taskRecord.acceptance_criteria : [];
 
+          // TH2-R2-02: Make governed completion conditional on actual linkage.
+          // If no Change is linked to this task, fall back to raw store.complete
+          // so ungoverned tasks dispatched via createGovernedDispatcher still work.
+          const linkedChange = await Promise.resolve(requireChange().findByWorkItem(WORK_ITEM_SYSTEM, taskId));
+          if (!linkedChange) {
+            // No Change linkage — use raw completion path.
+            const taskApi = requireTask();
+            if (taskApi && typeof taskApi.complete === 'function') {
+              return taskApi.complete(taskId, result, { worker, actor: 'task-change-control' });
+            }
+            throw Object.assign(new Error('taskOrchestrator.complete is unavailable for ungoverned fallback'), { code: 'LINKAGE_UNAVAILABLE' });
+          }
+
           // Require commit_sha from the worker — do not fabricate.
           const commitSha = result.commit_sha;
           if (!commitSha || typeof commitSha !== 'string' || commitSha.trim() === '') {

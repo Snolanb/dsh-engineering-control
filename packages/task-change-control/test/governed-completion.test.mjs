@@ -419,3 +419,58 @@ test('governed dispatcher rejects fabricated proof without commit_sha (TH2-R1-03
   const changeState = await ctx.changeControl.get(change.id);
   assert.notEqual(changeState.state, 'PREFLIGHT', 'Change should not reach PREFLIGHT without valid proof');
 });
+
+test('ungoverned task via createGovernedDispatcher uses store.complete fallback (TH2-R2-02)', async (t) => {
+  // TH2-R2-02: When no Change is linked to the task, governed dispatcher should
+  // fall back to raw store.complete so ungoverned tasks still work.
+  const dir = await mkdtemp(join(tmpdir(), 'tcc-t H2-ungov-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const ctx = new Context();
+  await ctx.plugin(SystemPrompt);
+  await ctx.plugin(ToolRuntime);
+  const taskStore = new TaskStore({ dbPath: join(dir, 'tasks.db') });
+  // Provide taskOrchestrator WITHOUT bootstrapping a Change — simulates ungoverned task.
+  ctx.provide('taskOrchestrator', Object.freeze({
+    get: taskStore.get.bind(taskStore),
+    update: taskStore.update.bind(taskStore),
+    complete: taskStore.complete.bind(taskStore),
+    createDispatcher(options = {}) {
+      return new WorkerDispatcher({
+        store: taskStore,
+        registry: new WorkerSpecRegistry({
+          worker: { mode: 'session', profile: 'wp', agentPreset: 'worker', provider: 'ollama', model: 'm', workspacePolicy: 'any', timeoutMs: 5000, leaseSeconds: 300 },
+        }),
+        launcher: options.launcher,
+        preflight: options.preflight ?? (async () => ({ ok: true, spec: { mode: 'session', profile: 'wp', agentPreset: 'worker', provider: 'ollama', model: 'm', workspacePolicy: 'any', timeoutMs: 5000, leaseSeconds: 300, name: 'worker' } })),
+        preDispatch: options.preDispatch ?? null,
+        completionHook: options.completionHook ?? null,
+      });
+    },
+  }));
+  await ctx.plugin(changeControlPlugin, { storePath: join(dir, 'changes.json') });
+  await ctx.plugin(plugin);
+
+  // Create task but do NOT bootstrap a Change — keeps it ungoverned.
+  const task = await taskStore.create({ title: 'tH2-ungov', description: 'd', status: 'ready', workspace: dir, worker_profile: 'worker', acceptance_criteria: ['ship'] });
+  // Verify no Change is linked.
+  const linkedChange = await ctx.changeControl.findByWorkItem('dsh-task-orchestrator', task.id);
+  assert.ok(!linkedChange, 'no Change should be linked for ungoverned task');
+
+  const launcher = {
+    async launch() {
+      return { sessionId: 'sess-ungov-1', wait: async () => {
+        return { exitCode: 0, stdout: 'done', stderr: '', commit_sha: 'abc123', files_changed: ['src/foo.js'], tests_run: ['test/foo.test.js'] };
+      }, async terminate() { return true; } };
+    },
+  };
+  const dispatcher = ctx.taskChangeControl.createGovernedDispatcher({ launcher });
+  const result = await dispatcher.dispatchOnce({ workerProfile: 'worker' });
+
+  // Should succeed via store.complete fallback (not completeGovernedTask).
+  assert.equal(result.dispatched, true);
+  assert.equal(result.status, 'in_review', 'ungoverned task should reach in_review via store.complete fallback');
+
+  // Task should be completed.
+  const finalTask = await taskStore.get(task.id);
+  assert.equal(finalTask.status, 'in_review');
+});

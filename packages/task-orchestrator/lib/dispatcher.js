@@ -353,6 +353,10 @@ export class WorkerDispatcher {
       ...(Array.isArray(outcome?.workerChecks) ? { workerChecks: outcome.workerChecks } : {}),
       ...(Array.isArray(outcome?.controllerPreflight) ? { controllerPreflight: outcome.controllerPreflight } : {}),
     }
+    // TODO(TH2-R2-04): Track the payload protocol gap — session/headless launchers
+    // should surface commit_sha/files_changed/tests_run in their outcome shape so
+    // the dispatcher can thread them automatically. Add a contract test using the
+    // REAL launcher outcome shape to make this gap explicit. Issue: pending.
     if (timedOut || outcome.exitCode !== 0 || outcome.error) {
       const failed = this.store.fail(task.id, result, { worker, actor: this.actor })
       return { dispatched: true, status: 'failed', task: failed, run_id: runId, worker, exit_code: outcome.exitCode, stdout, stderr }
@@ -370,8 +374,16 @@ export class WorkerDispatcher {
       } catch (error) {
         // Funnel completionHook errors to store.fail so the task lands in failed
         // (not running) and the error propagates to the dispatcher result.
-        const failed = this.store.fail(task.id, result, { worker, actor: this.actor })
-        return { dispatched: true, status: 'failed', task: failed, run_id: runId, worker, error: error.message }
+        // TH2-R2-03: Tolerate store.fail lease/owner errors — if the lease is already
+        // lost or the worker doesn't match, return a structured result instead of
+        // leaving the task stranded in running state.
+        try {
+          const failed = this.store.fail(task.id, result, { worker, actor: this.actor })
+          return { dispatched: true, status: 'failed', task: failed, run_id: runId, worker, error: error.message }
+        } catch (leaseError) {
+          // Lease/owner mismatch — return structured failure without uncaught rejection.
+          return { dispatched: true, status: 'lease_lost', task: this.store.get(task.id), run_id: runId, worker, error: leaseError.message }
+        }
       }
     } else {
       completed = this.store.complete(task.id, result, { worker, actor: this.actor })
