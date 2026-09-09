@@ -8,6 +8,11 @@
 import { createGovernanceGuard } from './governance.js';
 import { createBindingLauncher } from './binding.js';
 import { validatePairing } from './lifecycle.js';
+import {
+  reserveReviewerLaunch,
+  writeClaimRecord,
+  REVIEWER_CLAIM_LEASE_MS,
+} from './reviewer-claim.js';
 
 /** The task-orchestrator identity on the Change-side workItem. */
 export const WORK_ITEM_SYSTEM = 'dsh-task-orchestrator';
@@ -634,19 +639,33 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
           }
           await c.appendAudit({ kind: 'review_orchestration', changeId: change.id, action: 'preflight_passed' });
         }
-        // T-H5 PR1-02: serialize check→launch→bind for ONE Change under a
-        // per-Change reservation lock so concurrent (or resumed) controller
-        // calls cannot both observe "no reviewer binding" and launch separate
-        // reviewers. The first caller launches and binds; any later caller
-        // re-checks under the lock and reuses the persisted reviewer session.
-        // Cross-process is covered by the store's atomic bindRole + the read
-        // of the already-persisted binding; this lock closes the in-process
-        // read-then-write race.
+        // T-H5 PR1-02 + PR2-01: serialize check→launch→bind for ONE Change.
+        // The in-process tail lock is the fast local serializer; the durable
+        // cross-process claim (reserveReviewerLaunch) guarantees no two host
+        // processes launch a second reviewer, adopts a crashed owner's
+        // recorded session instead of re-launching it, and converges on the
+        // confirmed binding as the terminal record.
         const sessionId = await withReviewerReservation(change.id, async () => {
-          const existing = (await c.listRoleBindings()).find((b) => b.changeId === change.id && b.role === 'reviewer');
-          if (existing) return existing.sessionId;
-          const launched = await launchReviewerForTask(requireTask, requireChange, requireTaskId, taskId);
-          return launched.sessionId;
+          return reserveReviewerLaunch({
+            c, change, task,
+            launch: async ({ file, identity }) => {
+              const launched = await launchReviewerForTask(requireTask, requireChange, requireTaskId, taskId, {
+                // Durable record of the launched session before the binding —
+                // the crash-recovery (adopt) record for a successor claim.
+                recordSession: async (launchSessionId) => {
+                  await writeClaimRecord(file, { claimant: identity, sessionId: launchSessionId, updatedAt: Date.now() });
+                },
+                discardSession: async () => {
+                  // Our launch is dead (terminated on failure): expire the
+                  // claim so a successor takes over with a fresh launch
+                  // instead of adopting a terminated session.
+                  await writeClaimRecord(file, { claimant: identity, sessionId: null, updatedAt: Date.now() - 2 * REVIEWER_CLAIM_LEASE_MS })
+                    .catch(() => {});
+                },
+              });
+              return launched.sessionId;
+            },
+          });
         });
         // A successful store runPreflight is authoritative for the state
         // move: under a real preflight policy the store itself performed
@@ -655,7 +674,13 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         // one PREFLIGHT→REVIEW transition, never a double move.
         const liveAfterPreflight = await c.get(change.id);
         if (liveAfterPreflight.state === 'PREFLIGHT') {
-          await c.transition(change.id, 'REVIEW', { actor: 'review-orchestration' });
+          await c.transition(change.id, 'REVIEW', { actor: 'review-orchestration' }).catch((err) => {
+            if (err?.name !== 'ChangeDomainError') throw err;
+            // T-H5 PR2-01: a concurrent controller advanced the stage while
+            // we held the reservation — REVIEW→REVIEW is not a legal move,
+            // so the stage already converged; its launch is bound under the
+            // same claim we just released.
+          });
         }
         return { outcome: 'review_started', sessionId, changeId: change.id };
       })();
@@ -1414,7 +1439,15 @@ function buildRepairPrompt(taskId, changeId, revision, openFindings) {
  * @param {() => ChangeControlApi} requireChange
  * @param {(taskId: any) => void} requireTaskId
  * @param {string} taskId
- * @param {{ spec?: object, launcherOptions?: object }} [options]
+ * @param {{ spec?: object, launcherOptions?: object,
+ *   recordSession?: (sessionId: string) => Promise<void>,
+ *   discardSession?: () => Promise<void> }} [options]
+ *
+ * T-H5 PR2-01: `recordSession` runs after launch and BEFORE the binding so a
+ * durable record of the launched session exists before the (crash-prone)
+ * bind; `discardSession` runs after a launch that must be terminated (bind
+ * failure) so a successor claim does not adopt a dead session. Both are
+ * absent for plain host launches (launchReviewer), which are unchanged.
  */
 function launchReviewerForTask(requireTask, requireChange, requireTaskId, taskId, options = {}) {
   const t = requireTask();
@@ -1458,10 +1491,21 @@ Review the governed Change ${change.id} against its Plan and project task accept
     }
     let binding;
     try {
+      // T-H5 PR2-01: durably record the launched session BEFORE the binding,
+      // so a crash between launch and bind leaves a record a successor claim
+      // can adopt (reconcile, not re-launch). Absent for plain host launches.
+      if (typeof options.recordSession === 'function') {
+        await options.recordSession(handle.sessionId);
+      }
       binding = await c.bindRole(change.id, handle.sessionId, 'reviewer');
     } catch (error) {
       if (typeof handle?.terminate === 'function') {
         try { await handle.terminate(); } catch { /* best-effort */ }
+      }
+      // T-H5 PR2-01: expire the durable record so a successor claim launches
+      // fresh instead of adopting a session we just terminated.
+      if (typeof options.discardSession === 'function') {
+        try { await options.discardSession(); } catch { /* best-effort */ }
       }
       throw error;
     }

@@ -608,7 +608,12 @@ test('T-H5 PR2-01: two host processes on one store launch exactly ONE reviewer (
     .filter((x) => x.changeId === change.id && x.role === 'reviewer');
   assert.equal(reviewers.length, 1, 'exactly one reviewer binding persisted');
   assert.equal(reviewers[0].sessionId, ra.sessionId);
-  assert.equal((await ctx.changeControl.get(change.id)).state, 'REVIEW');
+  // State is asserted on DISK truth: a long-lived in-process ChangeStore view
+  // is cross-process stale by design (get() never re-reads), so the parent's
+  // own store may lag the children's persisted REVIEW.
+  const diskState = JSON.parse(readFileSync(join(dir, 'changes.json'), 'utf8'))
+    .changes.find((c) => c.id === change.id).domainState;
+  assert.equal(diskState, 'REVIEW');
 });
 
 test('T-H5 PR2-01: crashed claim owner\'s recorded reviewer session is adopted on restart (no relaunch, no orphan)', async (t) => {
@@ -632,5 +637,30 @@ test('T-H5 PR2-01: crashed claim owner\'s recorded reviewer session is adopted o
     .filter((x) => x.changeId === change.id && x.role === 'reviewer');
   assert.equal(reviewers.length, 1, 'the adopted session becomes the one and only reviewer binding');
   assert.equal(reviewers[0].sessionId, 'sess-crashed-reviewer');
+  assert.equal((await ctx.changeControl.get(change.id)).state, 'REVIEW');
+});
+
+test('T-H5 PR2-01: a stale claim with no recorded session is taken over with exactly one fresh launch', async (t) => {
+  const { ctx, taskStore, dir, reviewerLaunches } = await compose(t);
+  const { task, change } = await governedReadyTask(ctx, taskStore, dir);
+  await dispatchGovernedSuccess(ctx, taskStore, dir, change, { preflight: ['FAIL: build'] });
+  // The owner died before recording any session (crash during launch): a
+  // stale claim with no session. A successor must take over and launch
+  // exactly one reviewer — no adoption (nothing recorded), no duplicate.
+  const claimFile = reviewerClaimFileFor(task, change);
+  await mkdir(dirname(claimFile), { recursive: true });
+  await writeFile(claimFile, JSON.stringify({
+    claimant: 'dead-host:4242',
+    sessionId: null,
+    updatedAt: Date.now() - 2 * 10 * 60 * 1000,
+  }), 'utf8');
+
+  const result = await ctx.taskChangeControl.runGovernedSdlc(task.id, { controllerPreflightOverride: ['pass:build'] });
+  assert.equal(result.outcome, 'review_pending');
+  assert.equal(reviewerLaunches(), 1, 'a stale empty claim is taken over with one fresh launch');
+  const reviewers = (await ctx.changeControl.listRoleBindings())
+    .filter((x) => x.changeId === change.id && x.role === 'reviewer');
+  assert.equal(reviewers.length, 1);
+  assert.equal(result.sessionId, reviewers[0].sessionId);
   assert.equal((await ctx.changeControl.get(change.id)).state, 'REVIEW');
 });
