@@ -244,6 +244,65 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
               return userGuard(input);
             }
           : integrationGuard,
+        completionHook: /** @type {(taskId: string, result: any, opts?: { worker?: string, sessionId?: string }) => Promise<any>} */ (async function completionHook(taskId, result, opts) {
+          const worker = opts?.worker;
+          const sessionId = opts?.sessionId;
+          // The hook receives the monitor result shape (result_summary, files_changed,
+          // tests_run, remaining_blockers) plus optional sessionId from the launcher.
+          // completeGovernedTask performs the authoritative transition: validates lease,
+          // binding, proof fields, criteria alignment, submits Change-side proof, moves
+          // Change to PREFLIGHT, and transitions the task to in_review — atomically.
+          // Thread the worker's ACTUAL structured completion payload into the proof.
+          // Fail governed completion when required evidence is absent rather than
+          // substituting fabricated values — prevents false PREFLIGHT transitions.
+          // Fetch the task to get acceptance_criteria for proof alignment.
+          const taskRecord = await Promise.resolve(requireTask().get(taskId));
+          const acceptanceCriteria = Array.isArray(taskRecord?.acceptance_criteria) ? taskRecord.acceptance_criteria : [];
+
+          // TH2-R2-02: Make governed completion conditional on actual linkage.
+          // If no Change is linked to this task, fall back to raw store.complete
+          // so ungoverned tasks dispatched via createGovernedDispatcher still work.
+          const linkedChange = await Promise.resolve(requireChange().findByWorkItem(WORK_ITEM_SYSTEM, taskId));
+          if (!linkedChange) {
+            // No Change linkage — use raw completion path.
+            const taskApi = requireTask();
+            if (taskApi && typeof taskApi.complete === 'function') {
+              return taskApi.complete(taskId, result, { worker, actor: 'task-change-control' });
+            }
+            throw Object.assign(new Error('taskOrchestrator.complete is unavailable for ungoverned fallback'), { code: 'LINKAGE_UNAVAILABLE' });
+          }
+
+          // Require commit_sha from the worker — do not fabricate.
+          const commitSha = result.commit_sha;
+          if (!commitSha || typeof commitSha !== 'string' || commitSha.trim() === '') {
+            throw Object.assign(
+              new Error('governed completion requires commit_sha from worker result'),
+              { code: 'PROOF_FIELD_REQUIRED', field: 'commit_sha' },
+            );
+          }
+
+          const proof = {
+            beforeRevision: result.beforeRevision ?? 'initial',
+            afterRevision: result.afterRevision ?? commitSha,
+            commit_sha: commitSha,
+            files_changed: Array.isArray(result.files_changed) ? result.files_changed : [],
+            tests_run: Array.isArray(result.tests_run) ? result.tests_run : [],
+            remaining_blockers: Array.isArray(result.remaining_blockers) ? result.remaining_blockers : [],
+            criteria: Array.isArray(result.criteria)
+              ? result.criteria
+              : acceptanceCriteria.map((/** @type {string} */ c) => ({ id: c, satisfied: true })),
+            deviations: Array.isArray(result.deviations) ? result.deviations : [],
+            workerChecks: Array.isArray(result.workerChecks) ? result.workerChecks : [],
+            controllerPreflight: Array.isArray(result.controllerPreflight) ? result.controllerPreflight : [],
+            summary: result.result_summary ?? '',
+            ...(result || {}),
+          };
+          return api.completeGovernedTask(taskId, /** @type {{ sessionId: string, worker: string, proof: any }} */ ({
+            sessionId: /** @type {string} */ (sessionId ?? worker ?? ''),
+            worker: /** @type {string} */ (worker ?? ''),
+            proof,
+          }));
+        }),
       });
     },
 

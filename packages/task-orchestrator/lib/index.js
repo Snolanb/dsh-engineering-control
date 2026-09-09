@@ -80,6 +80,7 @@ export function apply(ctx, config = {}) {
       launcher: options.launcher ?? createWorkerLauncher(options.launcherOptions),
       preflight: options.preflight ?? preflight,
       preDispatch: options.preDispatch ?? null,
+      completionHook: options.completionHook ?? null,
       preflightOptions: options.preflightOptions,
       actor: options.actor,
       idFactory: options.idFactory,

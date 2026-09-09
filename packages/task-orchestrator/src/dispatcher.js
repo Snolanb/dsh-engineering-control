@@ -115,6 +115,7 @@ export class WorkerDispatcher {
     idFactory = randomUUID,
     clock = () => Date.now(),
     outputLimit = DEFAULT_OUTPUT_LIMIT,
+    completionHook = null,
   } = {}) {
     if (!store || typeof store.list !== 'function') throw new TypeError('a task store is required')
     if (!registry || typeof registry.resolve !== 'function') throw new TypeError('a WorkerSpecRegistry is required')
@@ -130,6 +131,8 @@ export class WorkerDispatcher {
     this.idFactory = idFactory
     this.clock = clock
     this.outputLimit = outputLimit
+    if (completionHook !== null && typeof completionHook !== 'function') throw new TypeError('completionHook must be a function or null')
+    this.completionHook = completionHook
   }
 
   async dispatchOnce({ workerProfile, limit = 1 } = {}) {
@@ -268,7 +271,23 @@ export class WorkerDispatcher {
       return { dispatched: false, reason: 'launch_failed', task: this.store.get(task.id), error: errorText(error), run_id: runId }
     }
 
-    return await this.monitor(task, spec, handle, { runId, worker })
+    // If a completion hook is configured (governed dispatch), hold the binding
+    // before wait() so the hook can validate session identity via completeGovernedTask.
+    let governedHoldAcquired = false
+    if (this.completionHook) {
+      await handle?._governedHold?.()
+      governedHoldAcquired = true
+    }
+
+    try {
+      return await this.monitor(task, spec, handle, { runId, worker })
+    } finally {
+      // Always release the governed binding when the hold was acquired, regardless
+      // of success/failure/lease-lost/timeout — prevents leaked worker role bindings.
+      if (governedHoldAcquired) {
+        await handle?._governedRelease?.()
+      }
+    }
   }
 
   async monitor(task, spec, handle, { runId, worker }) {
@@ -321,12 +340,54 @@ export class WorkerDispatcher {
       files_changed: [],
       tests_run: [],
       remaining_blockers: timedOut ? ['worker timeout'] : outcome.exitCode === 0 ? [] : ['worker exited unsuccessfully'],
+      // Thread any structured proof fields from the worker's raw outcome so the
+      // governed completion hook can use them instead of fabricating defaults.
+      ...(outcome?.commit_sha ? { commit_sha: outcome.commit_sha } : {}),
+      ...(Array.isArray(outcome?.files_changed) ? { files_changed: outcome.files_changed } : {}),
+      ...(Array.isArray(outcome?.tests_run) ? { tests_run: outcome.tests_run } : {}),
+      ...(Array.isArray(outcome?.remaining_blockers) ? { remaining_blockers: outcome.remaining_blockers } : {}),
+      ...(outcome?.beforeRevision ? { beforeRevision: outcome.beforeRevision } : {}),
+      ...(outcome?.afterRevision ? { afterRevision: outcome.afterRevision } : {}),
+      ...(Array.isArray(outcome?.criteria) ? { criteria: outcome.criteria } : {}),
+      ...(Array.isArray(outcome?.deviations) ? { deviations: outcome.deviations } : {}),
+      ...(Array.isArray(outcome?.workerChecks) ? { workerChecks: outcome.workerChecks } : {}),
+      ...(Array.isArray(outcome?.controllerPreflight) ? { controllerPreflight: outcome.controllerPreflight } : {}),
     }
+    // TODO(TH2-R2-04): Track the payload protocol gap — session/headless launchers
+    // should surface commit_sha/files_changed/tests_run in their outcome shape so
+    // the dispatcher can thread them automatically. Add a contract test using the
+    // REAL launcher outcome shape to make this gap explicit. Issue: pending.
     if (timedOut || outcome.exitCode !== 0 || outcome.error) {
       const failed = this.store.fail(task.id, result, { worker, actor: this.actor })
       return { dispatched: true, status: 'failed', task: failed, run_id: runId, worker, exit_code: outcome.exitCode, stdout, stderr }
     }
-    const completed = this.store.complete(task.id, result, { worker, actor: this.actor })
+    let completed
+    const completionOpts = { worker, actor: this.actor }
+    // Pin the sessionId from the launcher handle into the completion context
+    // so a governed completion hook can validate the actual session identity.
+    if (handle && typeof handle.sessionId === 'string') {
+      completionOpts.sessionId = handle.sessionId
+    }
+    if (this.completionHook) {
+      try {
+        completed = await this.completionHook(task.id, result, completionOpts)
+      } catch (error) {
+        // Funnel completionHook errors to store.fail so the task lands in failed
+        // (not running) and the error propagates to the dispatcher result.
+        // TH2-R2-03: Tolerate store.fail lease/owner errors — if the lease is already
+        // lost or the worker doesn't match, return a structured result instead of
+        // leaving the task stranded in running state.
+        try {
+          const failed = this.store.fail(task.id, result, { worker, actor: this.actor })
+          return { dispatched: true, status: 'failed', task: failed, run_id: runId, worker, error: error.message }
+        } catch (leaseError) {
+          // Lease/owner mismatch — return structured failure without uncaught rejection.
+          return { dispatched: true, status: 'lease_lost', task: this.store.get(task.id), run_id: runId, worker, error: leaseError.message }
+        }
+      }
+    } else {
+      completed = this.store.complete(task.id, result, { worker, actor: this.actor })
+    }
     return { dispatched: true, status: 'in_review', task: completed, run_id: runId, worker, exit_code: outcome.exitCode, stdout, stderr }
   }
 }
