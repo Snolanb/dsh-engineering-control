@@ -1,5 +1,45 @@
-import { createTaskChangeControlService } from './service.js';
+import { createTaskChangeControlService, WORK_ITEM_SYSTEM } from './service.js';
 import { createIntegrationTools } from './tools.js';
+
+export { WORK_ITEM_SYSTEM };
+
+/**
+ * T9.1 — mandatory-governance task-context provider.
+ *
+ * Resolves sessionId → governed task context through the Change-side bindings
+ * graph ONLY (session → role binding → Change → canonical work item):
+ *   { changeId, taskId, taskStatus, role } | null
+ * A Change whose workItem.system is not the canonical WORK_ITEM_SYSTEM is not
+ * a Task Orchestrator task, so taskId resolves to null (denied downstream).
+ *
+ * Exported as a factory so the plugin and boundary tests construct the same
+ * provider without reaching across the ChangeStore package boundary.
+ *
+ * @param {object} deps
+ * @param {() => any} deps.taskOrchestrator accessor for the Task Orchestrator service (may resolve undefined)
+ * @param {() => any} deps.changeControl accessor for the changeControl facade (may resolve undefined)
+ */
+export function createMandatoryGovernanceProvider({ taskOrchestrator, changeControl }) {
+  return {
+    /** @param {{ sessionId: string }} input */
+    async lookup({ sessionId }) {
+      const cc = changeControl();
+      if (!cc || typeof cc.listRoleBindings !== 'function') return null;
+      const bindings = await cc.listRoleBindings();
+      const hit = bindings.find((/** @type {any} */ b) => b.sessionId === sessionId);
+      if (!hit) return null;
+      const change = await cc.get(hit.changeId);
+      const taskId = change?.workItem?.system === WORK_ITEM_SYSTEM ? change.workItem.id : null;
+      const t = taskOrchestrator();
+      let taskStatus = null;
+      if (taskId && t && typeof t.get === 'function') {
+        const task = await t.get(taskId);
+        taskStatus = task?.status ?? null;
+      }
+      return { changeId: hit.changeId, taskId, taskStatus, role: hit.role };
+    },
+  };
+}
 
 /**
  * Task ↔ Change integration plugin.
@@ -27,22 +67,10 @@ export default {
     // (older/static change-control compositions ignore this).
     const changeControl = ctx.get('changeControl');
     if (changeControl && typeof changeControl.registerGovernanceProvider === 'function') {
-      changeControl.registerGovernanceProvider({
-        lookup: async (/** @type {{sessionId: string}} */ { sessionId }) => {
-          const bindings = await changeControl.listRoleBindings();
-          const hit = bindings.find((/** @type {any} */ b) => b.sessionId === sessionId);
-          if (!hit) return null;
-          const change = await changeControl.get(hit.changeId);
-          const taskId = change?.workItem?.system === 'task-orchestrator' ? change.workItem.id : null;
-          const t = ctx.get('taskOrchestrator');
-          let taskStatus = null;
-          if (taskId && t && typeof t.get === 'function') {
-            const task = await t.get(taskId);
-            taskStatus = task?.status ?? null;
-          }
-          return { changeId: hit.changeId, taskId, taskStatus, role: hit.role };
-        },
-      });
+      changeControl.registerGovernanceProvider(createMandatoryGovernanceProvider({
+        taskOrchestrator: () => ctx.get('taskOrchestrator'),
+        changeControl: () => ctx.get('changeControl'),
+      }));
     }
 
     // Model-facing surface: exactly two tools, registered only when a tools
