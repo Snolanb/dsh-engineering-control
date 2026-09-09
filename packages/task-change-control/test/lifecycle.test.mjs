@@ -88,7 +88,12 @@ async function composeWithPolicy(t, { storePrefix = 'tcc-th5-policy-' } = {}) {
   return { ctx, taskStore, dir, storePath, taskOrchestrator, reviewerLaunches: () => reviewerLaunches };
 }
 
-async function compose(t, { withReviewerLauncher = true, storePrefix = 'tcc-th5-' } = {}) {
+async function compose(t, {
+  withReviewerLauncher = true,
+  storePrefix = 'tcc-th5-',
+  reviewerLaunchDelay = 0,
+  reviewerSessionId = () => REVIEWER_SESSION,
+} = {}) {
   const dir = await mkdtemp(join(tmpdir(), storePrefix));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const ctx = new Context();
@@ -117,8 +122,12 @@ async function compose(t, { withReviewerLauncher = true, storePrefix = 'tcc-th5-
     taskOrchestrator.createReviewerLauncher = () => ({
       async launch() {
         reviewerLaunches += 1;
+        const n = reviewerLaunches;
+        if (reviewerLaunchDelay > 0) {
+          await new Promise((resolve) => setTimeout(resolve, reviewerLaunchDelay));
+        }
         return {
-          sessionId: REVIEWER_SESSION,
+          sessionId: reviewerSessionId(n),
           wait: async () => ({ exitCode: 0 }),
           terminate: async () => true,
         };
@@ -145,7 +154,7 @@ async function governedReadyTask(ctx, taskStore, dir) {
 }
 
 /** Instant-success governed worker: transitions Change to IMPLEMENTING mid-run and yields a structured proof. */
-function successLauncher(ctx, change, { commit = 'c1', afterRevision = 'a1', preflight = ['ok'] } = {}) {
+function successLauncher(ctx, change, { commit = 'c1', afterRevision = 'a1', preflight = ['ok'], manualTransition = true } = {}) {
   let ran = false;
   return {
     async launch() {
@@ -154,7 +163,12 @@ function successLauncher(ctx, change, { commit = 'c1', afterRevision = 'a1', pre
         wait: async () => {
           if (!ran) {
             ran = true;
-            await ctx.changeControl.transition(change.id, 'IMPLEMENTING', {});
+            // T-H5 PR1-01: real production launchers do NOT transition the
+            // Change — this is a test-only move that previously masked the
+            // missing controller-owned READY→IMPLEMENTING transition.
+            if (manualTransition) {
+              await ctx.changeControl.transition(change.id, 'IMPLEMENTING', {});
+            }
           }
           return {
             exitCode: 0, stdout: 'done', stderr: '',
@@ -441,4 +455,52 @@ test('T-H5 repair-r2: failing required check under a real policy fails closed (n
   const transitions = (await ctx.changeControl.history(change.id))
     .filter((e) => e.from === 'PREFLIGHT' && e.to === 'REVIEW');
   assert.equal(transitions.length, 0, 'failed required checks never move to REVIEW');
+});
+
+test('T-H5 PR1-01: real launcher that does NOT mutate the Change still completes PREFLIGHT→REVIEW (controller-owned READY→IMPLEMENTING)', async (t) => {
+  const { ctx, taskStore, dir, reviewerLaunches } = await compose(t);
+  const { task, change } = await governedReadyTask(ctx, taskStore, dir);
+  // A production launcher NEVER transitions the Change itself. The controlled
+  // dispatch must create/advance the governed lifecycle by transitioning
+  // READY→IMPLEMENTING (post-guard) at a host-owned point; the task must land
+  // in_review with the Change at REVIEW and one reviewer bound.
+  const result = await dispatchGovernedSuccess(ctx, taskStore, dir, change, { manualTransition: false });
+
+  assert.equal(result.status, 'in_review', 'governed completion must not land the task in failed for state READY');
+  assert.equal((await ctx.changeControl.get(change.id)).state, 'REVIEW',
+    'controller-owned READY→IMPLEMENTING→PREFLIGHT→REVIEW must be traversed without test-only mutation');
+  const reviewers = (await ctx.changeControl.listRoleBindings())
+    .filter((b) => b.changeId === change.id && b.role === 'reviewer');
+  assert.equal(reviewers.length, 1, 'exactly one reviewer bound');
+  assert.equal(reviewerLaunches(), 1);
+  assert.equal((await taskStore.get(task.id)).status, 'in_review');
+});
+
+test('T-H5 PR1-02: concurrent runGovernedSdlc calls launch and bind exactly ONE reviewer (atomic reservation)', async (t) => {
+  const { ctx, taskStore, dir, reviewerLaunches } = await compose(t, {
+    reviewerLaunchDelay: 50,
+    reviewerSessionId: (n) => `sess-rv-${n}`,
+  });
+  const { task, change } = await governedReadyTask(ctx, taskStore, dir);
+  // Land in PREFLIGHT with the task in_review and NO reviewer bound yet, so
+  // both concurrent controller calls race to launch/bind. (A failing initial
+  // preflight parks the Change in PREFLIGHT without a reviewer.)
+  const result = await dispatchGovernedSuccess(ctx, taskStore, dir, change, { preflight: ['FAIL: build'] });
+  assert.equal(result.status, 'in_review');
+  assert.equal((await ctx.changeControl.get(change.id)).state, 'PREFLIGHT');
+  assert.equal(reviewerLaunches(), 0);
+
+  const [a, b] = await Promise.all([
+    ctx.taskChangeControl.runGovernedSdlc(task.id, { controllerPreflightOverride: ['pass:build'] }),
+    ctx.taskChangeControl.runGovernedSdlc(task.id, { controllerPreflightOverride: ['pass:build'] }),
+  ]);
+  assert.equal(a.outcome, 'review_pending');
+  assert.equal(b.outcome, 'review_pending');
+  // Atomic/idempotent reservation: both calls resolve to the SAME reviewer
+  // session; exactly one launch, exactly one persisted reviewer binding.
+  assert.equal(reviewerLaunches(), 1, 'concurrent controller calls must not launch duplicate reviewers');
+  const reviewers = (await ctx.changeControl.listRoleBindings())
+    .filter((b) => b.changeId === change.id && b.role === 'reviewer');
+  assert.equal(reviewers.length, 1, 'exactly one reviewer binding persisted');
+  assert.equal((await ctx.changeControl.get(change.id)).state, 'REVIEW');
 });
