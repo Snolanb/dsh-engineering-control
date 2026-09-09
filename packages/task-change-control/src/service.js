@@ -244,7 +244,9 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
               return userGuard(input);
             }
           : integrationGuard,
-        completionHook: async (taskId, result, { worker, sessionId } = {}) => {
+        completionHook: /** @type {(taskId: string, result: any, opts?: { worker?: string, sessionId?: string }) => Promise<any>} */ (async function completionHook(taskId, result, opts) {
+          const worker = opts?.worker;
+          const sessionId = opts?.sessionId;
           // The hook receives the monitor result shape (result_summary, files_changed,
           // tests_run, remaining_blockers) plus optional sessionId from the launcher.
           // completeGovernedTask performs the authoritative transition: validates lease,
@@ -264,19 +266,19 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
             remaining_blockers: Array.isArray(result.remaining_blockers) ? result.remaining_blockers : [],
             criteria: Array.isArray(result.criteria)
               ? result.criteria
-              : acceptanceCriteria.map((c) => ({ id: c, satisfied: true })),
+              : acceptanceCriteria.map((/** @type {string} */ c) => ({ id: c, satisfied: true })),
             deviations: [],
             workerChecks: [],
             controllerPreflight: [],
             summary: result.result_summary ?? '',
             ...(result || {}),
           };
-          return api.completeGovernedTask(taskId, {
-            sessionId: sessionId ?? worker,
-            worker,
+          return api.completeGovernedTask(taskId, /** @type {{ sessionId: string, worker: string, proof: any }} */ ({
+            sessionId: /** @type {string} */ (sessionId ?? worker ?? ''),
+            worker: /** @type {string} */ (worker ?? ''),
             proof,
-          });
-        },
+          }));
+        }),
       });
     },
 
