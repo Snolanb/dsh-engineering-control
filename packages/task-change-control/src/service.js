@@ -25,8 +25,8 @@ function unavailable(detail) {
 
 /**
  * Minimal typed views of the two domain services this package depends on.
- * @typedef {{ get: (id: string) => any, update: (id: string, patch: any) => Promise<any>, updateIf: (id: string, expected: any, patch: any) => any, complete?: (id: string, result: object, options?: any) => any, createDispatcher: (options?: any) => any, createWorkerLauncher?: (options?: any) => any, createReviewerLauncher?: (options?: any) => any }} TaskOrchestratorApi
- * @typedef {{ get: (id: string) => Promise<any>, findByWorkItem: (system: string, id: string) => Promise<any>, findOrCreateForWorkItem: (input: { system: string, id: string, change: object }) => Promise<any>, resolveRole: (changeId: string, sessionId: string) => Promise<string>, getBinding: (changeId: string, sessionId: string) => Promise<any>, getBindingSync: (changeId: string, sessionId: string) => any, getBindingFromDisk: (changeId: string, sessionId: string) => any, listByWorkItem: (system: string, id: string) => Promise<any[]>, listRoleBindings: () => Promise<any[]>, status: (changeId: string) => Promise<any>, appendAudit: (event: any) => Promise<any>, submitProof: (changeId: string, proof: any, expected?: { sessionId?: string, expectedWorker?: string }) => Promise<any>, bindRole: (changeId: string, sessionId: string, role: string, opts?: any) => Promise<any>, submitReview: (changeId: string, review: any, opts: any) => Promise<any>, runPreflight: (changeId: string, input?: any) => Promise<any>, history: (changeId?: string) => Promise<any[]>, getGovernanceMode?: (scope: { projectId?: string|null, workspace?: string|null }) => Promise<string>, unbindRole: (changeId: string, sessionId: string, opts?: any) => Promise<any>, transition: (changeId: string, toState: string, opts?: any) => Promise<any> }} ChangeControlApi
+ * @typedef {{ get: (id: string) => any, update: (id: string, patch: any) => Promise<any>, updateIf: (id: string, expected: any, patch: any) => any, complete?: (id: string, result: object, options?: any) => any, createDispatcher: (options?: any) => any, createWorkerLauncher?: (options?: any) => any, createReviewerLauncher?: (options?: any) => any, claim?: (id: string, worker: string, options?: any) => any, start?: (id: string, worker: string, options?: any) => any, release?: (id: string, worker: string, options?: any) => any }} TaskOrchestratorApi
+ * @typedef {{ get: (id: string) => Promise<any>, findByWorkItem: (system: string, id: string) => Promise<any>, findOrCreateForWorkItem: (input: { system: string, id: string, change: object }) => Promise<any>, resolveRole: (changeId: string, sessionId: string) => Promise<string>, getBinding: (changeId: string, sessionId: string) => Promise<any>, getBindingSync: (changeId: string, sessionId: string) => any, getBindingFromDisk: (changeId: string, sessionId: string) => any, listByWorkItem: (system: string, id: string) => Promise<any[]>, listRoleBindings: () => Promise<any[]>, status: (changeId: string) => Promise<any>, appendAudit: (event: any) => Promise<any>, submitProof: (changeId: string, proof: any, expected?: { sessionId?: string, expectedWorker?: string }) => Promise<any>, bindRole: (changeId: string, sessionId: string, role: string, opts?: any) => Promise<any>, submitReview: (changeId: string, review: any, opts: any) => Promise<any>, submitRepair?: (changeId: string, repair: object, opts?: any) => Promise<any>, runPreflight: (changeId: string, input?: any) => Promise<any>, history: (changeId?: string) => Promise<any[]>, getGovernanceMode?: (scope: { projectId?: string|null, workspace?: string|null }) => Promise<string>, unbindRole: (changeId: string, sessionId: string, opts?: any) => Promise<any>, transition: (changeId: string, toState: string, opts?: any) => Promise<any> }} ChangeControlApi
  * @param {object} deps
  * @param {() => TaskOrchestratorApi | undefined} deps.taskOrchestrator accessor (may be absent)
  * @param {() => ChangeControlApi | undefined} deps.changeControl accessor (may be absent)
@@ -297,11 +297,30 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
             summary: result.result_summary ?? '',
             ...(result || {}),
           };
-          return api.completeGovernedTask(taskId, /** @type {{ sessionId: string, worker: string, proof: any }} */ ({
+          const completed = await api.completeGovernedTask(taskId, /** @type {{ sessionId: string, worker: string, proof: any }} */ ({
             sessionId: /** @type {string} */ (sessionId ?? worker ?? ''),
             worker: /** @type {string} */ (worker ?? ''),
             proof,
           }));
+          // T-H5 PRODUCTION TRIGGER: a governed worker success auto-advances
+          // the deterministic preflight → REVIEW + independent reviewer
+          // launch/bind. The controller is resumable: preflight_failed /
+          // review_pending / trigger_failed all leave the task in_review with
+          // the Change at the last reached stage — a re-invocation continues
+          // from persisted state. A trigger failure must never undo the
+          // governed completion that already converged (fail-soft + audit).
+          try {
+            const advance = await api.runGovernedSdlc(taskId, {});
+            return { ...completed, sdlc: advance };
+          } catch (/** @type {any} */ error) {
+            try {
+              const link = await requireChange().findByWorkItem(WORK_ITEM_SYSTEM, taskId);
+              if (link) {
+                await requireChange().appendAudit({ kind: 'review_orchestration', changeId: link.id, action: 'sdlc_trigger_failed', detail: error?.message ?? String(error) });
+              }
+            } catch { /* audit is best-effort; the trigger must not throw */ }
+            return { ...completed, sdlc: { outcome: 'trigger_failed', error: error?.message ?? String(error) } };
+          }
         }),
       });
     },
@@ -659,11 +678,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         }
         const reviewCount = /** @type {number} */ (options.maxRepairRounds ?? 3);
         const attemptsSeen = Array.isArray(status?.attempts) ? status.attempts.length : 0;
-        // "Repair rounds" = every extra attempt beyond the initial one
-        // (submission, then one per repair cycle). The escalation threshold
-        // is comparisons against RETRIES ONLY — never the baseline review.
-        const repairsDone = Math.max(0, attemptsSeen - 1);
-        const escalate = options.verdict === 'fail' && repairsDone >= reviewCount;
+        const escalate = options.verdict === 'fail' && repairRoundsExhausted(attemptsSeen, reviewCount);
         // Pre-validate EVERYTHING that could make submitReview throw BEFORE
         // touching the task at all. This matters because a terminal task
         // status (done/failed/...) is irreversible, whereas a Change left in
@@ -765,6 +780,170 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
      */
     launchReviewer(taskId, options = {}) {
       return launchReviewerForTask(requireTask, requireChange, requireTaskId, taskId, options);
+    },
+
+    /**
+     * T-H5 — the production governed SDLC controller.
+     *
+     * One explicit controller-owned lifecycle over the existing governed
+     * operations. The automatic production trigger is the dispatcher
+     * completionHook (governed worker success → this method with no verdict);
+     * verdict data arrives by re-invocation (host-observed structured
+     * verdict, or a review already submitted through Change Control's
+     * reviewer tools, which this method converges).
+     *
+     * Stage traversal:
+     *   PREFLIGHT → deterministic preflight → REVIEW + independent reviewer
+     *   launch/bind → verdict:
+     *     pass → APPROVED + task done (terminal)
+     *     fail → REPAIR + task changes_requested → repair worker routing
+     *     (Task Orchestrator claim/start + governance-bound worker session +
+     *     submitRepair claiming the unresolved finding IDs + governed
+     *     completion) → repeat preflight/review
+     *   maxRepairRounds exhaustion → escalation: task failed, the Change is
+     *   left in REPAIR for human disposition (the existing policy).
+     *
+     * Authority boundaries are preserved: the controller owns no domain
+     * state — every loop iteration re-reads the persisted (task, Change)
+     * pair, so operations are idempotent and resumable after a restart, and
+     * the reviewer never receives a task claim/lease merely by being
+     * launched. No model-facing bind/create/transition surface is added
+     * (tools.js is unchanged; the model-facing surface stays at two tools).
+     *
+     * @param {string} taskId
+     * @param {{ maxRepairRounds?: number,
+     *   controllerPreflightOverride?: string[],
+     *   verdict?: { verdict: 'pass'|'fail', findings?: object[], sessionId?: string },
+     *   worker?: string,
+     *   workerLauncher?: object,
+     *   repairProof?: object,
+     *   repairFindings?: object[],
+     *   repairClaim?: string,
+     *   leaseSeconds?: number }} [options]
+     * @returns {Promise<{ outcome: string, [key: string]: any }>}
+     */
+    runGovernedSdlc(taskId, options = {}) {
+      const t = requireTask();
+      const c = requireChange();
+      requireTaskId(taskId);
+      const maxRepairRounds = options.maxRepairRounds ?? 3;
+      // The verdict is one-shot per call: a repair loop that re-enters the
+      // REVIEW stage must never re-settle the same verdict.
+      let verdict = options.verdict && (options.verdict.verdict === 'pass' || options.verdict.verdict === 'fail')
+        ? options.verdict
+        : null;
+      return (async () => {
+        let iterations = 0;
+        while (true) {
+          if (++iterations > maxRepairRounds * 3 + 8) {
+            return { outcome: 'stuck', taskId, detail: 'controller loop exceeded its round bound' };
+          }
+          const task = await Promise.resolve(t.get(taskId));
+          if (!task) throw Object.assign(new Error(`task not found: ${taskId}`), { code: 'TASK_NOT_FOUND' });
+          // findByWorkItem excludes terminal Changes; fall back to any
+          // linkage record so a converged (APPROVED) task still resolves its
+          // Change on re-entry — the terminal checks below handle it.
+          let change = await c.findByWorkItem(WORK_ITEM_SYSTEM, taskId);
+          if (!change) {
+            const all = typeof c.listByWorkItem === 'function' ? await c.listByWorkItem(WORK_ITEM_SYSTEM, taskId) : [];
+            change = Array.isArray(all) && all.length > 0 ? all[all.length - 1] : null;
+          }
+          if (!change) throw Object.assign(new Error(`no Change linked to task ${taskId}`), { code: 'WORK_ITEM_NOT_LINKED' });
+          const state = change.state;
+
+          // ── Terminal convergence ──
+          if (state === 'APPROVED') {
+            if (task.status !== 'done') {
+              const converged = t.updateIf(taskId, { status: 'in_review' }, { status: 'done' });
+              if (converged === null) continue; // moved concurrently — re-read
+              await c.appendAudit({ kind: 'review_orchestration', changeId: change.id, action: 'review_pass_converged' });
+            }
+            return { outcome: 'approved', taskId, changeId: change.id };
+          }
+          if (task.status === 'failed' && state === 'REPAIR' && await hasEscalationAudit(c, change.id)) {
+            return { outcome: 'escalated', taskId, changeId: change.id };
+          }
+          // Foreign drift (a human blocked/cancelled the task mid-flight):
+          // never mutate here — reconcileTaskChange / a human disposes.
+          if (task.status === 'blocked' || task.status === 'cancelled') {
+            return { outcome: 'lifecycle_mismatch', taskId, changeId: change.id, taskStatus: task.status, changeState: state };
+          }
+
+          if (state === 'PREFLIGHT') {
+            if (task.status !== 'in_review') {
+              return { outcome: 'lifecycle_mismatch', taskId, changeId: change.id, taskStatus: task.status, changeState: state };
+            }
+            // Deterministic preflight + reviewer launch/bind (reviewer
+            // sessions never touch task claim/lease).
+            const rv = await api.runGovernedReview(taskId, { controllerPreflightOverride: options.controllerPreflightOverride });
+            if (rv.outcome === 'preflight_failed') {
+              return { outcome: 'preflight_failed', taskId, changeId: change.id };
+            }
+            continue; // Change is now REVIEW with a reviewer bound
+          }
+
+          if (state === 'REVIEW') {
+            if (task.status !== 'in_review') {
+              return { outcome: 'lifecycle_mismatch', taskId, changeId: change.id, taskStatus: task.status, changeState: state };
+            }
+            // A concurrent reviewer may have settled the review through
+            // Change Control's reviewer tools (REVIEW → APPROVED | REPAIR).
+            // Re-read before settling.
+            const live = await c.get(change.id);
+            if (live.state === 'APPROVED') {
+              if (task.status !== 'done') {
+                const converged = t.updateIf(taskId, { status: 'in_review' }, { status: 'done' });
+                if (converged === null) continue;
+                await c.appendAudit({ kind: 'review_orchestration', changeId: change.id, action: 'review_pass_converged' });
+              }
+              return { outcome: 'approved', taskId, changeId: change.id };
+            }
+            if (live.state === 'REPAIR') {
+              // Reviewer-submitted fail verdict: settle the task side
+              // (mirror of applyReviewOutcome's fail path minus the submit),
+              // honoring the same escalation policy.
+              const settled = await settleReviewedFailure(taskId, change.id, t, c, maxRepairRounds);
+              if (settled !== null) {
+                if (settled.outcome === 'task_update_race') continue; // re-read
+                return settled; // 'escalated'
+              }
+              // fall through: task is now changes_requested — route repair
+            } else {
+              // Still REVIEW: the verdict must arrive as data.
+              let reviewer = await currentReviewerBinding(c, change.id);
+              if (!reviewer) {
+                // Reviewer session lost (crash between transition and
+                // bind/launch): resume the stage, which launches a fresh
+                // reviewer without re-running preflight.
+                const rv = await api.runGovernedReview(taskId, { controllerPreflightOverride: options.controllerPreflightOverride });
+                if (rv.outcome === 'preflight_failed') {
+                  return { outcome: 'preflight_failed', taskId, changeId: change.id };
+                }
+                reviewer = (await currentReviewerBinding(c, change.id)) ?? { sessionId: rv.sessionId };
+              }
+              if (!verdict) {
+                return { outcome: 'review_pending', taskId, changeId: change.id, sessionId: reviewer.sessionId };
+              }
+              const settled = await api.applyReviewOutcome(taskId, {
+                sessionId: verdict.sessionId ?? reviewer.sessionId,
+                verdict: verdict.verdict,
+                findings: verdict.findings,
+                maxRepairRounds,
+              });
+              verdict = null; // consumed — the next round needs fresh data
+              if (settled.outcome === 'approved') return { outcome: 'approved', taskId, changeId: change.id };
+              if (settled.outcome === 'escalated') return { outcome: 'escalated', taskId, changeId: change.id, attempts: settled.attempts };
+              if (settled.outcome === 'task_update_race' || settled.outcome === 'invalid_state') continue;
+              // 'repair' → Change REPAIR + task changes_requested — route below
+            }
+          }
+
+          // REPAIR stage: persisted REPAIR entry, or just-settled REVIEW.
+          const routed = await routeRepairAttempt({ t, c, api, taskId, change, options });
+          if (routed.stopped) return routed.result;
+          continue; // repair submitted + governed completion converged
+        }
+      })();
     },
 
     /**
@@ -941,6 +1120,231 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
   return Object.freeze(api);
 }
 
+
+/**
+ * The service-facade slice the T-H5 repair routing needs.
+ * @typedef {{ prepareRepairAttempt: (taskId: string) => Promise<any>, completeGovernedTask: (taskId: string, options: { sessionId: string, worker: string, proof: object }) => Promise<any> }} SdlcApiView
+ */
+
+/**
+ * "Repair rounds" = every extra implementation attempt beyond the initial
+ * one (submission, then one per repair cycle). The escalation threshold
+ * compares RETRIES ONLY — never the baseline review. Shared by
+ * applyReviewOutcome and the T-H5 controller so both settlement paths
+ * honor the same escalation policy.
+ * @param {number} attemptsSeen
+ * @param {number} maxRepairRounds
+ */
+function repairRoundsExhausted(attemptsSeen, maxRepairRounds) {
+  return Math.max(0, attemptsSeen - 1) >= maxRepairRounds;
+}
+
+/**
+ * Whether the Change audit already records an escalation (T-H5 terminal
+ * convergence check — an escalated Change stays in REPAIR for human
+ * disposition; re-invocations must converge, not re-route).
+ * @param {ChangeControlApi} c
+ * @param {string} changeId
+ */
+async function hasEscalationAudit(c, changeId) {
+  const history = await c.history(changeId);
+  return Array.isArray(history)
+    && history.some((/** @type {any} */ e) => e.kind === 'review_orchestration' && e.action === 'escalated');
+}
+
+/**
+ * The most recent reviewer role binding on a Change (repair rounds reuse
+ * the same reviewer session), or null when none exists.
+ * @param {ChangeControlApi} c
+ * @param {string} changeId
+ */
+async function currentReviewerBinding(c, changeId) {
+  const all = await c.listRoleBindings();
+  const mine = all.filter((/** @type {any} */ b) => b.changeId === changeId && b.role === 'reviewer');
+  return mine.length > 0 ? mine[mine.length - 1] : null;
+}
+
+/**
+ * T-H5 — task-side settlement of a fail review that has ALREADY been
+ * submitted through Change Control (REVIEW → REPAIR happened without the
+ * controller settling the task). Mirrors applyReviewOutcome's fail path
+ * minus the submitReview: escalation on the same policy, otherwise
+ * changes_requested. Returns a result object to STOP (escalated /
+ * task_update_race), or null to CONTINUE into repair routing.
+ * @param {string} taskId
+ * @param {string} changeId
+ * @param {TaskOrchestratorApi} t
+ * @param {ChangeControlApi} c
+ * @param {number} maxRepairRounds
+ * @returns {Promise<{ outcome: string, [key: string]: any } | null>}
+ */
+async function settleReviewedFailure(taskId, changeId, t, c, maxRepairRounds) {
+  const task = await Promise.resolve(t.get(taskId));
+  if (!task || task.status !== 'in_review') return null; // already settled by a data-path settlement
+  const status = await c.status(changeId);
+  const attemptsSeen = Array.isArray(status?.attempts) ? status.attempts.length : 0;
+  if (repairRoundsExhausted(attemptsSeen, maxRepairRounds)) {
+    const failedTask = t.updateIf(taskId, { status: 'in_review' }, { status: 'failed', result_summary: 'escalated to failed after repair threshold' });
+    if (!failedTask) return { outcome: 'task_update_race', taskId, changeId };
+    await c.appendAudit({
+      kind: 'review_orchestration', changeId, action: 'escalated',
+      revision: status?.revision ?? null, attempts: attemptsSeen,
+      note: 'repair attempts exhausted (reviewer-submitted review); change left in REPAIR for human disposition',
+    });
+    return { outcome: 'escalated', taskId, changeId, attempts: attemptsSeen };
+  }
+  const updated = t.updateIf(taskId, { status: 'in_review' }, { status: 'changes_requested' });
+  if (!updated) return { outcome: 'task_update_race', taskId, changeId };
+  await c.appendAudit({
+    kind: 'review_orchestration', changeId, action: 'review_fail_settled',
+    revision: status?.revision ?? null,
+    note: 'fail review was submitted through Change Control; task side settled by the SDLC controller',
+  });
+  return null; // task is now changes_requested — route repair
+}
+
+/**
+ * T-H5 — Repair routing. Pushes a REPAIR-stage task back to ready
+ * (idempotent prepareRepairAttempt), then — when a repair worker is
+ * supplied — claims/starts it through the Task Orchestrator facade
+ * (concrete routing authority), launches the repair worker through the
+ * governance binding wrapper (worker role, run identity), waits, submits
+ * the repair CLAIMING THE UNRESOLVED FINDING IDs (Change Control is
+ * authoritative for the claims; the store rejects unknown IDs and
+ * missing blocking claims), and converges the governed completion.
+ * Without a supplied worker, stops at the resumable repair_routed
+ * boundary.
+ *
+ * @param {object} args
+ * @param {TaskOrchestratorApi} args.t
+ * @param {ChangeControlApi} args.c
+ * @param {SdlcApiView} args.api the service facade (prepareRepairAttempt / completeGovernedTask)
+ * @param {string} args.taskId
+ * @param {{ id: string }} args.change
+ * @param {{ worker?: string, workerLauncher?: object, repairProof?: object,
+ *   repairFindings?: object[], repairClaim?: string, leaseSeconds?: number }} args.options
+ * @returns {Promise<{ stopped: true, result: { outcome: string, [key: string]: any } } | { stopped: false }>}
+ * `stopped: false` means the repair was submitted and governed completion
+ * converged — the caller loops back to PREFLIGHT.
+ */
+async function routeRepairAttempt({ t, c, api, taskId, change, options }) {
+  const task = await Promise.resolve(t.get(taskId));
+  if (task.status === 'changes_requested') {
+    await api.prepareRepairAttempt(taskId); // → ready (CAS-protected)
+  } else if (task.status !== 'ready') {
+    return {
+      stopped: true,
+      result: { outcome: 'lifecycle_mismatch', taskId, changeId: change.id, taskStatus: task.status, changeState: 'REPAIR' },
+    };
+  }
+  if (typeof t.claim !== 'function' || typeof t.start !== 'function' || typeof t.release !== 'function') {
+    throw Object.assign(new Error('taskOrchestrator facade does not expose claim/start/release — repair routing unavailable'), { code: 'ROUTING_UNAVAILABLE' });
+  }
+  if (typeof c.submitRepair !== 'function') {
+    throw Object.assign(new Error('changeControl facade does not expose submitRepair — repair routing unavailable'), { code: 'SUBMIT_REPAIR_UNAVAILABLE' });
+  }
+  const statusNow = await c.status(change.id);
+  const openFindings = Array.isArray(statusNow?.openFindings) ? statusNow.openFindings : [];
+  const revision = statusNow?.revision ?? null;
+  if (!options.worker || !options.workerLauncher || options.repairProof == null) {
+    // Resumable boundary: the repair stage is prepped; a re-invocation
+    // (possibly after a restart, possibly with the repair worker and its
+    // structured proof) continues.
+    return {
+      stopped: true,
+      result: {
+        outcome: 'repair_routed', taskId, changeId: change.id,
+        openFindingIds: openFindings.map((/** @type {any} */ f) => f.id),
+        revision,
+        missing: options.worker && options.workerLauncher ? 'repairProof' : 'repairWorker',
+      },
+    };
+  }
+  const runId = options.worker;
+  const claim = await Promise.resolve(t.claim(taskId, runId, { lease_seconds: options.leaseSeconds ?? 600, actor: 'sdlc-controller' }));
+  if (!claim || claim.claimed !== true) {
+    return { stopped: true, result: { outcome: 'repair_claim_failed', taskId, changeId: change.id, reason: claim?.reason } };
+  }
+  await Promise.resolve(t.start(taskId, runId, { actor: 'sdlc-controller' }));
+  const liveTask = await Promise.resolve(t.get(taskId));
+  const governedLauncher = createBindingLauncher(options.workerLauncher, c, WORK_ITEM_SYSTEM);
+  let handle;
+  try {
+    handle = await governedLauncher.launch({
+      task: liveTask,
+      spec: { mode: 'session', prompt: buildRepairPrompt(taskId, change.id, revision, openFindings) },
+      worker: runId,
+    });
+  } catch (/** @type {any} */ error) {
+    await Promise.resolve(t.release(taskId, runId, { actor: 'sdlc-controller' })).catch(() => {});
+    return { stopped: true, result: { outcome: 'repair_launch_failed', taskId, changeId: change.id, error: error?.message ?? String(error) } };
+  }
+  // Governed hold (T-H3): keep the worker binding through wait so the
+  // governed completion can validate the real session identity; release is
+  // idempotent and safe to race with the abnormal paths below.
+  // Repair claims: the UNRESOLVED FINDING IDs (blocking findings require
+  // 'fixed'; explicit worker-supplied claims pass through untouched).
+  const claims = Array.isArray(options.repairFindings) && options.repairFindings.length > 0
+    ? options.repairFindings
+    : openFindings.map((/** @type {any} */ f) => ({ findingId: f.id, status: 'fixed', claim: String(options.repairClaim ?? 'repaired') }));
+  // Governed hold (T-H3): keep the worker binding through wait so the
+  // governed completion can validate the real session identity. Submission
+  // and completion run UNDER THE HOLD (before the release in finally) —
+  // completeGovernedTask requires the live binding.
+  handle._governedHold?.();
+  let settle;
+  let submitError = null;
+  try {
+    settle = await handle.wait?.();
+    if (settle && settle.exitCode === 0 && !settle.error) {
+      try {
+        await c.submitRepair(change.id, { findings: claims, proof: options.repairProof }, { workerId: runId });
+        // Governed completion converges the task side (PREFLIGHT idempotent
+        // fast path: the stored repair proof matches this payload).
+        await api.completeGovernedTask(taskId, { sessionId: handle.sessionId, worker: runId, proof: options.repairProof });
+      } catch (/** @type {any} */ error) {
+        submitError = error;
+      }
+    }
+  } finally {
+    await handle._governedRelease?.();
+  }
+  if (submitError !== null) {
+    // A failed submission/leave would strand the task running under our
+    // claim: release it so a re-invocation can re-claim (resumable), then
+    // surface the domain error.
+    await Promise.resolve(t.release(taskId, runId, { actor: 'sdlc-controller' })).catch(() => {});
+    throw submitError;
+  }
+  if (!settle || settle.exitCode !== 0 || settle.error) {
+    // Repair worker did not complete: release the lease so a re-invocation
+    // can re-claim — the Change stays in REPAIR (resumable).
+    await Promise.resolve(t.release(taskId, runId, { actor: 'sdlc-controller' })).catch(() => {});
+    return {
+      stopped: true,
+      result: { outcome: 'repair_failed', taskId, changeId: change.id, sessionId: handle.sessionId, detail: settle?.error ?? `worker exited ${settle?.exitCode}` },
+    };
+  }
+  return { stopped: false };
+}
+
+/**
+ * Minimal repair context handed to the repair worker (finding IDs first).
+ * @param {string} taskId
+ * @param {string} changeId
+ * @param {string|null} revision
+ * @param {Array<object>} openFindings
+ */
+function buildRepairPrompt(taskId, changeId, revision, openFindings) {
+  const lines = openFindings.map((/** @type {any} */ f) =>
+    `- ${f.id} [${f.severity}] ${f.location ?? ''}: ${f.problem ?? ''} (required: ${f.requiredOutcome ?? ''})`);
+  return [
+    `You are the repair worker for task ${taskId}.`,
+    `Governed Change ${changeId} failed independent review at revision ${revision ?? 'unknown'}.`,
+    'Address every unresolved finding below, stay within the Change scope, and submit the repair claiming each finding ID:',
+    lines.length > 0 ? lines.join('\n') : '(no unresolved findings recorded)',
+  ].join('\n');
+}
 
 /**
  * Internal reviewer launch. Factored as a free function so runGovernedReview
