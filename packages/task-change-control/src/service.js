@@ -597,11 +597,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
           // protected paths, and requiredChecks are all evaluated there.
           const statusNow = await c.status(change.id);
           const proof = statusNow?.proof ?? null;
-          const checkResults = (options.controllerPreflightOverride ?? proof?.controllerPreflight ?? []).map((/** @type {string} */ entry) => {
-            const name = String(entry).trim();
-            const okLabel = /^(pass|ok)([:.\s]|$)/i.test(name);
-            return { name, passed: okLabel, exitCode: okLabel ? 0 : 1 };
-          });
+          const checkResults = (options.controllerPreflightOverride ?? proof?.controllerPreflight ?? []).map((/** @type {string} */ entry) => parseControllerPreflightEntry(entry));
           let preflightPassed;
           try {
             await c.runPreflight(change.id, {
@@ -640,7 +636,13 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
           const launched = await launchReviewerForTask(requireTask, requireChange, requireTaskId, taskId);
           sessionId = launched.sessionId;
         }
-        if (change.state !== 'REVIEW') {
+        // A successful store runPreflight is authoritative for the state
+        // move: under a real preflight policy the store itself performed
+        // PREFLIGHT→REVIEW. Re-read the live state and transition ONLY in
+        // the NO_POLICY fallback, where the store did not move it — exactly
+        // one PREFLIGHT→REVIEW transition, never a double move.
+        const liveAfterPreflight = await c.get(change.id);
+        if (liveAfterPreflight.state === 'PREFLIGHT') {
           await c.transition(change.id, 'REVIEW', { actor: 'review-orchestration' });
         }
         return { outcome: 'review_started', sessionId, changeId: change.id };
@@ -1125,6 +1127,31 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
  * The service-facade slice the T-H5 repair routing needs.
  * @typedef {{ prepareRepairAttempt: (taskId: string) => Promise<any>, completeGovernedTask: (taskId: string, options: { sessionId: string, worker: string, proof: object }) => Promise<any> }} SdlcApiView
  */
+
+/**
+ * Parse one controller preflight entry into its check identity and its
+ * status, encoded separately:
+ *   'pass:build' / 'ok:build' / 'PASS: build' → { name: 'build', passed: true,  exitCode: 0 }
+ *   'fail:build' / 'FAIL: build'              → { name: 'build', passed: false, exitCode: 1 }
+ *   'ok' / 'pass' (bare status markers)        → { name: <entry>,  passed: true,  exitCode: 0 }
+ *   anything unprefixed or empty               → { name: <entry|'ok'>, passed: false, exitCode: 1 }
+ * The name is the CANONICAL BARE required-check name (any pass:/ok:/fail:
+ * prefix stripped) so it matches the host preflightPolicy.requiredChecks
+ * entry exactly. Unprefixed/empty entries fail closed — the same rule the
+ * NO_POLICY default gate applies.
+ * @param {string} entry
+ * @returns {{ name: string, passed: boolean, exitCode: number }}
+ */
+function parseControllerPreflightEntry(entry) {
+  const trimmed = String(entry ?? '').trim();
+  const match = /^(pass|ok|fail)(?:[:.\s](.*))?$/i.exec(trimmed);
+  if (match) {
+    const passed = match[1].toLowerCase() !== 'fail';
+    const name = (match[2] ?? '').trim() || trimmed || 'ok';
+    return { name, passed, exitCode: passed ? 0 : 1 };
+  }
+  return { name: trimmed || 'ok', passed: false, exitCode: 1 };
+}
 
 /**
  * "Repair rounds" = every extra implementation attempt beyond the initial
