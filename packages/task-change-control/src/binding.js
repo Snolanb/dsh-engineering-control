@@ -52,16 +52,26 @@ export function createBindingLauncher(launcher, changeControl, WORK_ITEM_SYSTEM)
       const unbind = async () => {
         try { await changeControl.unbindRole(change.id, sessionId); } catch { /* audited elsewhere */ }
       };
+      // trackedUnbind: when a completion hook is present (governed dispatch),
+      // the hook runs AFTER wait() resolves but BEFORE unbind fires. This
+      // handle exposes `_governedHold` to prevent the finally-unbind, then
+      // `_governedRelease` to perform it after the hook completes.
+      const trackedUnbind = { pending: false };
       return {
         ...handle,
         sessionId, // pinned to what we bound
         pid: handle.pid ?? null,
         wait: wait
-          ? async () => { try { return await wait(); } finally { await unbind(); } }
+          ? async () => { try { return await wait(); } finally { if (!trackedUnbind.pending) await unbind(); } }
           : undefined,
         terminate: async (signal) => {
-          try { return await (handle.terminate?.(signal) ?? true); } finally { await unbind(); }
+          try { return await (handle.terminate?.(signal) ?? true); } finally { if (!trackedUnbind.pending) await unbind(); }
         },
+        // Called BEFORE the completion hook to prevent wait/terminate from
+        // unbinding — keeps the binding alive for completeGovernedTask validation.
+        _governedHold: () => { trackedUnbind.pending = true; },
+        // Called AFTER the completion hook returns to actually remove the binding.
+        _governedRelease: async () => { await unbind(); },
       };
     },
   };

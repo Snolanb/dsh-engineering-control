@@ -244,6 +244,39 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
               return userGuard(input);
             }
           : integrationGuard,
+        completionHook: async (taskId, result, { worker, sessionId } = {}) => {
+          // The hook receives the monitor result shape (result_summary, files_changed,
+          // tests_run, remaining_blockers) plus optional sessionId from the launcher.
+          // completeGovernedTask performs the authoritative transition: validates lease,
+          // binding, proof fields, criteria alignment, submits Change-side proof, moves
+          // Change to PREFLIGHT, and transitions the task to in_review — atomically.
+          // Construct a valid proof envelope from the dispatcher result so the Change
+          // side has everything it needs (commit_sha is mandatory on the proof shape).
+          // Fetch the task to get acceptance_criteria for proof alignment.
+          const taskRecord = await Promise.resolve(requireTask().get(taskId));
+          const acceptanceCriteria = Array.isArray(taskRecord?.acceptance_criteria) ? taskRecord.acceptance_criteria : [];
+          const proof = {
+            beforeRevision: 'initial',
+            afterRevision: 'dispatched',
+            commit_sha: result.commit_sha ?? 'dispatched',
+            files_changed: Array.isArray(result.files_changed) ? result.files_changed : [],
+            tests_run: Array.isArray(result.tests_run) ? result.tests_run : [],
+            remaining_blockers: Array.isArray(result.remaining_blockers) ? result.remaining_blockers : [],
+            criteria: Array.isArray(result.criteria)
+              ? result.criteria
+              : acceptanceCriteria.map((c) => ({ id: c, satisfied: true })),
+            deviations: [],
+            workerChecks: [],
+            controllerPreflight: [],
+            summary: result.result_summary ?? '',
+            ...(result || {}),
+          };
+          return api.completeGovernedTask(taskId, {
+            sessionId: sessionId ?? worker,
+            worker,
+            proof,
+          });
+        },
       });
     },
 

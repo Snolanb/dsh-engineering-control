@@ -115,6 +115,7 @@ export class WorkerDispatcher {
     idFactory = randomUUID,
     clock = () => Date.now(),
     outputLimit = DEFAULT_OUTPUT_LIMIT,
+    completionHook = null,
   } = {}) {
     if (!store || typeof store.list !== 'function') throw new TypeError('a task store is required')
     if (!registry || typeof registry.resolve !== 'function') throw new TypeError('a WorkerSpecRegistry is required')
@@ -130,6 +131,8 @@ export class WorkerDispatcher {
     this.idFactory = idFactory
     this.clock = clock
     this.outputLimit = outputLimit
+    if (completionHook !== null && typeof completionHook !== 'function') throw new TypeError('completionHook must be a function or null')
+    this.completionHook = completionHook
   }
 
   async dispatchOnce({ workerProfile, limit = 1 } = {}) {
@@ -268,6 +271,12 @@ export class WorkerDispatcher {
       return { dispatched: false, reason: 'launch_failed', task: this.store.get(task.id), error: errorText(error), run_id: runId }
     }
 
+    // If a completion hook is configured (governed dispatch), hold the binding
+    // before wait() so the hook can validate session identity via completeGovernedTask.
+    if (this.completionHook) {
+      await handle?._governedHold?.()
+    }
+
     return await this.monitor(task, spec, handle, { runId, worker })
   }
 
@@ -326,7 +335,23 @@ export class WorkerDispatcher {
       const failed = this.store.fail(task.id, result, { worker, actor: this.actor })
       return { dispatched: true, status: 'failed', task: failed, run_id: runId, worker, exit_code: outcome.exitCode, stdout, stderr }
     }
-    const completed = this.store.complete(task.id, result, { worker, actor: this.actor })
+    let completed
+    const completionOpts = { worker, actor: this.actor }
+    // Pin the sessionId from the launcher handle into the completion context
+    // so a governed completion hook can validate the actual session identity.
+    if (handle && typeof handle.sessionId === 'string') {
+      completionOpts.sessionId = handle.sessionId
+    }
+    if (this.completionHook) {
+      try {
+        completed = await this.completionHook(task.id, result, completionOpts)
+      } finally {
+        // Release the binding after the hook completes (success or failure).
+        await handle?._governedRelease?.()
+      }
+    } else {
+      completed = this.store.complete(task.id, result, { worker, actor: this.actor })
+    }
     return { dispatched: true, status: 'in_review', task: completed, run_id: runId, worker, exit_code: outcome.exitCode, stdout, stderr }
   }
 }

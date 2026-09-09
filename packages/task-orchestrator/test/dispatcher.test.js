@@ -169,6 +169,89 @@ test('session launcher classifies a terminal model error as failure', async () =
   assert.match(result.stderr, /provider failed/)
 })
 
+test('completionHook routes governed success through the hook instead of raw store.complete', async t => {
+  const f = fixture(); t.after(() => f.cleanup())
+  const task = readyTask(f)
+  let hookCalled = false
+  let hookTaskId = null
+  let hookOpts = null
+  const hook = async (taskId, result, opts = {}) => {
+    hookCalled = true
+    hookTaskId = taskId
+    hookOpts = opts
+    // Delegate to the store so the task reaches in_review
+    return f.store.complete(taskId, result, { worker: opts.worker, actor: 'test-dispatcher' })
+  }
+  const launcherWithSession = {
+    async launch() { return { sessionId: 'sess-123', wait: async () => ({ exitCode: 0, stdout: 'done', stderr: '' }), async terminate() {} } }
+  }
+  const dispatcher = new WorkerDispatcher({
+    store: f.store,
+    registry: f.registry,
+    idFactory: () => 'run-hook',
+    actor: 'test-dispatcher',
+    preflight: async () => ({ ok: true, spec: f.registry.get('worker') }),
+    launcher: launcherWithSession,
+    completionHook: hook,
+  })
+  const result = await dispatcher.dispatchOnce({ workerProfile: 'worker' })
+  assert.equal(result.status, 'in_review')
+  assert.equal(result.task.status, 'in_review')
+  assert.equal(hookCalled, true, 'completionHook must be invoked on governed success')
+  assert.equal(hookTaskId, task.id)
+  assert.equal(hookOpts.sessionId, 'sess-123', 'sessionId must be threaded from launcher handle')
+  assert.equal(hookOpts.worker, 'worker:run-hook')
+})
+
+test('raw store.complete is used when completionHook is absent (backwards compatibility)', async t => {
+  const f = fixture(); t.after(() => f.cleanup())
+  const task = readyTask(f)
+  let rawCompleteCalled = false
+  // Wrap the store so complete() tracks the call but delegates to the real store
+  const store = {
+    list: (...a) => f.store.list(...a),
+    create: (...a) => f.store.create(...a),
+    get: (...a) => f.store.get(...a),
+    update: (...a) => f.store.update(...a),
+    updateIf: (...a) => f.store.updateIf(...a),
+    delete: (...a) => f.store.delete(...a),
+    claim: (...a) => f.store.claim(...a),
+    release: (...a) => f.store.release(...a),
+    renewLease: (...a) => f.store.renewLease(...a),
+    start: (...a) => f.store.start(...a),
+    complete(id, result, opts) { rawCompleteCalled = true; return f.store.complete(id, result, opts); },
+    fail: (...a) => f.store.fail(...a),
+    block: (...a) => f.store.block(...a),
+    unblock: (...a) => f.store.unblock(...a),
+    requestChanges: (...a) => f.store.requestChanges(...a),
+    addDependency: (...a) => f.store.addDependency(...a),
+    removeDependency: (...a) => f.store.removeDependency(...a),
+    addTaskLink: (...a) => f.store.addTaskLink(...a),
+    removeTaskLink: (...a) => f.store.removeTaskLink(...a),
+    listTaskLinks: (...a) => f.store.listTaskLinks(...a),
+    setCriterionResults: (...a) => f.store.setCriterionResults(...a),
+    addChild: (...a) => f.store.addChild(...a),
+    listChildren: (...a) => f.store.listChildren(...a),
+    listDescendants: (...a) => f.store.listDescendants(...a),
+    readyToRun: (...a) => f.store.readyToRun(...a),
+    blockedByDependencies: (...a) => f.store.blockedByDependencies(...a),
+    events: (...a) => f.store.events(...a),
+    subscribe: (...a) => f.store.subscribe(...a),
+    close: () => f.store.close(),
+  }
+  const dispatcher = new WorkerDispatcher({
+    store,
+    registry: f.registry,
+    idFactory: () => 'run-raw',
+    actor: 'test-dispatcher',
+    preflight: async () => ({ ok: true, spec: f.registry.get('worker') }),
+    launcher: { async launch() { return { wait: async () => ({ exitCode: 0, stdout: 'ok', stderr: '' }) } } },
+  })
+  const result = await dispatcher.dispatchOnce({ workerProfile: 'worker' })
+  assert.equal(result.status, 'in_review')
+  assert.equal(rawCompleteCalled, true, 'raw store.complete is called when no hook is provided')
+})
+
 test('session RPC client sends DSH envelopes and surfaces structured errors', async () => {
   const requests = []
   const rpc = createSessionRpcClient({
