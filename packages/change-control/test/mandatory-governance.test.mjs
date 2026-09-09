@@ -146,7 +146,7 @@ test('required: planner/reviewer remain read-only (role confusion)', async (t) =
   const { ctx, registry } = await compose(t, { registerProvider: 'good', policy: { enabled: true, owner: 'host', projectId: 'proj-A' } });
   registerFakeTools(registry);
   await ctx.changeControl.setGovernanceMode({ projectId: 'proj-A', mode: 'required' });
-  const change = await ctx.changeControl.create({ title: 'x', workItem: { system: 'dsh-task-orchestrator', id: 'task-r' } });
+  const change = await ctx.changeControl.create({ title: 'x', workItem: { system: 'task-orchestrator', id: 'task-r' } });
   await ctx.changeControl.transition(change.id, 'PLANNED', {});
   await ctx.changeControl.transition(change.id, 'READY', {});
   await ctx.changeControl.transition(change.id, 'IMPLEMENTING', {});
@@ -160,7 +160,7 @@ test('required: Change state blocks worker mutation outside IMPLEMENTING/REPAIR'
   const { ctx, registry } = await compose(t, { registerProvider: 'good', policy: { enabled: true, owner: 'host', projectId: 'proj-A' } });
   registerFakeTools(registry);
   await ctx.changeControl.setGovernanceMode({ projectId: 'proj-A', mode: 'required' });
-  const change = await ctx.changeControl.create({ title: 'x', workItem: { system: 'dsh-task-orchestrator', id: 'task-s' } });
+  const change = await ctx.changeControl.create({ title: 'x', workItem: { system: 'task-orchestrator', id: 'task-s' } });
   await ctx.changeControl.bindRole(change.id, 'sess-gov-wride', 'worker');
   const out = await execTool(registry, 'mutator', 'sess-gov-wride', { changeId: change.id });
   assert.ok(out.isError === true || /STATE_NOT_ALLOWED|CHANGE_CONTROL_REQUIRED/.test(asText(out)));
@@ -170,7 +170,7 @@ test('required: legitimate bound worker in IMPLEMENTING can mutate', async (t) =
   const { ctx, registry } = await compose(t, { registerProvider: 'good', policy: { enabled: true, owner: 'host', projectId: 'proj-A' } });
   registerFakeTools(registry);
   await ctx.changeControl.setGovernanceMode({ projectId: 'proj-A', mode: 'required' });
-  const change = await ctx.changeControl.create({ title: 'x', workItem: { system: 'dsh-task-orchestrator', id: 'task-ok' } });
+  const change = await ctx.changeControl.create({ title: 'x', workItem: { system: 'task-orchestrator', id: 'task-ok' } });
   await ctx.changeControl.transition(change.id, 'PLANNED', {});
   await ctx.changeControl.transition(change.id, 'READY', {});
   await ctx.changeControl.transition(change.id, 'IMPLEMENTING', {});
@@ -229,7 +229,7 @@ test('F8: role/state denials under required mode carry [CHANGE_CONTROL_REQUIRED]
   const { ctx, registry } = await compose(t, { registerProvider: 'good' });
   registerFakeTools(registry);
   await ctx.changeControl.setGovernanceMode({ projectId: 'proj-A', mode: 'required' });
-  const change = await ctx.changeControl.create({ title: 'x', workItem: { system: 'dsh-task-orchestrator', id: 'task-f8' } });
+  const change = await ctx.changeControl.create({ title: 'x', workItem: { system: 'task-orchestrator', id: 'task-f8' } });
   await ctx.changeControl.bindRole(change.id, 'sess-gov-plan', 'planner');
   const out = await execTool(registry, 'mutator', 'sess-gov-plan', { changeId: change.id, projectId: 'proj-A' });
   const txt = asText(out);
