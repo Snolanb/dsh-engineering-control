@@ -547,8 +547,8 @@ const taskOrchestrator = Object.freeze({
       launches += 1;
       const sessionId = 'sess-child-' + process.pid + '-' + launches;
       appendFileSync(join(dir, 'reviewer-launches.log'), sessionId + '\\n');
-      // Widen the cross-process race window deliberately.
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      // Widen the cross-process race window deliberately (env-tunable for stress).
+      await new Promise((resolve) => setTimeout(resolve, Number(process.env.TCC_LAUNCH_MS || 200)));
       return { sessionId, wait: async () => ({ exitCode: 0 }), terminate: async () => true };
     },
   }),
@@ -564,10 +564,10 @@ process.stdout.write(JSON.stringify({ outcome: result.outcome, sessionId: result
 `;
 
 /** Spawn one host process driving runGovernedSdlc against the shared store dir. */
-function spawnReviewerProcess(dir, taskId) {
+function spawnReviewerProcess(dir, taskId, { launchMs = 200 } = {}) {
   const child = spawn(process.execPath, ['--input-type=module', '-e', REVIEWER_CHILD_SCRIPT], {
     cwd: PKG_DIR,
-    env: { ...process.env, TCC_DIR: dir, TCC_TASK_ID: taskId },
+    env: { ...process.env, TCC_DIR: dir, TCC_TASK_ID: taskId, TCC_LAUNCH_MS: String(launchMs) },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let stdout = '';
@@ -663,4 +663,61 @@ test('T-H5 PR2-01: a stale claim with no recorded session is taken over with exa
   assert.equal(reviewers.length, 1);
   assert.equal(result.sessionId, reviewers[0].sessionId);
   assert.equal((await ctx.changeControl.get(change.id)).state, 'REVIEW');
+});
+
+
+// ─── T-H5 PR2-02 — stale-claim takeover race (multi-process stress) ────────
+
+test('T-H5 PR2-02: stress — many host processes racing to take over the same stale empty claim launch exactly ONE reviewer', async (t) => {
+  // The pre-fix race: a stale reader reads the claim file and then deletes it
+  // UNCONDITIONALLY; a fresh claim acquired by another process in that window
+  // gets wiped, and the stale reader launches a DUPLICATE reviewer (an orphaned
+  // loser). Each process pair is a coin flip, so run independent trials with
+  // many processes and stop at the FIRST trial that violates the invariant —
+  // exactly ONE reviewer launch, ONE binding, no orphaned loser.
+  const N = 48;             // host processes per trial (more processes, more race pairs)
+  const LAUNCH_MS = 800;    // widen the "fresh claim, no session" window the race targets
+  const MAX_TRIALS = 30;    // cap: post-fix every trial is clean, so all run
+  let duplicateTrial = 0;
+  for (let trial = 1; trial <= MAX_TRIALS; trial += 1) {
+    const { ctx, taskStore, dir } = await compose(t);
+    const { task, change } = await governedReadyTask(ctx, taskStore, dir);
+    // Land in PREFLIGHT with NO reviewer, then pre-stage the finding's
+    // "stale empty claim": an owner died after claiming but before recording
+    // any session (no session, updatedAt far past the lease).
+    await dispatchGovernedSuccess(ctx, taskStore, dir, change, { preflight: ['FAIL: build'] });
+    assert.equal((await ctx.changeControl.get(change.id)).state, 'PREFLIGHT');
+    const claimFile = reviewerClaimFileFor(task, change);
+    await mkdir(dirname(claimFile), { recursive: true });
+    await writeFile(claimFile, JSON.stringify({
+      claimant: 'dead-host:9999',
+      sessionId: null,
+      updatedAt: Date.now() - 2 * 10 * 60 * 1000,
+    }), 'utf8');
+
+    const children = await Promise.all(Array.from({ length: N }, () => spawnReviewerProcess(dir, task.id, { launchMs: LAUNCH_MS })));
+    children.forEach((ch, i) => assert.equal(ch.code, 0, `trial ${trial} host ${i} must complete: ${ch.stderr || ch.stdout}`));
+    const results = children.map((ch) => JSON.parse(ch.stdout));
+    results.forEach((r, i) => assert.equal(r.outcome, 'review_pending', `trial ${trial} host ${i} converges to review_pending`));
+
+    let launches = 0;
+    try {
+      launches = readFileSync(join(dir, 'reviewer-launches.log'), 'utf8').trim().split('\n').filter(Boolean).length;
+    } catch { /* zero launches is a violation, recorded below */ }
+    // No orphaned loser: every process must converge on the SAME reviewer
+    // session — a process that launched its own reviewer left an orphan.
+    const sessions = new Set(results.map((r) => r.sessionId));
+    const reviewers = (await ctx.changeControl.listRoleBindings())
+      .filter((b) => b.changeId === change.id && b.role === 'reviewer');
+    const diskState = JSON.parse(readFileSync(join(dir, 'changes.json'), 'utf8')).changes
+      .find((c) => c.id === change.id).domainState;
+    const ok = launches === 1 && sessions.size === 1 && reviewers.length === 1
+      && diskState === 'REVIEW' && reviewers[0].sessionId === results[0].sessionId;
+    if (!ok) {
+      duplicateTrial = trial;
+      break;
+    }
+  }
+  assert.equal(duplicateTrial, 0,
+    `trial ${duplicateTrial} launched duplicate reviewers (one launch, one binding, no orphaned loser required)`);
 });
