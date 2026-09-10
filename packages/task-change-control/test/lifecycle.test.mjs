@@ -564,19 +564,42 @@ process.stdout.write(JSON.stringify({ outcome: result.outcome, sessionId: result
 `;
 
 /** Spawn one host process driving runGovernedSdlc against the shared store dir. */
-function spawnReviewerProcess(dir, taskId, { launchMs = 200 } = {}) {
+// The child's reservation already self-bounds to REVIEWER_CLAIM_WAIT_MS (11 min,
+// throwing REVIEWER_CLAIM_TIMEOUT), so a parent-side timeout must sit ABOVE that
+// ceiling: it is a backstop for a process-level hang (a child that never exits),
+// never a racing timer against a legitimately slow store-contended child.
+const CHILD_TIMEOUT_MS = 12 * 60 * 1000;
+function spawnReviewerProcess(dir, taskId, { launchMs = 200, timeoutMs = CHILD_TIMEOUT_MS, context = '', t } = {}) {
+  const label = context ? `${context} ` : '';
   const child = spawn(process.execPath, ['--input-type=module', '-e', REVIEWER_CHILD_SCRIPT], {
     cwd: PKG_DIR,
     env: { ...process.env, TCC_DIR: dir, TCC_TASK_ID: taskId, TCC_LAUNCH_MS: String(launchMs) },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+  // Guaranteed reaping: any child still alive at test teardown (including an
+  // assertion failure before its promise settles) is SIGKILLed, so a hung host
+  // can never outlive the test or leak into CI teardown.
+  if (t) t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); });
   let stdout = '';
   let stderr = '';
   child.stdout.on('data', (d) => { stdout += d; });
   child.stderr.on('data', (d) => { stderr += d; });
   return new Promise((resolve) => {
-    child.on('error', (err) => resolve({ code: -1, stdout: stdout.trim(), stderr: stderr + String(err) }));
-    child.on('close', (code) => resolve({ code, stdout: stdout.trim(), stderr }));
+    // Bounded execution: a child that never exits (e.g. a reviewer launch deadlock)
+    // is killed and reported with its trial/child context instead of hanging CI.
+    const timer = setTimeout(() => {
+      const msg = `${label}timed out after ${timeoutMs}ms; killed pid ${child.pid}`;
+      child.kill('SIGKILL');
+      resolve({ code: -2, stdout: stdout.trim(), stderr: `${stderr}${msg}`.trim() });
+    }, timeoutMs);
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      resolve({ code: -1, stdout: stdout.trim(), stderr: `${stderr}${label}${String(err)}` });
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      resolve({ code, stdout: stdout.trim(), stderr });
+    });
   });
 }
 
@@ -589,8 +612,8 @@ test('T-H5 PR2-01: two host processes on one store launch exactly ONE reviewer (
   assert.equal((await ctx.changeControl.get(change.id)).state, 'PREFLIGHT');
 
   const [a, b] = await Promise.all([
-    spawnReviewerProcess(dir, task.id),
-    spawnReviewerProcess(dir, task.id),
+    spawnReviewerProcess(dir, task.id, { context: 'host A', t }),
+    spawnReviewerProcess(dir, task.id, { context: 'host B', t }),
   ]);
   assert.equal(a.code, 0, `host process A must complete: ${a.stderr || a.stdout}`);
   assert.equal(b.code, 0, `host process B must complete: ${b.stderr || b.stdout}`);
@@ -695,7 +718,11 @@ test('T-H5 PR2-02: stress — many host processes racing to take over the same s
       updatedAt: Date.now() - 2 * 10 * 60 * 1000,
     }), 'utf8');
 
-    const children = await Promise.all(Array.from({ length: N }, () => spawnReviewerProcess(dir, task.id, { launchMs: LAUNCH_MS })));
+    const children = await Promise.all(Array.from({ length: N }, (_, i) => spawnReviewerProcess(dir, task.id, {
+      launchMs: LAUNCH_MS,
+      context: `trial ${trial} host ${i}`,
+      t,
+    })));
     children.forEach((ch, i) => assert.equal(ch.code, 0, `trial ${trial} host ${i} must complete: ${ch.stderr || ch.stdout}`));
     const results = children.map((ch) => JSON.parse(ch.stdout));
     results.forEach((r, i) => assert.equal(r.outcome, 'review_pending', `trial ${trial} host ${i} converges to review_pending`));
@@ -757,7 +784,10 @@ test('T-H5 PR2-03: stress — many host processes racing to reclaim a stale clai
       updatedAt: Date.now() - 2 * 10 * 60 * 1000, // stale: beyond the 10-minute lease
     }), 'utf8');
 
-    const children = await Promise.all(Array.from({ length: N }, () => spawnReviewerProcess(dir, task.id)));
+    const children = await Promise.all(Array.from({ length: N }, (_, i) => spawnReviewerProcess(dir, task.id, {
+      context: `trial ${trial} host ${i}`,
+      t,
+    })));
     children.forEach((ch, i) => assert.equal(ch.code, 0, `trial ${trial} host ${i} must complete: ${ch.stderr || ch.stdout}`));
     const results = children.map((ch) => JSON.parse(ch.stdout));
     results.forEach((r, i) => assert.equal(r.outcome, 'review_pending', `trial ${trial} host ${i} converges to review_pending`));
