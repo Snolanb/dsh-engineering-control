@@ -1,3 +1,4 @@
+// @ts-nocheck — T-H5 PR2-01: node:fs/os/path I/O for the durable cross-process reviewer claim; same convention as src/binding.js, src/governance.js, src/tools.js.
 /**
  * taskChangeControl integration service.
  *
@@ -8,6 +9,10 @@
 import { createGovernanceGuard } from './governance.js';
 import { createBindingLauncher } from './binding.js';
 import { validatePairing } from './lifecycle.js';
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
+import { hostname, tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 
 /** The task-orchestrator identity on the Change-side workItem. */
 export const WORK_ITEM_SYSTEM = 'dsh-task-orchestrator';
@@ -25,8 +30,8 @@ function unavailable(detail) {
 
 /**
  * Minimal typed views of the two domain services this package depends on.
- * @typedef {{ get: (id: string) => any, update: (id: string, patch: any) => Promise<any>, updateIf: (id: string, expected: any, patch: any) => any, complete?: (id: string, result: object, options?: any) => any, createDispatcher: (options?: any) => any, createWorkerLauncher?: (options?: any) => any, createReviewerLauncher?: (options?: any) => any }} TaskOrchestratorApi
- * @typedef {{ get: (id: string) => Promise<any>, findByWorkItem: (system: string, id: string) => Promise<any>, findOrCreateForWorkItem: (input: { system: string, id: string, change: object }) => Promise<any>, resolveRole: (changeId: string, sessionId: string) => Promise<string>, getBinding: (changeId: string, sessionId: string) => Promise<any>, getBindingSync: (changeId: string, sessionId: string) => any, getBindingFromDisk: (changeId: string, sessionId: string) => any, listByWorkItem: (system: string, id: string) => Promise<any[]>, listRoleBindings: () => Promise<any[]>, status: (changeId: string) => Promise<any>, appendAudit: (event: any) => Promise<any>, submitProof: (changeId: string, proof: any, expected?: { sessionId?: string, expectedWorker?: string }) => Promise<any>, bindRole: (changeId: string, sessionId: string, role: string, opts?: any) => Promise<any>, submitReview: (changeId: string, review: any, opts: any) => Promise<any>, runPreflight: (changeId: string, input?: any) => Promise<any>, history: (changeId?: string) => Promise<any[]>, getGovernanceMode?: (scope: { projectId?: string|null, workspace?: string|null }) => Promise<string>, unbindRole: (changeId: string, sessionId: string, opts?: any) => Promise<any>, transition: (changeId: string, toState: string, opts?: any) => Promise<any> }} ChangeControlApi
+ * @typedef {{ get: (id: string) => any, update: (id: string, patch: any) => Promise<any>, updateIf: (id: string, expected: any, patch: any) => any, complete?: (id: string, result: object, options?: any) => any, createDispatcher: (options?: any) => any, createWorkerLauncher?: (options?: any) => any, createReviewerLauncher?: (options?: any) => any, claim?: (id: string, worker: string, options?: any) => any, start?: (id: string, worker: string, options?: any) => any, release?: (id: string, worker: string, options?: any) => any }} TaskOrchestratorApi
+ * @typedef {{ get: (id: string) => Promise<any>, findByWorkItem: (system: string, id: string) => Promise<any>, findOrCreateForWorkItem: (input: { system: string, id: string, change: object }) => Promise<any>, resolveRole: (changeId: string, sessionId: string) => Promise<string>, getBinding: (changeId: string, sessionId: string) => Promise<any>, getBindingSync: (changeId: string, sessionId: string) => any, getBindingFromDisk: (changeId: string, sessionId: string) => any, listByWorkItem: (system: string, id: string) => Promise<any[]>, listRoleBindings: () => Promise<any[]>, status: (changeId: string) => Promise<any>, appendAudit: (event: any) => Promise<any>, submitProof: (changeId: string, proof: any, expected?: { sessionId?: string, expectedWorker?: string }) => Promise<any>, bindRole: (changeId: string, sessionId: string, role: string, opts?: any) => Promise<any>, submitReview: (changeId: string, review: any, opts: any) => Promise<any>, submitRepair?: (changeId: string, repair: object, opts?: any) => Promise<any>, runPreflight: (changeId: string, input?: any) => Promise<any>, history: (changeId?: string) => Promise<any[]>, getGovernanceMode?: (scope: { projectId?: string|null, workspace?: string|null }) => Promise<string>, unbindRole: (changeId: string, sessionId: string, opts?: any) => Promise<any>, transition: (changeId: string, toState: string, opts?: any) => Promise<any> }} ChangeControlApi
  * @param {object} deps
  * @param {() => TaskOrchestratorApi | undefined} deps.taskOrchestrator accessor (may be absent)
  * @param {() => ChangeControlApi | undefined} deps.changeControl accessor (may be absent)
@@ -297,11 +302,30 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
             summary: result.result_summary ?? '',
             ...(result || {}),
           };
-          return api.completeGovernedTask(taskId, /** @type {{ sessionId: string, worker: string, proof: any }} */ ({
+          const completed = await api.completeGovernedTask(taskId, /** @type {{ sessionId: string, worker: string, proof: any }} */ ({
             sessionId: /** @type {string} */ (sessionId ?? worker ?? ''),
             worker: /** @type {string} */ (worker ?? ''),
             proof,
           }));
+          // T-H5 PRODUCTION TRIGGER: a governed worker success auto-advances
+          // the deterministic preflight → REVIEW + independent reviewer
+          // launch/bind. The controller is resumable: preflight_failed /
+          // review_pending / trigger_failed all leave the task in_review with
+          // the Change at the last reached stage — a re-invocation continues
+          // from persisted state. A trigger failure must never undo the
+          // governed completion that already converged (fail-soft + audit).
+          try {
+            const advance = await api.runGovernedSdlc(taskId, {});
+            return { ...completed, sdlc: advance };
+          } catch (/** @type {any} */ error) {
+            try {
+              const link = await requireChange().findByWorkItem(WORK_ITEM_SYSTEM, taskId);
+              if (link) {
+                await requireChange().appendAudit({ kind: 'review_orchestration', changeId: link.id, action: 'sdlc_trigger_failed', detail: error?.message ?? String(error) });
+              }
+            } catch { /* audit is best-effort; the trigger must not throw */ }
+            return { ...completed, sdlc: { outcome: 'trigger_failed', error: error?.message ?? String(error) } };
+          }
         }),
       });
     },
@@ -460,9 +484,19 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         // MUST equal the caller's proof on the four integration fields —
         // any mismatch means the prior submission persisted a stale proof.
         const change = await c.get(changed.id);
-        if (change.state === 'IMPLEMENTING') {
+        let currentState = change.state;
+        if (currentState === 'READY') {
+          // T-H5 PR1-01: a production launcher NEVER mutates the Change; the
+          // preDispatch guard already demanded READY. The controller owns the
+          // host-side READY→IMPLEMENTING so a real governed worker's success
+          // can be completed (submit source proof) without test-only mutation.
+          // Authority stays with Change Control — we only invoke its transition.
+          await c.transition(changed.id, 'IMPLEMENTING', { actor: 'task-change-control' });
+          currentState = 'IMPLEMENTING';
+        }
+        if (currentState === 'IMPLEMENTING') {
           await c.submitProof(changed.id, { ...proof, sessionId }, { sessionId, expectedWorker: worker });
-        } else if (change.state === 'PREFLIGHT') {
+        } else if (currentState === 'PREFLIGHT') {
           const statusSnapshot = await c.status(changed.id).catch(() => null);
           const existing = statusSnapshot && statusSnapshot.proof ? statusSnapshot.proof : null;
           const same = existing
@@ -578,11 +612,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
           // protected paths, and requiredChecks are all evaluated there.
           const statusNow = await c.status(change.id);
           const proof = statusNow?.proof ?? null;
-          const checkResults = (options.controllerPreflightOverride ?? proof?.controllerPreflight ?? []).map((/** @type {string} */ entry) => {
-            const name = String(entry).trim();
-            const okLabel = /^(pass|ok)([:.\s]|$)/i.test(name);
-            return { name, passed: okLabel, exitCode: okLabel ? 0 : 1 };
-          });
+          const checkResults = (options.controllerPreflightOverride ?? proof?.controllerPreflight ?? []).map((/** @type {string} */ entry) => parseControllerPreflightEntry(entry));
           let preflightPassed;
           try {
             await c.runPreflight(change.id, {
@@ -609,20 +639,48 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
           }
           await c.appendAudit({ kind: 'review_orchestration', changeId: change.id, action: 'preflight_passed' });
         }
-        // Existing reviewer binding? Reuse the session id (repair rounds
-        // re-enter runGovernedReview on the SAME Change). Otherwise launch
-        // a fresh reviewer and bind BEFORE transitioning so a thrown
-        // launcher never wedges the Change.
-        const existing = (await c.listRoleBindings()).find((b) => b.changeId === change.id && b.role === 'reviewer');
-        let sessionId;
-        if (existing) {
-          sessionId = existing.sessionId;
-        } else {
-          const launched = await launchReviewerForTask(requireTask, requireChange, requireTaskId, taskId);
-          sessionId = launched.sessionId;
-        }
-        if (change.state !== 'REVIEW') {
-          await c.transition(change.id, 'REVIEW', { actor: 'review-orchestration' });
+        // T-H5 PR1-02 + PR2-01: serialize check→launch→bind for ONE Change.
+        // The in-process tail lock is the fast local serializer; the durable
+        // cross-process claim (reserveReviewerLaunch) guarantees no two host
+        // processes launch a second reviewer, adopts a crashed owner's
+        // recorded session instead of re-launching it, and converges on the
+        // confirmed binding as the terminal record.
+        const sessionId = await withReviewerReservation(change.id, async () => {
+          return reserveReviewerLaunch({
+            c, change, task,
+            launch: async ({ file, identity }) => {
+              const launched = await launchReviewerForTask(requireTask, requireChange, requireTaskId, taskId, {
+                // Durable record of the launched session before the binding —
+                // the crash-recovery (adopt) record for a successor claim.
+                recordSession: async (launchSessionId) => {
+                  await writeClaimRecord(file, { claimant: identity, sessionId: launchSessionId, updatedAt: Date.now() });
+                },
+                discardSession: async () => {
+                  // Our launch is dead (terminated on failure): expire the
+                  // claim so a successor takes over with a fresh launch
+                  // instead of adopting a terminated session.
+                  await writeClaimRecord(file, { claimant: identity, sessionId: null, updatedAt: Date.now() - 2 * REVIEWER_CLAIM_LEASE_MS })
+                    .catch(() => {});
+                },
+              });
+              return launched.sessionId;
+            },
+          });
+        });
+        // A successful store runPreflight is authoritative for the state
+        // move: under a real preflight policy the store itself performed
+        // PREFLIGHT→REVIEW. Re-read the live state and transition ONLY in
+        // the NO_POLICY fallback, where the store did not move it — exactly
+        // one PREFLIGHT→REVIEW transition, never a double move.
+        const liveAfterPreflight = await c.get(change.id);
+        if (liveAfterPreflight.state === 'PREFLIGHT') {
+          await c.transition(change.id, 'REVIEW', { actor: 'review-orchestration' }).catch((err) => {
+            if (err?.name !== 'ChangeDomainError') throw err;
+            // T-H5 PR2-01: a concurrent controller advanced the stage while
+            // we held the reservation — REVIEW→REVIEW is not a legal move,
+            // so the stage already converged; its launch is bound under the
+            // same claim we just released.
+          });
         }
         return { outcome: 'review_started', sessionId, changeId: change.id };
       })();
@@ -659,11 +717,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         }
         const reviewCount = /** @type {number} */ (options.maxRepairRounds ?? 3);
         const attemptsSeen = Array.isArray(status?.attempts) ? status.attempts.length : 0;
-        // "Repair rounds" = every extra attempt beyond the initial one
-        // (submission, then one per repair cycle). The escalation threshold
-        // is comparisons against RETRIES ONLY — never the baseline review.
-        const repairsDone = Math.max(0, attemptsSeen - 1);
-        const escalate = options.verdict === 'fail' && repairsDone >= reviewCount;
+        const escalate = options.verdict === 'fail' && repairRoundsExhausted(attemptsSeen, reviewCount);
         // Pre-validate EVERYTHING that could make submitReview throw BEFORE
         // touching the task at all. This matters because a terminal task
         // status (done/failed/...) is irreversible, whereas a Change left in
@@ -765,6 +819,170 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
      */
     launchReviewer(taskId, options = {}) {
       return launchReviewerForTask(requireTask, requireChange, requireTaskId, taskId, options);
+    },
+
+    /**
+     * T-H5 — the production governed SDLC controller.
+     *
+     * One explicit controller-owned lifecycle over the existing governed
+     * operations. The automatic production trigger is the dispatcher
+     * completionHook (governed worker success → this method with no verdict);
+     * verdict data arrives by re-invocation (host-observed structured
+     * verdict, or a review already submitted through Change Control's
+     * reviewer tools, which this method converges).
+     *
+     * Stage traversal:
+     *   PREFLIGHT → deterministic preflight → REVIEW + independent reviewer
+     *   launch/bind → verdict:
+     *     pass → APPROVED + task done (terminal)
+     *     fail → REPAIR + task changes_requested → repair worker routing
+     *     (Task Orchestrator claim/start + governance-bound worker session +
+     *     submitRepair claiming the unresolved finding IDs + governed
+     *     completion) → repeat preflight/review
+     *   maxRepairRounds exhaustion → escalation: task failed, the Change is
+     *   left in REPAIR for human disposition (the existing policy).
+     *
+     * Authority boundaries are preserved: the controller owns no domain
+     * state — every loop iteration re-reads the persisted (task, Change)
+     * pair, so operations are idempotent and resumable after a restart, and
+     * the reviewer never receives a task claim/lease merely by being
+     * launched. No model-facing bind/create/transition surface is added
+     * (tools.js is unchanged; the model-facing surface stays at two tools).
+     *
+     * @param {string} taskId
+     * @param {{ maxRepairRounds?: number,
+     *   controllerPreflightOverride?: string[],
+     *   verdict?: { verdict: 'pass'|'fail', findings?: object[], sessionId?: string },
+     *   worker?: string,
+     *   workerLauncher?: object,
+     *   repairProof?: object,
+     *   repairFindings?: object[],
+     *   repairClaim?: string,
+     *   leaseSeconds?: number }} [options]
+     * @returns {Promise<{ outcome: string, [key: string]: any }>}
+     */
+    runGovernedSdlc(taskId, options = {}) {
+      const t = requireTask();
+      const c = requireChange();
+      requireTaskId(taskId);
+      const maxRepairRounds = options.maxRepairRounds ?? 3;
+      // The verdict is one-shot per call: a repair loop that re-enters the
+      // REVIEW stage must never re-settle the same verdict.
+      let verdict = options.verdict && (options.verdict.verdict === 'pass' || options.verdict.verdict === 'fail')
+        ? options.verdict
+        : null;
+      return (async () => {
+        let iterations = 0;
+        while (true) {
+          if (++iterations > maxRepairRounds * 3 + 8) {
+            return { outcome: 'stuck', taskId, detail: 'controller loop exceeded its round bound' };
+          }
+          const task = await Promise.resolve(t.get(taskId));
+          if (!task) throw Object.assign(new Error(`task not found: ${taskId}`), { code: 'TASK_NOT_FOUND' });
+          // findByWorkItem excludes terminal Changes; fall back to any
+          // linkage record so a converged (APPROVED) task still resolves its
+          // Change on re-entry — the terminal checks below handle it.
+          let change = await c.findByWorkItem(WORK_ITEM_SYSTEM, taskId);
+          if (!change) {
+            const all = typeof c.listByWorkItem === 'function' ? await c.listByWorkItem(WORK_ITEM_SYSTEM, taskId) : [];
+            change = Array.isArray(all) && all.length > 0 ? all[all.length - 1] : null;
+          }
+          if (!change) throw Object.assign(new Error(`no Change linked to task ${taskId}`), { code: 'WORK_ITEM_NOT_LINKED' });
+          const state = change.state;
+
+          // ── Terminal convergence ──
+          if (state === 'APPROVED') {
+            if (task.status !== 'done') {
+              const converged = t.updateIf(taskId, { status: 'in_review' }, { status: 'done' });
+              if (converged === null) continue; // moved concurrently — re-read
+              await c.appendAudit({ kind: 'review_orchestration', changeId: change.id, action: 'review_pass_converged' });
+            }
+            return { outcome: 'approved', taskId, changeId: change.id };
+          }
+          if (task.status === 'failed' && state === 'REPAIR' && await hasEscalationAudit(c, change.id)) {
+            return { outcome: 'escalated', taskId, changeId: change.id };
+          }
+          // Foreign drift (a human blocked/cancelled the task mid-flight):
+          // never mutate here — reconcileTaskChange / a human disposes.
+          if (task.status === 'blocked' || task.status === 'cancelled') {
+            return { outcome: 'lifecycle_mismatch', taskId, changeId: change.id, taskStatus: task.status, changeState: state };
+          }
+
+          if (state === 'PREFLIGHT') {
+            if (task.status !== 'in_review') {
+              return { outcome: 'lifecycle_mismatch', taskId, changeId: change.id, taskStatus: task.status, changeState: state };
+            }
+            // Deterministic preflight + reviewer launch/bind (reviewer
+            // sessions never touch task claim/lease).
+            const rv = await api.runGovernedReview(taskId, { controllerPreflightOverride: options.controllerPreflightOverride });
+            if (rv.outcome === 'preflight_failed') {
+              return { outcome: 'preflight_failed', taskId, changeId: change.id };
+            }
+            continue; // Change is now REVIEW with a reviewer bound
+          }
+
+          if (state === 'REVIEW') {
+            if (task.status !== 'in_review') {
+              return { outcome: 'lifecycle_mismatch', taskId, changeId: change.id, taskStatus: task.status, changeState: state };
+            }
+            // A concurrent reviewer may have settled the review through
+            // Change Control's reviewer tools (REVIEW → APPROVED | REPAIR).
+            // Re-read before settling.
+            const live = await c.get(change.id);
+            if (live.state === 'APPROVED') {
+              if (task.status !== 'done') {
+                const converged = t.updateIf(taskId, { status: 'in_review' }, { status: 'done' });
+                if (converged === null) continue;
+                await c.appendAudit({ kind: 'review_orchestration', changeId: change.id, action: 'review_pass_converged' });
+              }
+              return { outcome: 'approved', taskId, changeId: change.id };
+            }
+            if (live.state === 'REPAIR') {
+              // Reviewer-submitted fail verdict: settle the task side
+              // (mirror of applyReviewOutcome's fail path minus the submit),
+              // honoring the same escalation policy.
+              const settled = await settleReviewedFailure(taskId, change.id, t, c, maxRepairRounds);
+              if (settled !== null) {
+                if (settled.outcome === 'task_update_race') continue; // re-read
+                return settled; // 'escalated'
+              }
+              // fall through: task is now changes_requested — route repair
+            } else {
+              // Still REVIEW: the verdict must arrive as data.
+              let reviewer = await currentReviewerBinding(c, change.id);
+              if (!reviewer) {
+                // Reviewer session lost (crash between transition and
+                // bind/launch): resume the stage, which launches a fresh
+                // reviewer without re-running preflight.
+                const rv = await api.runGovernedReview(taskId, { controllerPreflightOverride: options.controllerPreflightOverride });
+                if (rv.outcome === 'preflight_failed') {
+                  return { outcome: 'preflight_failed', taskId, changeId: change.id };
+                }
+                reviewer = (await currentReviewerBinding(c, change.id)) ?? { sessionId: rv.sessionId };
+              }
+              if (!verdict) {
+                return { outcome: 'review_pending', taskId, changeId: change.id, sessionId: reviewer.sessionId };
+              }
+              const settled = await api.applyReviewOutcome(taskId, {
+                sessionId: verdict.sessionId ?? reviewer.sessionId,
+                verdict: verdict.verdict,
+                findings: verdict.findings,
+                maxRepairRounds,
+              });
+              verdict = null; // consumed — the next round needs fresh data
+              if (settled.outcome === 'approved') return { outcome: 'approved', taskId, changeId: change.id };
+              if (settled.outcome === 'escalated') return { outcome: 'escalated', taskId, changeId: change.id, attempts: settled.attempts };
+              if (settled.outcome === 'task_update_race' || settled.outcome === 'invalid_state') continue;
+              // 'repair' → Change REPAIR + task changes_requested — route below
+            }
+          }
+
+          // REPAIR stage: persisted REPAIR entry, or just-settled REVIEW.
+          const routed = await routeRepairAttempt({ t, c, api, taskId, change, options });
+          if (routed.stopped) return routed.result;
+          continue; // repair submitted + governed completion converged
+        }
+      })();
     },
 
     /**
@@ -943,6 +1161,595 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
 
 
 /**
+ * The service-facade slice the T-H5 repair routing needs.
+ * @typedef {{ prepareRepairAttempt: (taskId: string) => Promise<any>, completeGovernedTask: (taskId: string, options: { sessionId: string, worker: string, proof: object }) => Promise<any> }} SdlcApiView
+ */
+
+/**
+ * Parse one controller preflight entry into its check identity and its
+ * status, encoded separately:
+ *   'pass:build' / 'ok:build' / 'PASS: build' → { name: 'build', passed: true,  exitCode: 0 }
+ *   'fail:build' / 'FAIL: build'              → { name: 'build', passed: false, exitCode: 1 }
+ *   'ok' / 'pass' (bare status markers)        → { name: <entry>,  passed: true,  exitCode: 0 }
+ *   anything unprefixed or empty               → { name: <entry|'ok'>, passed: false, exitCode: 1 }
+ * The name is the CANONICAL BARE required-check name (any pass:/ok:/fail:
+ * prefix stripped) so it matches the host preflightPolicy.requiredChecks
+ * entry exactly. Unprefixed/empty entries fail closed — the same rule the
+ * NO_POLICY default gate applies.
+ * @param {string} entry
+ * @returns {{ name: string, passed: boolean, exitCode: number }}
+ */
+function parseControllerPreflightEntry(entry) {
+  const trimmed = String(entry ?? '').trim();
+  const match = /^(pass|ok|fail)(?:[:.\s](.*))?$/i.exec(trimmed);
+  if (match) {
+    const passed = match[1].toLowerCase() !== 'fail';
+    const name = (match[2] ?? '').trim() || trimmed || 'ok';
+    return { name, passed, exitCode: passed ? 0 : 1 };
+  }
+  return { name: trimmed || 'ok', passed: false, exitCode: 1 };
+}
+
+const reviewerReservationLocks = new Map(); // changeId -> tail promise
+/**
+ * Per-Change reviewer reservation lock. Serializes the check→launch→bind
+ * critical section per Change (see the map above).
+ * @param {string} changeId
+ * @param {() => Promise<string>} fn the launch-and-bind critical section
+ */
+function withReviewerReservation(changeId, fn) {
+  const prev = reviewerReservationLocks.get(changeId) ?? Promise.resolve();
+  const next = prev.then(() => fn());
+  // Trim the map once this tail settles so a dead Change never leaks a lock.
+  // The derived finally-promise mirrors `next` (incl. rejection) but is not
+  // what callers await, so swallow it to avoid an unhandled rejection when
+  // fn throws — the original `next` still rejects for the awaited caller.
+  next.finally(() => {
+    if (reviewerReservationLocks.get(changeId) === next) reviewerReservationLocks.delete(changeId);
+  }).catch(() => {});
+  reviewerReservationLocks.set(changeId, next);
+  return next;
+}
+
+// ─── T-H5 PR2-01: durable cross-process reviewer claim ───────
+
+/**
+ * T-H5 PR2-01/02 — durable cross-process reviewer-claim.
+ *
+ * The claim FILE is the reservation: the launched session is recorded in the
+ * file BEFORE the binding, so a crashed owner's reviewer is reconciled by
+ * the next claim (adopted, never re-launched, never orphaned). A confirmed
+ * reviewer binding always wins: it is the durable, cross-process-visible
+ * terminal record.
+ *
+ * T-H5 PR2-02 — creation of the claim (first claim, stale-empty
+ * takeover, dead-incomplete reclaim) is serialized under a sibling RECLAIM
+ * LOCK file (atomic exclusive create, crash-safe via the same lease):
+ * exactly one process at a time (re)creates the claim, by OVERWRITING it in
+ * place — no delete-then-create, so there is no absence window a stale
+ * reader could exploit to wipe a concurrent winner's fresh claim and launch
+ * a duplicate reviewer. Losers wait on the lock, then converge on the
+ * winner's claim/session/binding.
+ *
+ * T-H5 PR2-03 — STALE lock recovery is generation-safe: a reclaimer grabs
+ * the slot atomically and discards ONLY the exact lock generation it
+ * observed as stale; a newer generation that landed in the slot meanwhile
+ * is restored, never evicted. Before the critical section the holder also
+ * re-verifies its lock is still in the slot (a concurrent refiller can
+ * re-create the slot in the grab gap), and release deletes only a lock it
+ * still owns. No concurrent recovery can remove a newly acquired lock or
+ * produce two holders — so no duplicate launches.
+ *
+ * Claim-file layout: `<task.workspace>/.dsh-governance/reviewer-claims/
+ * reviewer-claim-<changeId>`. The shared task workspace is the stable anchor
+ * every host process owning the task sees; hosts without a workspace fall
+ * back to the shared host tmpdir (wiped on host reboot, where all sessions
+ * are dead anyway and a fresh launch is the correct convergence).
+ */
+
+/**
+ * Claim lease: the longest a claim owner may hold a reservation without the
+ * launched session being bound. A crashed owner's claim goes stale and a
+ * waiting successor takes it over, so liveness is inferred from the durable
+ * record timestamp, not a heartbeat.
+ * ponytail: ceiling — a reviewer launch that outlives the lease can be taken
+ * over mid-flight by a waiting process (duplicate-launch window); raise the
+ * lease if provider cold-starts run longer than 10 minutes.
+ */
+const REVIEWER_CLAIM_LEASE_MS = 10 * 60 * 1000;
+const REVIEWER_CLAIM_POLL_MS = 50;
+/** Bounded wait: lease + grace, so a corrupt record can never block forever. */
+const REVIEWER_CLAIM_WAIT_MS = REVIEWER_CLAIM_LEASE_MS + 60_000;
+
+/**
+ * @param {any} change
+ * @param {any} task
+ * @returns {string}
+ */
+function reviewerClaimFile(change, task) {
+  const base = typeof task?.workspace === 'string' && task.workspace.trim() !== ''
+    ? task.workspace
+    : tmpdir();
+  return join(base, '.dsh-governance', 'reviewer-claims', `reviewer-claim-${String(change.id)}`);
+}
+
+/** @returns {string} the host-process identity written into claim records. */
+function claimIdentity() {
+  return `${hostname()}:${process.pid}`;
+}
+
+/**
+ * @param {string} file
+ * @returns {Promise<{ exists: boolean, incomplete: boolean, value: { claimant?: string, sessionId?: string | null, updatedAt?: number } | null }>}
+ */
+async function readClaimRecord(file) {
+  let raw;
+  try {
+    raw = await readFile(file, 'utf8');
+  } catch {
+    return { exists: false, incomplete: false, value: null };
+  }
+  if (raw.trim() === '') {
+    // The holder exclusive-created the claim but has not finished its
+    // initial record write (or died mid-write): incomplete, never stale
+    // by content.
+    return { exists: true, incomplete: true, value: null };
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return { exists: true, incomplete: true, value: null };
+    return { exists: true, incomplete: false, value: parsed };
+  } catch {
+    return { exists: true, incomplete: true, value: null };
+  }
+}
+
+/**
+ * Atomic rewrite of the durable claim record (tmp + rename, as the store's
+ * writeJson). The sole claim writer: called UNDER the reclaim lock when a
+ * claim is (re)created, and by the owner's recordSession hook when the
+ * launched session is persisted.
+ * @param {string} file
+ * @param {{ claimant: string, sessionId: string | null, updatedAt: number }} record
+ */
+async function writeClaimRecord(file, record) {
+  const tmp = `${file}.tmp.${process.pid}`;
+  await writeFile(tmp, JSON.stringify(record), 'utf8');
+  await rename(tmp, file);
+}
+
+/** @param {string} claimFile @returns {string} the sibling reclaim-lock path. */
+function reclaimLockFile(claimFile) {
+  return `${claimFile}.lock`;
+}
+
+/**
+ * Exclusive-create the reclaim lock. A live lock is someone else's held lock
+ * (returns false → the caller waits). A STALE lock (its holder crashed
+ * before releasing) is reclaimed generation-safely (T-H5 PR2-03): the slot
+ * is grabbed atomically and ONLY the exact observed generation is discarded;
+ * a newer generation that landed in the slot while we decided is restored,
+ * never evicted — so a stale reader can never remove another process's
+ * freshly acquired lock and double-acquire.
+ * ponytail: ceiling — the lock lease reuses the 10-min claim lease; a
+ * crashed holder's lock blocks successors until it expires. Add a heartbeat
+ * (or shorter lock lease) only if lock holders outlive the lease.
+ * @param {string} lockFile
+ * @param {string} identity
+ * @returns {Promise<boolean>} true when this caller holds the lock
+ */
+async function acquireReclaimLock(lockFile, identity) {
+  await mkdir(dirname(lockFile), { recursive: true });
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      await writeFile(lockFile, JSON.stringify({ owner: identity, updatedAt: Date.now() }), {
+        flag: fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY,
+      });
+      return true;
+    } catch (err) {
+      if (err?.code !== 'EEXIST') throw err;
+    }
+    // A lock is in the slot: read exactly what is there, then reclaim ONLY
+    // that observed generation.
+    let observedRaw;
+    try { observedRaw = await readFile(lockFile, 'utf8'); } catch { continue; }
+    let held = null;
+    try { held = JSON.parse(observedRaw); } catch { held = null; }
+    const lockStale = !held || Date.now() - Number(held.updatedAt || 0) > REVIEWER_CLAIM_LEASE_MS;
+    if (!lockStale) return false; // a live holder: wait for its release
+    // Grab the slot atomically, then verify WHAT was in it.
+    const grab = `${lockFile}.grab.${process.pid}`;
+    try {
+      await rename(lockFile, grab);
+    } catch (err) {
+      if (err?.code !== 'ENOENT') throw err;
+      continue; // vanished between check and grab: retry the exclusive create
+    }
+    const grabbedRaw = await readFile(grab, 'utf8');
+    if (grabbedRaw === observedRaw) {
+      // The EXACT stale generation we observed: safe to discard; retry the
+      // exclusive create (the slot is now empty).
+      await rm(grab, { force: true }).catch(() => {});
+      continue;
+    }
+    // A NEWER generation was acquired in the slot while we decided: restore
+    // it (if the slot was re-filled meanwhile, EEXIST → it is intact), and
+    // wait on that holder instead of racing ahead.
+    await writeFile(lockFile, grabbedRaw, {
+      flag: fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY,
+    }).catch((err) => { if (err?.code !== 'EEXIST') throw err; });
+    await rm(grab, { force: true }).catch(() => {});
+    return false;
+  }
+  return false; // concurrent reclaimers kept winning; the caller polls
+}
+
+/**
+ * Point-of-use lock verification (T-H5 PR2-03): the holder re-checks that
+ * ITS lock is still in the slot before the critical section. A concurrent
+ * refiller can re-create the slot in a grab gap, leaving the original
+ * holder's lock evicted — that holder must back off, not launch.
+ * @param {string} lockFile
+ * @param {string} identity
+ * @returns {Promise<boolean>}
+ */
+async function verifyReclaimLockHeld(lockFile, identity) {
+  let rec = null;
+  try { rec = JSON.parse(await readFile(lockFile, 'utf8')); } catch { return false; }
+  return rec?.owner === identity && Date.now() - Number(rec.updatedAt || 0) <= REVIEWER_CLAIM_LEASE_MS;
+}
+
+/**
+ * Release the reclaim lock — deleting ONLY a lock this owner still holds
+ * (T-H5 PR2-03: a blind delete could remove a successor's fresh lock).
+ * @param {string} lockFile
+ * @param {string} identity
+ */
+async function releaseReclaimLock(lockFile, identity) {
+  let rec = null;
+  try { rec = JSON.parse(await readFile(lockFile, 'utf8')); } catch { return; }
+  if (rec?.owner === identity) await rm(lockFile, { force: true }).catch(() => {});
+}
+
+/** @param {number} ms */
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * The claim protocol (see module notes). Never launches a reviewer while a
+ * durable claim exists: reuses a confirmed binding, adopts a recorded
+ * (launched-but-unbound) session, waits for a live owner, or takes over a
+ * stale claim — then hands off to `launch`, which records its session
+ * durably before binding.
+ *
+ * @param {{
+ *   c: any, change: any, task: any,
+ *   launch: (holder: { file: string, identity: string }) => Promise<string>,
+ * }} deps
+ * @returns {Promise<string>} the reviewer session id to use
+ */
+async function reserveReviewerLaunch({ c, change, task, launch }) {
+  const file = reviewerClaimFile(change, task);
+  const lockFile = reclaimLockFile(file);
+  const identity = claimIdentity();
+  const deadline = Date.now() + REVIEWER_CLAIM_WAIT_MS;
+  const confirmedBinding = () => c.listRoleBindings()
+    .then((bindings) => bindings.find((b) => b.changeId === change.id && b.role === 'reviewer'));
+  const adopt = (sessionId, claimant) => c.bindRole(change.id, sessionId, 'reviewer')
+    .catch((err) => { if (err?.code === 'ALREADY_BOUND') return null; throw err; })
+    .then(() => c.appendAudit({
+      kind: 'review_orchestration', changeId: change.id, action: 'reviewer_claim_adopted',
+      sessionId, claimant: claimant ?? null,
+    }))
+    .then(() => sessionId);
+  for (;;) {
+    // 1. Confirmed reviewer binding: durable and visible across processes —
+    //    reuse it, never launch.
+    const bound = await confirmedBinding();
+    if (bound) return bound.sessionId;
+
+    const { exists, incomplete, value: record } = await readClaimRecord(file);
+    const stale = !incomplete && exists
+      ? Date.now() - Number(record.updatedAt || 0) > REVIEWER_CLAIM_LEASE_MS
+      : false;
+
+    // 2. A launched session is recorded but not yet bound: the owner is
+    //    mid-bind (wait for convergence) or crashed (adopt). Adoption binds
+    //    the recorded session instead of launching a duplicate — the
+    //    orphaned reviewer is reconciled, not re-created.
+    if (record?.sessionId && typeof record.sessionId === 'string') {
+      if (!stale) {
+        if (Date.now() > deadline) {
+          throw Object.assign(new Error('reviewer claim owner has not bound its session within the wait window'), { code: 'REVIEWER_CLAIM_TIMEOUT' });
+        }
+        await sleep(REVIEWER_CLAIM_POLL_MS);
+        continue;
+      }
+      // Stale owner: bind the recorded session (a concurrent adopter may
+      // have beaten us — ALREADY_BOUND is successful convergence).
+      return await adopt(record.sessionId, record.claimant);
+    }
+
+    // 3. Fresh claim with no session: its owner is mid-launch — wait for
+    //    the session to be recorded (bounded), never launch a second
+    //    reviewer.
+    if (exists && !incomplete && !stale) {
+      if (Date.now() > deadline) {
+        throw Object.assign(new Error('reviewer claim wait exceeded window'), { code: 'REVIEWER_CLAIM_TIMEOUT' });
+      }
+      await sleep(REVIEWER_CLAIM_POLL_MS);
+      continue;
+    }
+
+    // 4. A claim must be (re)created: absent, stale-empty, or a dead
+    //    incomplete holder (past the wait window). Serialized under the
+    //    durable RECLAIM LOCK: exactly one process at a time (re)creates
+    //    the claim, overwriting it IN PLACE — no delete-then-create, no
+    //    absence window, so no stale reader can wipe a concurrent winner's
+    //    fresh claim and launch a duplicate reviewer (T-H5 PR2-02). The
+    //    stale-lock recovery is generation-safe, and the holder re-verifies
+    //    its lock is still in the slot before the critical section (T-H5
+    //    PR2-03) — a lost lock means backing off, never launching.
+    for (;;) {
+      if (await acquireReclaimLock(lockFile, identity)
+        && await verifyReclaimLockHeld(lockFile, identity)) break;
+      if (Date.now() > deadline) {
+        throw Object.assign(new Error('reviewer claim wait exceeded window'), { code: 'REVIEWER_CLAIM_TIMEOUT' });
+      }
+      await sleep(REVIEWER_CLAIM_POLL_MS);
+    }
+    let created = false;
+    let adopted;
+    try {
+      // Re-validate UNDER the lock: the claim may have changed since we read.
+      const boundNow = await confirmedBinding();
+      if (boundNow) return boundNow.sessionId;
+      const r = await readClaimRecord(file);
+      const rStale = !r.incomplete && r.exists
+        ? Date.now() - Number(r.value.updatedAt || 0) > REVIEWER_CLAIM_LEASE_MS
+        : false;
+      if (r.value?.sessionId && typeof r.value.sessionId === 'string' && rStale) {
+        // A crashed owner recorded a session: reconcile it instead of launching.
+        adopted = await adopt(r.value.sessionId, r.value.claimant);
+      } else if (!(r.exists && !r.incomplete && !rStale)) {
+        // Absent, stale-empty, or dead-incomplete: (re)create the claim in
+        // place. Safe under the lock — we are the sole creator right now.
+        await writeClaimRecord(file, { claimant: identity, sessionId: null, updatedAt: Date.now() });
+        created = true;
+      }
+      // else: a fresh in-progress claim appeared while we waited — its
+      // owner is mid-launch; leave it alone and wait for its session/bind.
+    } finally {
+      await releaseReclaimLock(lockFile, identity);
+    }
+    if (adopted !== undefined) return adopted;
+    if (created) return await launch({ file, identity });
+    continue;
+  }
+}
+
+/**
+ * "Repair rounds" = every extra implementation attempt beyond the initial
+ * one (submission, then one per repair cycle). The escalation threshold
+ * compares RETRIES ONLY — never the baseline review. Shared by
+ * applyReviewOutcome and the T-H5 controller so both settlement paths
+ * honor the same escalation policy.
+ * @param {number} attemptsSeen
+ * @param {number} maxRepairRounds
+ */
+function repairRoundsExhausted(attemptsSeen, maxRepairRounds) {
+  return Math.max(0, attemptsSeen - 1) >= maxRepairRounds;
+}
+
+/**
+ * Whether the Change audit already records an escalation (T-H5 terminal
+ * convergence check — an escalated Change stays in REPAIR for human
+ * disposition; re-invocations must converge, not re-route).
+ * @param {ChangeControlApi} c
+ * @param {string} changeId
+ */
+async function hasEscalationAudit(c, changeId) {
+  const history = await c.history(changeId);
+  return Array.isArray(history)
+    && history.some((/** @type {any} */ e) => e.kind === 'review_orchestration' && e.action === 'escalated');
+}
+
+/**
+ * The most recent reviewer role binding on a Change (repair rounds reuse
+ * the same reviewer session), or null when none exists.
+ * @param {ChangeControlApi} c
+ * @param {string} changeId
+ */
+async function currentReviewerBinding(c, changeId) {
+  const all = await c.listRoleBindings();
+  const mine = all.filter((/** @type {any} */ b) => b.changeId === changeId && b.role === 'reviewer');
+  return mine.length > 0 ? mine[mine.length - 1] : null;
+}
+
+/**
+ * T-H5 — task-side settlement of a fail review that has ALREADY been
+ * submitted through Change Control (REVIEW → REPAIR happened without the
+ * controller settling the task). Mirrors applyReviewOutcome's fail path
+ * minus the submitReview: escalation on the same policy, otherwise
+ * changes_requested. Returns a result object to STOP (escalated /
+ * task_update_race), or null to CONTINUE into repair routing.
+ * @param {string} taskId
+ * @param {string} changeId
+ * @param {TaskOrchestratorApi} t
+ * @param {ChangeControlApi} c
+ * @param {number} maxRepairRounds
+ * @returns {Promise<{ outcome: string, [key: string]: any } | null>}
+ */
+async function settleReviewedFailure(taskId, changeId, t, c, maxRepairRounds) {
+  const task = await Promise.resolve(t.get(taskId));
+  if (!task || task.status !== 'in_review') return null; // already settled by a data-path settlement
+  const status = await c.status(changeId);
+  const attemptsSeen = Array.isArray(status?.attempts) ? status.attempts.length : 0;
+  if (repairRoundsExhausted(attemptsSeen, maxRepairRounds)) {
+    const failedTask = t.updateIf(taskId, { status: 'in_review' }, { status: 'failed', result_summary: 'escalated to failed after repair threshold' });
+    if (!failedTask) return { outcome: 'task_update_race', taskId, changeId };
+    await c.appendAudit({
+      kind: 'review_orchestration', changeId, action: 'escalated',
+      revision: status?.revision ?? null, attempts: attemptsSeen,
+      note: 'repair attempts exhausted (reviewer-submitted review); change left in REPAIR for human disposition',
+    });
+    return { outcome: 'escalated', taskId, changeId, attempts: attemptsSeen };
+  }
+  const updated = t.updateIf(taskId, { status: 'in_review' }, { status: 'changes_requested' });
+  if (!updated) return { outcome: 'task_update_race', taskId, changeId };
+  await c.appendAudit({
+    kind: 'review_orchestration', changeId, action: 'review_fail_settled',
+    revision: status?.revision ?? null,
+    note: 'fail review was submitted through Change Control; task side settled by the SDLC controller',
+  });
+  return null; // task is now changes_requested — route repair
+}
+
+/**
+ * T-H5 — Repair routing. Pushes a REPAIR-stage task back to ready
+ * (idempotent prepareRepairAttempt), then — when a repair worker is
+ * supplied — claims/starts it through the Task Orchestrator facade
+ * (concrete routing authority), launches the repair worker through the
+ * governance binding wrapper (worker role, run identity), waits, submits
+ * the repair CLAIMING THE UNRESOLVED FINDING IDs (Change Control is
+ * authoritative for the claims; the store rejects unknown IDs and
+ * missing blocking claims), and converges the governed completion.
+ * Without a supplied worker, stops at the resumable repair_routed
+ * boundary.
+ *
+ * @param {object} args
+ * @param {TaskOrchestratorApi} args.t
+ * @param {ChangeControlApi} args.c
+ * @param {SdlcApiView} args.api the service facade (prepareRepairAttempt / completeGovernedTask)
+ * @param {string} args.taskId
+ * @param {{ id: string }} args.change
+ * @param {{ worker?: string, workerLauncher?: object, repairProof?: object,
+ *   repairFindings?: object[], repairClaim?: string, leaseSeconds?: number }} args.options
+ * @returns {Promise<{ stopped: true, result: { outcome: string, [key: string]: any } } | { stopped: false }>}
+ * `stopped: false` means the repair was submitted and governed completion
+ * converged — the caller loops back to PREFLIGHT.
+ */
+async function routeRepairAttempt({ t, c, api, taskId, change, options }) {
+  const task = await Promise.resolve(t.get(taskId));
+  if (task.status === 'changes_requested') {
+    await api.prepareRepairAttempt(taskId); // → ready (CAS-protected)
+  } else if (task.status !== 'ready') {
+    return {
+      stopped: true,
+      result: { outcome: 'lifecycle_mismatch', taskId, changeId: change.id, taskStatus: task.status, changeState: 'REPAIR' },
+    };
+  }
+  if (typeof t.claim !== 'function' || typeof t.start !== 'function' || typeof t.release !== 'function') {
+    throw Object.assign(new Error('taskOrchestrator facade does not expose claim/start/release — repair routing unavailable'), { code: 'ROUTING_UNAVAILABLE' });
+  }
+  if (typeof c.submitRepair !== 'function') {
+    throw Object.assign(new Error('changeControl facade does not expose submitRepair — repair routing unavailable'), { code: 'SUBMIT_REPAIR_UNAVAILABLE' });
+  }
+  const statusNow = await c.status(change.id);
+  const openFindings = Array.isArray(statusNow?.openFindings) ? statusNow.openFindings : [];
+  const revision = statusNow?.revision ?? null;
+  if (!options.worker || !options.workerLauncher || options.repairProof == null) {
+    // Resumable boundary: the repair stage is prepped; a re-invocation
+    // (possibly after a restart, possibly with the repair worker and its
+    // structured proof) continues.
+    return {
+      stopped: true,
+      result: {
+        outcome: 'repair_routed', taskId, changeId: change.id,
+        openFindingIds: openFindings.map((/** @type {any} */ f) => f.id),
+        revision,
+        missing: options.worker && options.workerLauncher ? 'repairProof' : 'repairWorker',
+      },
+    };
+  }
+  const runId = options.worker;
+  const claim = await Promise.resolve(t.claim(taskId, runId, { lease_seconds: options.leaseSeconds ?? 600, actor: 'sdlc-controller' }));
+  if (!claim || claim.claimed !== true) {
+    return { stopped: true, result: { outcome: 'repair_claim_failed', taskId, changeId: change.id, reason: claim?.reason } };
+  }
+  await Promise.resolve(t.start(taskId, runId, { actor: 'sdlc-controller' }));
+  const liveTask = await Promise.resolve(t.get(taskId));
+  const governedLauncher = createBindingLauncher(options.workerLauncher, c, WORK_ITEM_SYSTEM);
+  let handle;
+  try {
+    handle = await governedLauncher.launch({
+      task: liveTask,
+      spec: { mode: 'session', prompt: buildRepairPrompt(taskId, change.id, revision, openFindings) },
+      worker: runId,
+    });
+  } catch (/** @type {any} */ error) {
+    await Promise.resolve(t.release(taskId, runId, { actor: 'sdlc-controller' })).catch(() => {});
+    return { stopped: true, result: { outcome: 'repair_launch_failed', taskId, changeId: change.id, error: error?.message ?? String(error) } };
+  }
+  // Governed hold (T-H3): keep the worker binding through wait so the
+  // governed completion can validate the real session identity; release is
+  // idempotent and safe to race with the abnormal paths below.
+  // Repair claims: the UNRESOLVED FINDING IDs (blocking findings require
+  // 'fixed'; explicit worker-supplied claims pass through untouched).
+  const claims = Array.isArray(options.repairFindings) && options.repairFindings.length > 0
+    ? options.repairFindings
+    : openFindings.map((/** @type {any} */ f) => ({ findingId: f.id, status: 'fixed', claim: String(options.repairClaim ?? 'repaired') }));
+  // Governed hold (T-H3): keep the worker binding through wait so the
+  // governed completion can validate the real session identity. Submission
+  // and completion run UNDER THE HOLD (before the release in finally) —
+  // completeGovernedTask requires the live binding.
+  handle._governedHold?.();
+  let settle;
+  let submitError = null;
+  try {
+    settle = await handle.wait?.();
+    if (settle && settle.exitCode === 0 && !settle.error) {
+      try {
+        await c.submitRepair(change.id, { findings: claims, proof: options.repairProof }, { workerId: runId });
+        // Governed completion converges the task side (PREFLIGHT idempotent
+        // fast path: the stored repair proof matches this payload).
+        await api.completeGovernedTask(taskId, { sessionId: handle.sessionId, worker: runId, proof: options.repairProof });
+      } catch (/** @type {any} */ error) {
+        submitError = error;
+      }
+    }
+  } finally {
+    await handle._governedRelease?.();
+  }
+  if (submitError !== null) {
+    // A failed submission/leave would strand the task running under our
+    // claim: release it so a re-invocation can re-claim (resumable), then
+    // surface the domain error.
+    await Promise.resolve(t.release(taskId, runId, { actor: 'sdlc-controller' })).catch(() => {});
+    throw submitError;
+  }
+  if (!settle || settle.exitCode !== 0 || settle.error) {
+    // Repair worker did not complete: release the lease so a re-invocation
+    // can re-claim — the Change stays in REPAIR (resumable).
+    await Promise.resolve(t.release(taskId, runId, { actor: 'sdlc-controller' })).catch(() => {});
+    return {
+      stopped: true,
+      result: { outcome: 'repair_failed', taskId, changeId: change.id, sessionId: handle.sessionId, detail: settle?.error ?? `worker exited ${settle?.exitCode}` },
+    };
+  }
+  return { stopped: false };
+}
+
+/**
+ * Minimal repair context handed to the repair worker (finding IDs first).
+ * @param {string} taskId
+ * @param {string} changeId
+ * @param {string|null} revision
+ * @param {Array<object>} openFindings
+ */
+function buildRepairPrompt(taskId, changeId, revision, openFindings) {
+  const lines = openFindings.map((/** @type {any} */ f) =>
+    `- ${f.id} [${f.severity}] ${f.location ?? ''}: ${f.problem ?? ''} (required: ${f.requiredOutcome ?? ''})`);
+  return [
+    `You are the repair worker for task ${taskId}.`,
+    `Governed Change ${changeId} failed independent review at revision ${revision ?? 'unknown'}.`,
+    'Address every unresolved finding below, stay within the Change scope, and submit the repair claiming each finding ID:',
+    lines.length > 0 ? lines.join('\n') : '(no unresolved findings recorded)',
+  ].join('\n');
+}
+
+/**
  * Internal reviewer launch. Factored as a free function so runGovernedReview
  * does not depend on the frozen-facade `this` binding.
  *
@@ -950,7 +1757,15 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
  * @param {() => ChangeControlApi} requireChange
  * @param {(taskId: any) => void} requireTaskId
  * @param {string} taskId
- * @param {{ spec?: object, launcherOptions?: object }} [options]
+ * @param {{ spec?: object, launcherOptions?: object,
+ *   recordSession?: (sessionId: string) => Promise<void>,
+ *   discardSession?: () => Promise<void> }} [options]
+ *
+ * T-H5 PR2-01: `recordSession` runs after launch and BEFORE the binding so a
+ * durable record of the launched session exists before the (crash-prone)
+ * bind; `discardSession` runs after a launch that must be terminated (bind
+ * failure) so a successor claim does not adopt a dead session. Both are
+ * absent for plain host launches (launchReviewer), which are unchanged.
  */
 function launchReviewerForTask(requireTask, requireChange, requireTaskId, taskId, options = {}) {
   const t = requireTask();
@@ -994,10 +1809,21 @@ Review the governed Change ${change.id} against its Plan and project task accept
     }
     let binding;
     try {
+      // T-H5 PR2-01: durably record the launched session BEFORE the binding,
+      // so a crash between launch and bind leaves a record a successor claim
+      // can adopt (reconcile, not re-launch). Absent for plain host launches.
+      if (typeof options.recordSession === 'function') {
+        await options.recordSession(handle.sessionId);
+      }
       binding = await c.bindRole(change.id, handle.sessionId, 'reviewer');
     } catch (error) {
       if (typeof handle?.terminate === 'function') {
         try { await handle.terminate(); } catch { /* best-effort */ }
+      }
+      // T-H5 PR2-01: expire the durable record so a successor claim launches
+      // fresh instead of adopting a session we just terminated.
+      if (typeof options.discardSession === 'function') {
+        try { await options.discardSession(); } catch { /* best-effort */ }
       }
       throw error;
     }
