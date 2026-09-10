@@ -1214,15 +1214,22 @@ function withReviewerReservation(changeId, fn) {
 // ─── T-H5 PR2-01: durable cross-process reviewer claim ───────
 
 /**
- * T-H5 PR2-01 — durable cross-process reviewer-claim.
+ * T-H5 PR2-01/02 — durable cross-process reviewer-claim.
  *
- * The claim FILE is the reservation: an exclusive create-and-write claims it
- * atomically across host processes (the same file-backed locking architecture
- * the ChangeStore uses for its cross-process disk lock), and the launched
- * session is recorded in the file BEFORE the binding, so a crashed owner's
- * reviewer is reconciled by the next claim (adopted, never re-launched, never
- * orphaned). A confirmed reviewer binding always wins: it is the durable,
- * cross-process-visible terminal record.
+ * The claim FILE is the reservation: the launched session is recorded in the
+ * file BEFORE the binding, so a crashed owner's reviewer is reconciled by
+ * the next claim (adopted, never re-launched, never orphaned). A confirmed
+ * reviewer binding always wins: it is the durable, cross-process-visible
+ * terminal record.
+ *
+ * T-H5 PR2-02 — creation of the claim (first claim, stale-empty
+ * takeover, dead-incomplete reclaim) is serialized under a sibling RECLAIM
+ * LOCK file (atomic exclusive create, crash-safe via the same lease):
+ * exactly one process at a time (re)creates the claim, by OVERWRITING it in
+ * place — no delete-then-create, so there is no absence window a stale
+ * reader could exploit to wipe a concurrent winner's fresh claim and launch
+ * a duplicate reviewer. Losers wait on the lock, then converge on the
+ * winner's claim/session/binding.
  *
  * Claim-file layout: `<task.workspace>/.dsh-governance/reviewer-claims/
  * reviewer-claim-<changeId>`. The shared task workspace is the stable anchor
@@ -1290,10 +1297,9 @@ async function readClaimRecord(file) {
 
 /**
  * Atomic rewrite of the durable claim record (tmp + rename, as the store's
- * writeJson). The INITIAL claim is NOT written this way — it is a single
- * exclusive open+write (see claimExclusiveWrite) so the claim and its
- * record appear together and a lost claim is the atomic loser, not a
- * reclaimer of an empty file.
+ * writeJson). The sole claim writer: called UNDER the reclaim lock when a
+ * claim is (re)created, and by the owner's recordSession hook when the
+ * launched session is persisted.
  * @param {string} file
  * @param {{ claimant: string, sessionId: string | null, updatedAt: number }} record
  */
@@ -1303,28 +1309,48 @@ async function writeClaimRecord(file, record) {
   await rename(tmp, file);
 }
 
-/**
- * Exclusive create + initial record write in one open (atomic claim).
- * @param {string} file
- * @param {{ claimant: string, sessionId: string | null, updatedAt: number }} record
- * @returns {Promise<boolean>} true when this caller won the claim
- */
-async function claimExclusiveWrite(file, record) {
-  await mkdir(dirname(file), { recursive: true });
-  try {
-    await writeFile(file, JSON.stringify(record), {
-      flag: fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY,
-    });
-    return true;
-  } catch (err) {
-    if (err?.code === 'EEXIST') return false;
-    throw err;
-  }
+/** @param {string} claimFile @returns {string} the sibling reclaim-lock path. */
+function reclaimLockFile(claimFile) {
+  return `${claimFile}.lock`;
 }
 
-/** @param {string} file */
-async function removeClaimFile(file) {
-  await rm(file, { force: true }).catch(() => {});
+/**
+ * Exclusive-create the reclaim lock. A live lock is someone else's held lock
+ * (returns false → the caller waits); a STALE lock (its holder crashed
+ * before releasing) is moved aside and the acquisition retried — crash-safe
+ * via the same lease as the claim.
+ * ponytail: ceiling — the lock lease reuses the 10-min claim lease; a
+ * crashed holder's lock blocks successors until it expires. Add a heartbeat
+ * (or shorter lock lease) only if lock holders outlive the lease.
+ * @param {string} lockFile
+ * @param {string} identity
+ * @returns {Promise<boolean>} true when this caller holds the lock
+ */
+async function acquireReclaimLock(lockFile, identity) {
+  await mkdir(dirname(lockFile), { recursive: true });
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      await writeFile(lockFile, JSON.stringify({ owner: identity, updatedAt: Date.now() }), {
+        flag: fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY,
+      });
+      return true;
+    } catch (err) {
+      if (err?.code !== 'EEXIST') throw err;
+    }
+    let held = null;
+    try { held = JSON.parse(await readFile(lockFile, 'utf8')); } catch { held = null; }
+    const lockStale = !held || Date.now() - Number(held.updatedAt || 0) > REVIEWER_CLAIM_LEASE_MS;
+    if (!lockStale) return false; // a live holder: wait for its release
+    // Stale lock (crashed holder): move it aside, retry the exclusive create.
+    await rename(lockFile, `${lockFile}.dead.${identity}`)
+      .catch((err) => { if (err?.code !== 'ENOENT') throw err; });
+  }
+  return false; // concurrent reclaimers kept winning; the caller polls
+}
+
+/** @param {string} lockFile */
+async function releaseReclaimLock(lockFile) {
+  await rm(lockFile, { force: true }).catch(() => {});
 }
 
 /** @param {number} ms */
@@ -1347,43 +1373,34 @@ function sleep(ms) {
  */
 async function reserveReviewerLaunch({ c, change, task, launch }) {
   const file = reviewerClaimFile(change, task);
+  const lockFile = reclaimLockFile(file);
   const identity = claimIdentity();
   const deadline = Date.now() + REVIEWER_CLAIM_WAIT_MS;
+  const confirmedBinding = () => c.listRoleBindings()
+    .then((bindings) => bindings.find((b) => b.changeId === change.id && b.role === 'reviewer'));
+  const adopt = (sessionId, claimant) => c.bindRole(change.id, sessionId, 'reviewer')
+    .catch((err) => { if (err?.code === 'ALREADY_BOUND') return null; throw err; })
+    .then(() => c.appendAudit({
+      kind: 'review_orchestration', changeId: change.id, action: 'reviewer_claim_adopted',
+      sessionId, claimant: claimant ?? null,
+    }))
+    .then(() => sessionId);
   for (;;) {
     // 1. Confirmed reviewer binding: durable and visible across processes —
     //    reuse it, never launch.
-    const bound = (await c.listRoleBindings()).find((b) => b.changeId === change.id && b.role === 'reviewer');
+    const bound = await confirmedBinding();
     if (bound) return bound.sessionId;
 
     const { exists, incomplete, value: record } = await readClaimRecord(file);
+    const stale = !incomplete && exists
+      ? Date.now() - Number(record.updatedAt || 0) > REVIEWER_CLAIM_LEASE_MS
+      : false;
 
-    // 2. No claim yet: claim it atomically, then launch the single reviewer.
-    if (!exists) {
-      const won = await claimExclusiveWrite(file, { claimant: identity, sessionId: null, updatedAt: Date.now() });
-      if (!won) continue; // a concurrent claimer raced us; loop back to steps 1/3
-      return await launch({ file, identity });
-    }
-
-    // 3. Incomplete claim (holder mid-initial-write, or died mid-write):
-    //    wait it out; reclaim only after the wait window (a live holder
-    //    finishes its initial write in microseconds, so an incomplete file
-    //    that outlives the window is a dead holder's, reclaimable).
-    if (incomplete) {
-      if (Date.now() > deadline) {
-        await removeClaimFile(file);
-        continue;
-      }
-      await sleep(REVIEWER_CLAIM_POLL_MS);
-      continue;
-    }
-
-    const stale = Date.now() - Number(record.updatedAt || 0) > REVIEWER_CLAIM_LEASE_MS;
-
-    // 4. A launched session is recorded but not yet bound: the owner is
+    // 2. A launched session is recorded but not yet bound: the owner is
     //    mid-bind (wait for convergence) or crashed (adopt). Adoption binds
     //    the recorded session instead of launching a duplicate — the
     //    orphaned reviewer is reconciled, not re-created.
-    if (record.sessionId && typeof record.sessionId === 'string') {
+    if (record?.sessionId && typeof record.sessionId === 'string') {
       if (!stale) {
         if (Date.now() > deadline) {
           throw Object.assign(new Error('reviewer claim owner has not bound its session within the wait window'), { code: 'REVIEWER_CLAIM_TIMEOUT' });
@@ -1393,25 +1410,60 @@ async function reserveReviewerLaunch({ c, change, task, launch }) {
       }
       // Stale owner: bind the recorded session (a concurrent adopter may
       // have beaten us — ALREADY_BOUND is successful convergence).
-      await c.bindRole(change.id, record.sessionId, 'reviewer')
-        .catch((err) => { if (err?.code === 'ALREADY_BOUND') return null; throw err; });
-      await c.appendAudit({
-        kind: 'review_orchestration', changeId: change.id, action: 'reviewer_claim_adopted',
-        sessionId: record.sessionId, claimant: record.claimant ?? null,
-      });
-      return record.sessionId;
+      return await adopt(record.sessionId, record.claimant);
     }
 
-    // 5. No recorded session: a live owner is mid-launch (wait) or the claim
-    //    is stale (reclaim).
-    if (stale) {
-      await removeClaimFile(file);
-      continue; // retry the exclusive claim (a concurrent reclaimer may win first)
+    // 3. Fresh claim with no session: its owner is mid-launch — wait for
+    //    the session to be recorded (bounded), never launch a second
+    //    reviewer.
+    if (exists && !incomplete && !stale) {
+      if (Date.now() > deadline) {
+        throw Object.assign(new Error('reviewer claim wait exceeded window'), { code: 'REVIEWER_CLAIM_TIMEOUT' });
+      }
+      await sleep(REVIEWER_CLAIM_POLL_MS);
+      continue;
     }
-    if (Date.now() > deadline) {
-      throw Object.assign(new Error('reviewer claim wait exceeded window'), { code: 'REVIEWER_CLAIM_TIMEOUT' });
+
+    // 4. A claim must be (re)created: absent, stale-empty, or a dead
+    //    incomplete holder (past the wait window). Serialized under the
+    //    durable RECLAIM LOCK: exactly one process at a time (re)creates
+    //    the claim, overwriting it IN PLACE — no delete-then-create, no
+    //    absence window, so no stale reader can wipe a concurrent winner's
+    //    fresh claim and launch a duplicate reviewer (T-H5 PR2-02).
+    if (!(await acquireReclaimLock(lockFile, identity))) {
+      if (Date.now() > deadline) {
+        throw Object.assign(new Error('reviewer claim wait exceeded window'), { code: 'REVIEWER_CLAIM_TIMEOUT' });
+      }
+      await sleep(REVIEWER_CLAIM_POLL_MS);
+      continue;
     }
-    await sleep(REVIEWER_CLAIM_POLL_MS);
+    let created = false;
+    let adopted;
+    try {
+      // Re-validate UNDER the lock: the claim may have changed since we read.
+      const boundNow = await confirmedBinding();
+      if (boundNow) return boundNow.sessionId;
+      const r = await readClaimRecord(file);
+      const rStale = !r.incomplete && r.exists
+        ? Date.now() - Number(r.value.updatedAt || 0) > REVIEWER_CLAIM_LEASE_MS
+        : false;
+      if (r.value?.sessionId && typeof r.value.sessionId === 'string' && rStale) {
+        // A crashed owner recorded a session: reconcile it instead of launching.
+        adopted = await adopt(r.value.sessionId, r.value.claimant);
+      } else if (!(r.exists && !r.incomplete && !rStale)) {
+        // Absent, stale-empty, or dead-incomplete: (re)create the claim in
+        // place. Safe under the lock — we are the sole creator right now.
+        await writeClaimRecord(file, { claimant: identity, sessionId: null, updatedAt: Date.now() });
+        created = true;
+      }
+      // else: a fresh in-progress claim appeared while we waited — its
+      // owner is mid-launch; leave it alone and wait for its session/bind.
+    } finally {
+      await releaseReclaimLock(lockFile);
+    }
+    if (adopted !== undefined) return adopted;
+    if (created) return await launch({ file, identity });
+    continue;
   }
 }
 
