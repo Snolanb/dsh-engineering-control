@@ -89,6 +89,13 @@ test('snapshot survives reopen, task mutation, and idempotent bootstrap', async 
   const again = await reopened.taskChangeControl.bootstrapTask(taskId);
   assert.equal(again.change.id, first.change.id);
   assert.deepEqual(again.change.bootstrapSnapshot, expected);
+  // regression (TH4-F1 / repair-round-2): the repeated bootstrap's API
+  // snapshot is a detached copy of the PERSISTED canonical snapshot — not the
+  // mutated task record, not the prior returned object, not the frozen
+  // Change projection.
+  assert.deepEqual(again.snapshot, expected);
+  assert.notEqual(again.snapshot, first.snapshot);
+  assert.notEqual(again.snapshot, again.change.bootstrapSnapshot);
 });
 
 test('idempotent: sequential and concurrent bootstraps return the same Change', async (t) => {
