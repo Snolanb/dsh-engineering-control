@@ -1231,6 +1231,15 @@ function withReviewerReservation(changeId, fn) {
  * a duplicate reviewer. Losers wait on the lock, then converge on the
  * winner's claim/session/binding.
  *
+ * T-H5 PR2-03 — STALE lock recovery is generation-safe: a reclaimer grabs
+ * the slot atomically and discards ONLY the exact lock generation it
+ * observed as stale; a newer generation that landed in the slot meanwhile
+ * is restored, never evicted. Before the critical section the holder also
+ * re-verifies its lock is still in the slot (a concurrent refiller can
+ * re-create the slot in the grab gap), and release deletes only a lock it
+ * still owns. No concurrent recovery can remove a newly acquired lock or
+ * produce two holders — so no duplicate launches.
+ *
  * Claim-file layout: `<task.workspace>/.dsh-governance/reviewer-claims/
  * reviewer-claim-<changeId>`. The shared task workspace is the stable anchor
  * every host process owning the task sees; hosts without a workspace fall
@@ -1316,9 +1325,12 @@ function reclaimLockFile(claimFile) {
 
 /**
  * Exclusive-create the reclaim lock. A live lock is someone else's held lock
- * (returns false → the caller waits); a STALE lock (its holder crashed
- * before releasing) is moved aside and the acquisition retried — crash-safe
- * via the same lease as the claim.
+ * (returns false → the caller waits). A STALE lock (its holder crashed
+ * before releasing) is reclaimed generation-safely (T-H5 PR2-03): the slot
+ * is grabbed atomically and ONLY the exact observed generation is discarded;
+ * a newer generation that landed in the slot while we decided is restored,
+ * never evicted — so a stale reader can never remove another process's
+ * freshly acquired lock and double-acquire.
  * ponytail: ceiling — the lock lease reuses the 10-min claim lease; a
  * crashed holder's lock blocks successors until it expires. Add a heartbeat
  * (or shorter lock lease) only if lock holders outlive the lease.
@@ -1337,20 +1349,66 @@ async function acquireReclaimLock(lockFile, identity) {
     } catch (err) {
       if (err?.code !== 'EEXIST') throw err;
     }
+    // A lock is in the slot: read exactly what is there, then reclaim ONLY
+    // that observed generation.
+    let observedRaw;
+    try { observedRaw = await readFile(lockFile, 'utf8'); } catch { continue; }
     let held = null;
-    try { held = JSON.parse(await readFile(lockFile, 'utf8')); } catch { held = null; }
+    try { held = JSON.parse(observedRaw); } catch { held = null; }
     const lockStale = !held || Date.now() - Number(held.updatedAt || 0) > REVIEWER_CLAIM_LEASE_MS;
     if (!lockStale) return false; // a live holder: wait for its release
-    // Stale lock (crashed holder): move it aside, retry the exclusive create.
-    await rename(lockFile, `${lockFile}.dead.${identity}`)
-      .catch((err) => { if (err?.code !== 'ENOENT') throw err; });
+    // Grab the slot atomically, then verify WHAT was in it.
+    const grab = `${lockFile}.grab.${process.pid}`;
+    try {
+      await rename(lockFile, grab);
+    } catch (err) {
+      if (err?.code !== 'ENOENT') throw err;
+      continue; // vanished between check and grab: retry the exclusive create
+    }
+    const grabbedRaw = await readFile(grab, 'utf8');
+    if (grabbedRaw === observedRaw) {
+      // The EXACT stale generation we observed: safe to discard; retry the
+      // exclusive create (the slot is now empty).
+      await rm(grab, { force: true }).catch(() => {});
+      continue;
+    }
+    // A NEWER generation was acquired in the slot while we decided: restore
+    // it (if the slot was re-filled meanwhile, EEXIST → it is intact), and
+    // wait on that holder instead of racing ahead.
+    await writeFile(lockFile, grabbedRaw, {
+      flag: fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY,
+    }).catch((err) => { if (err?.code !== 'EEXIST') throw err; });
+    await rm(grab, { force: true }).catch(() => {});
+    return false;
   }
   return false; // concurrent reclaimers kept winning; the caller polls
 }
 
-/** @param {string} lockFile */
-async function releaseReclaimLock(lockFile) {
-  await rm(lockFile, { force: true }).catch(() => {});
+/**
+ * Point-of-use lock verification (T-H5 PR2-03): the holder re-checks that
+ * ITS lock is still in the slot before the critical section. A concurrent
+ * refiller can re-create the slot in a grab gap, leaving the original
+ * holder's lock evicted — that holder must back off, not launch.
+ * @param {string} lockFile
+ * @param {string} identity
+ * @returns {Promise<boolean>}
+ */
+async function verifyReclaimLockHeld(lockFile, identity) {
+  let rec = null;
+  try { rec = JSON.parse(await readFile(lockFile, 'utf8')); } catch { return false; }
+  return rec?.owner === identity && Date.now() - Number(rec.updatedAt || 0) <= REVIEWER_CLAIM_LEASE_MS;
+}
+
+/**
+ * Release the reclaim lock — deleting ONLY a lock this owner still holds
+ * (T-H5 PR2-03: a blind delete could remove a successor's fresh lock).
+ * @param {string} lockFile
+ * @param {string} identity
+ */
+async function releaseReclaimLock(lockFile, identity) {
+  let rec = null;
+  try { rec = JSON.parse(await readFile(lockFile, 'utf8')); } catch { return; }
+  if (rec?.owner === identity) await rm(lockFile, { force: true }).catch(() => {});
 }
 
 /** @param {number} ms */
@@ -1429,13 +1487,17 @@ async function reserveReviewerLaunch({ c, change, task, launch }) {
     //    durable RECLAIM LOCK: exactly one process at a time (re)creates
     //    the claim, overwriting it IN PLACE — no delete-then-create, no
     //    absence window, so no stale reader can wipe a concurrent winner's
-    //    fresh claim and launch a duplicate reviewer (T-H5 PR2-02).
-    if (!(await acquireReclaimLock(lockFile, identity))) {
+    //    fresh claim and launch a duplicate reviewer (T-H5 PR2-02). The
+    //    stale-lock recovery is generation-safe, and the holder re-verifies
+    //    its lock is still in the slot before the critical section (T-H5
+    //    PR2-03) — a lost lock means backing off, never launching.
+    for (;;) {
+      if (await acquireReclaimLock(lockFile, identity)
+        && await verifyReclaimLockHeld(lockFile, identity)) break;
       if (Date.now() > deadline) {
         throw Object.assign(new Error('reviewer claim wait exceeded window'), { code: 'REVIEWER_CLAIM_TIMEOUT' });
       }
       await sleep(REVIEWER_CLAIM_POLL_MS);
-      continue;
     }
     let created = false;
     let adopted;
@@ -1459,7 +1521,7 @@ async function reserveReviewerLaunch({ c, change, task, launch }) {
       // else: a fresh in-progress claim appeared while we waited — its
       // owner is mid-launch; leave it alone and wait for its session/bind.
     } finally {
-      await releaseReclaimLock(lockFile);
+      await releaseReclaimLock(lockFile, identity);
     }
     if (adopted !== undefined) return adopted;
     if (created) return await launch({ file, identity });
