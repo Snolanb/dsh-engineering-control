@@ -151,6 +151,7 @@ function rehydrate(serialized, events) {
     acceptanceCriteria: serialized.acceptanceCriteria,
     risk: serialized.risk,
     workItem: serialized.workItem ?? null,
+    bootstrapSnapshot: serialized.bootstrapSnapshot ?? null,
   });
   c.id = serialized.id;
   c.createdAt = serialized.createdAt;
@@ -204,10 +205,22 @@ function freezeChange(c) {
     state: c.state,
     createdAt: c.createdAt,
     updatedAt: c.updatedAt,
+    // Immutable snapshot: deeply frozen clone so callers can neither mutate the
+    // stored record nor reach it. Omitted (undefined) for legacy Changes.
+    bootstrapSnapshot: c.bootstrapSnapshot ? deepFreeze(structuredClone(c.bootstrapSnapshot)) : undefined,
   };
   Object.freeze(proj.acceptanceCriteria);
   Object.freeze(proj);
   return proj;
+}
+
+/** Deep-freeze nested objects/arrays. */
+function deepFreeze(value) {
+  if (value && typeof value === 'object' && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const key of Object.keys(value)) deepFreeze(value[key]);
+  }
+  return value;
 }
 
 export class ChangeStore {
@@ -488,6 +501,7 @@ export class ChangeStore {
           risk: c.risk,
           acceptedPlanId: c.acceptedPlanId,
           workItem: c.workItem ? { system: c.workItem.system, id: c.workItem.id } : null,
+          bootstrapSnapshot: c.bootstrapSnapshot ?? null,
           planState: c._getPlanState?.() ?? null,
           domainState: c._getDomainState?.() ?? c.state,
           createdAt: c.createdAt,
@@ -504,6 +518,7 @@ export class ChangeStore {
           acceptanceCriteria: c.acceptanceCriteria,
           risk: c.risk,
           updatedAt: c.updatedAt,
+          bootstrapSnapshot: c.bootstrapSnapshot ?? diskRec.bootstrapSnapshot ?? null,
           requiredChecks: c._requiredChecks ?? diskRec.requiredChecks ?? null,
           controllerPreflightResults: c._controllerPreflightResults ?? diskRec.controllerPreflightResults ?? null,
         });
@@ -689,7 +704,7 @@ export class ChangeStore {
           }
         }
       }
-      const change = createChange({ ...input, workItem });
+      const change = createChange({ ...input, workItem, bootstrapSnapshot: input.bootstrapSnapshot ? structuredClone(input.bootstrapSnapshot) : null });
       this.#changes.set(change.id, change);
       // Reseed from disk under lock immediately before assigning eventId,
       // so concurrent process writes are visible and no collision occurs.
@@ -712,6 +727,20 @@ export class ChangeStore {
           from: null,
           to: 'DRAFT',
           workItem: { system: workItem.system, id: workItem.id },
+          ts: change.createdAt,
+        });
+      }
+      // Immutable canonical bootstrap snapshot: append-only record of the
+      // original task context, tied to this Change (typed, non-transition).
+      if (change.bootstrapSnapshot) {
+        this.#audit.push({
+          eventId: nextEventId(),
+          changeId: change.id,
+          type: 'BOOTSTRAP_SNAPSHOT',
+          from: null,
+          to: 'DRAFT',
+          workItem: workItem ? { system: workItem.system, id: workItem.id } : null,
+          bootstrapSnapshot: change.bootstrapSnapshot,
           ts: change.createdAt,
         });
       }
@@ -782,7 +811,7 @@ export class ChangeStore {
           return freezeChange(c);
         }
       }
-      const change = createChange({ ...input, workItem });
+      const change = createChange({ ...input, workItem, bootstrapSnapshot: input.bootstrapSnapshot ? structuredClone(input.bootstrapSnapshot) : null });
       this.#changes.set(change.id, change);
       await reseedFromDisk(this.#file);
       this.#audit.push({
@@ -801,6 +830,20 @@ export class ChangeStore {
         workItem: { system: workItem.system, id: workItem.id },
         ts: change.createdAt,
       });
+      // Immutable canonical bootstrap snapshot: append-only record of the
+      // original task context, tied to this Change (typed, non-transition).
+      if (change.bootstrapSnapshot) {
+        this.#audit.push({
+          eventId: nextEventId(),
+          changeId: change.id,
+          type: 'BOOTSTRAP_SNAPSHOT',
+          from: null,
+          to: 'DRAFT',
+          workItem: { system: workItem.system, id: workItem.id },
+          bootstrapSnapshot: change.bootstrapSnapshot,
+          ts: change.createdAt,
+        });
+      }
       await this.#persist();
       return freezeChange(change);
     } finally {

@@ -202,6 +202,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
             title: snapshot.title,
             objective: snapshot.description || snapshot.title,
             acceptanceCriteria: snapshot.acceptance_criteria,
+            bootstrapSnapshot: snapshot,
           },
         });
         // Denormalized projection (repairs drift; Change side stays canon).

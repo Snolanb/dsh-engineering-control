@@ -70,10 +70,11 @@ export const TRANSITIONS = deepFreeze({
  * @param {string[]} [params.acceptanceCriteria=[]]
  * @param {'low'|'normal'|'high'|null} [params.risk=null] unset until a host decision
  * @param {{ system: string, id: string } | null} [params.workItem=null]
+ * @param {object | null} [params.bootstrapSnapshot=null] immutable canonical task snapshot
  * @returns {Change}
  */
-export function createChange({ title, objective = '', acceptanceCriteria = [], risk = null, workItem = null }) {
-  return new Change({ title, objective, acceptanceCriteria, risk, workItem });
+export function createChange({ title, objective = '', acceptanceCriteria = [], risk = null, workItem = null, bootstrapSnapshot = null }) {
+  return new Change({ title, objective, acceptanceCriteria, risk, workItem, bootstrapSnapshot });
 }
 
 /**
@@ -89,8 +90,9 @@ export class Change {
    * @param {string[]} [params.acceptanceCriteria]
    * @param {'low'|'normal'|'high'|null} [params.risk]
    * @param {{ system: string, id: string } | null} [params.workItem]
+   * @param {object | null} [params.bootstrapSnapshot]
    */
-  constructor({ title, objective = '', acceptanceCriteria = [], risk = null, workItem = null }) {
+  constructor({ title, objective = '', acceptanceCriteria = [], risk = null, workItem = null, bootstrapSnapshot = null }) {
     /** @type {string} */
     this.id = crypto.randomUUID();
     /** @type {string} */
@@ -109,6 +111,12 @@ export class Change {
      * @type {{ system: string, id: string } | null}
      */
     this.workItem = workItem;
+    /**
+     * Immutable canonical task bootstrap snapshot, captured once at bootstrap
+     * and never rewritten. null when the Change predates snapshots.
+     * @type {object | null}
+     */
+    this.bootstrapSnapshot = bootstrapSnapshot;
     /** @type {string} */
     this.createdAt = new Date().toISOString();
     /** @type {string} */
