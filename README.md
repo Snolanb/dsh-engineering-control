@@ -30,6 +30,26 @@ pnpm typecheck   # run every package's typecheck (change-control: tsc --checkJs)
 Per-package scripts can also be run directly, e.g.
 `pnpm --filter dsh-task-orchestrator test`.
 
+## CI command contract
+
+`.github/workflows/ci.yml` runs the same root commands on every pull request
+and on pushes to `main`, in a clean checkout (no `node_modules`, no lockfile
+mutations, no machine-local paths or symlinks):
+
+```sh
+pnpm install --frozen-lockfile   # install from the committed lockfile, fail on drift
+pnpm build                       # build every package that declares a build step
+pnpm test                        # run every package's suite, incl. task-change-control integration tests
+pnpm typecheck                   # typecheck every package that declares a typecheck step
+```
+
+The workflow pins Node to the repository-declared `>=22.5.0` engine and pnpm
+`10.28.0` (the committed `packageManager`). The root scripts dispatch via
+`pnpm -r --if-present`, so a clean checkout exercises all three packages:
+`task-orchestrator`, `change-control`, and the `task-change-control`
+integration package (whose suite covers task ↔ Change linkage, bootstrap,
+governed completion, and reviewer-launcher integration).
+
 ## Host-provided runtime dependencies
 
 `@deepseek-ai/dsh-tools` is a **peer dependency** of every plugin package
