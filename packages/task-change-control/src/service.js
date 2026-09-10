@@ -202,11 +202,20 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
             title: snapshot.title,
             objective: snapshot.description || snapshot.title,
             acceptanceCriteria: snapshot.acceptance_criteria,
+            bootstrapSnapshot: snapshot,
           },
         });
+        // API snapshot is the PERSISTED canonical one: when the resolved
+        // Change carries a bootstrapSnapshot, return a detached copy of it so a
+        // repeat bootstrap after task mutation never re-exposes the mutated
+        // task record; the task-derived snapshot is retained only for Changes
+        // that predate snapshots (legacy).
+        const apiSnapshot = change.bootstrapSnapshot
+          ? structuredClone(change.bootstrapSnapshot)
+          : snapshot;
         // Denormalized projection (repairs drift; Change side stays canon).
         await api.linkTaskChange(taskId);
-        return { change, snapshot };
+        return { change, snapshot: apiSnapshot };
       })();
     },
 

@@ -33,6 +33,39 @@ const snapshot = (change) => ({
   updatedAt: change.updatedAt,
 });
 
+// T-H4: canonical bootstrap snapshots are durable and immutable.
+test('persists bootstrap snapshot across reopen without rewriting it', () => withStore(async (file) => {
+  const bootstrapSnapshot = {
+    title: 'canonical title', description: 'canonical objective body',
+    acceptance_criteria: ['ac-1', 'ac-2'], workspace: '/ws', repo: 'org/repo',
+    branch: 'feat/x', task_type: 'story', project_id: null, milestone_id: null,
+  };
+  const first = await ChangeStore.open(file);
+  const created = await first.create({
+    title: bootstrapSnapshot.title, objective: bootstrapSnapshot.description,
+    acceptanceCriteria: bootstrapSnapshot.acceptance_criteria, risk: 'normal',
+    bootstrapSnapshot,
+  });
+  const second = await ChangeStore.open(file);
+  assert.deepEqual((await second.get(created.id)).bootstrapSnapshot, bootstrapSnapshot);
+  assert.equal(Object.isFrozen((await second.get(created.id)).bootstrapSnapshot), true);
+}));
+
+test('rehydrates legacy Changes that predate bootstrap snapshots', () => withStore(async (file) => {
+  const id = 'legacy-change';
+  await writeFile(file, JSON.stringify({
+    changes: [{ id, title: 'Legacy', objective: 'Old format', acceptanceCriteria: [], risk: 'normal',
+      acceptedPlanId: null, workItem: { system: 'dsh-task-orchestrator', id: 'legacy-task' },
+      domainState: 'DRAFT', planState: null, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }],
+    audit: [], plans: [], bindings: [], attempts: {}, proofs: {}, preflightResults: {}, gateSatisfaction: {},
+    repairClaims: {}, repairProofs: {}, budgets: {}, governanceModes: {}, reviews: {},
+  }), 'utf8');
+  const store = await ChangeStore.open(file);
+  const change = await store.get(id);
+  assert.equal(change.title, 'Legacy');
+  assert.equal(change.bootstrapSnapshot, undefined);
+}));
+
 // AC1: Changes survive restart with identical IDs/data and latest legal state.
 test('persists changes and latest legal state across restart', () => withStore(async (file) => {
   const first = await ChangeStore.open(file);

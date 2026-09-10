@@ -57,6 +57,47 @@ test('spoofed overrides are ignored: bootstrap snapshots the canonical task reco
   assert.equal(JSON.stringify(change).includes('SPOOFED'), false);
 });
 
+test('persists the complete canonical task snapshot on the linked Change', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'tcc-bootstrap-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const { ctx, taskStore } = await composeFresh(t, dir);
+  const taskId = await makeTask(taskStore);
+  const expected = {
+    title: 'canonical title',
+    description: 'canonical objective body',
+    acceptance_criteria: ['ac-1', 'ac-2'],
+    workspace: '/ws', repo: 'org/repo', branch: 'feat/x',
+    task_type: 'story', project_id: null, milestone_id: null,
+  };
+  const { change, snapshot } = await ctx.taskChangeControl.bootstrapTask(taskId);
+  assert.deepEqual(snapshot, expected);
+  assert.deepEqual(change.bootstrapSnapshot, expected);
+  assert.equal(Object.isFrozen(change.bootstrapSnapshot), true);
+});
+
+test('snapshot survives reopen, task mutation, and idempotent bootstrap', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'tcc-bootstrap-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const { ctx, taskStore } = await composeFresh(t, dir);
+  const taskId = await makeTask(taskStore);
+  const first = await ctx.taskChangeControl.bootstrapTask(taskId);
+  const expected = structuredClone(first.snapshot);
+  await taskStore.update(taskId, { title: 'mutated title', description: 'mutated description', acceptance_criteria: ['mutated'] });
+  const { ctx: reopened } = await compose(t, join(dir, 'changes.json'), join(dir, 'tasks.db'));
+  const afterReopen = await reopened.changeControl.findByWorkItem(SYSTEM, taskId);
+  assert.deepEqual(afterReopen.bootstrapSnapshot, expected);
+  const again = await reopened.taskChangeControl.bootstrapTask(taskId);
+  assert.equal(again.change.id, first.change.id);
+  assert.deepEqual(again.change.bootstrapSnapshot, expected);
+  // regression (TH4-F1 / repair-round-2): the repeated bootstrap's API
+  // snapshot is a detached copy of the PERSISTED canonical snapshot — not the
+  // mutated task record, not the prior returned object, not the frozen
+  // Change projection.
+  assert.deepEqual(again.snapshot, expected);
+  assert.notEqual(again.snapshot, first.snapshot);
+  assert.notEqual(again.snapshot, again.change.bootstrapSnapshot);
+});
+
 test('idempotent: sequential and concurrent bootstraps return the same Change', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'tcc-bootstrap-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
