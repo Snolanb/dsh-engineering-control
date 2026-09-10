@@ -721,3 +721,65 @@ test('T-H5 PR2-02: stress — many host processes racing to take over the same s
   assert.equal(duplicateTrial, 0,
     `trial ${duplicateTrial} launched duplicate reviewers (one launch, one binding, no orphaned loser required)`);
 });
+
+// ─── T-H5 PR2-03 — stale reclaim-lock recovery race (multi-process stress) ─
+
+test('T-H5 PR2-03: stress — many host processes racing to reclaim a stale claim through a STALE RECLAIM LOCK launch exactly ONE reviewer', async (t) => {
+  // The pre-fix race: acquireReclaimLock read a stale lock and then
+  // UNCONDITIONALLY renamed the lock file aside; a fresh lock created by
+  // another process in that window got moved out of the slot, and the stale
+  // reader exclusive-created its own lock — two concurrent lock holders, two
+  // claim creators, duplicate reviewer launches (orphaned losers). Run
+  // independent trials with many processes and stop at the FIRST trial that
+  // violates the invariant — exactly ONE reviewer launch, ONE binding, no
+  // orphaned loser.
+  const N = 16;          // host processes per trial (sized to stay fast under full-suite parallel load)
+  const MAX_TRIALS = 30; // cap: post-fix every trial is clean, so all run
+  let duplicateTrial = 0;
+  for (let trial = 1; trial <= MAX_TRIALS; trial += 1) {
+    const { ctx, taskStore, dir } = await compose(t);
+    const { task, change } = await governedReadyTask(ctx, taskStore, dir);
+    // Land in PREFLIGHT with NO reviewer, then pre-stage the finding's
+    // "stale empty claim" PLUS a "stale reclaim lock" (its holder died
+    // while breaking the lock): every contender must run the stale-lock
+    // recovery path before it can (re)create the claim.
+    await dispatchGovernedSuccess(ctx, taskStore, dir, change, { preflight: ['FAIL: build'] });
+    assert.equal((await ctx.changeControl.get(change.id)).state, 'PREFLIGHT');
+    const claimFile = reviewerClaimFileFor(task, change);
+    await mkdir(dirname(claimFile), { recursive: true });
+    await writeFile(claimFile, JSON.stringify({
+      claimant: 'dead-host:9999',
+      sessionId: null,
+      updatedAt: Date.now() - 2 * 10 * 60 * 1000,
+    }), 'utf8');
+    await writeFile(`${claimFile}.lock`, JSON.stringify({
+      owner: 'dead-locker:4242',
+      updatedAt: Date.now() - 2 * 10 * 60 * 1000, // stale: beyond the 10-minute lease
+    }), 'utf8');
+
+    const children = await Promise.all(Array.from({ length: N }, () => spawnReviewerProcess(dir, task.id)));
+    children.forEach((ch, i) => assert.equal(ch.code, 0, `trial ${trial} host ${i} must complete: ${ch.stderr || ch.stdout}`));
+    const results = children.map((ch) => JSON.parse(ch.stdout));
+    results.forEach((r, i) => assert.equal(r.outcome, 'review_pending', `trial ${trial} host ${i} converges to review_pending`));
+
+    let launches = 0;
+    try {
+      launches = readFileSync(join(dir, 'reviewer-launches.log'), 'utf8').trim().split('\n').filter(Boolean).length;
+    } catch { /* zero launches is a violation, recorded below */ }
+    // No orphaned loser: every process must converge on the SAME reviewer
+    // session — a process that launched its own reviewer left an orphan.
+    const sessions = new Set(results.map((r) => r.sessionId));
+    const reviewers = (await ctx.changeControl.listRoleBindings())
+      .filter((b) => b.changeId === change.id && b.role === 'reviewer');
+    const diskState = JSON.parse(readFileSync(join(dir, 'changes.json'), 'utf8')).changes
+      .find((c) => c.id === change.id).domainState;
+    const ok = launches === 1 && sessions.size === 1 && reviewers.length === 1
+      && diskState === 'REVIEW' && reviewers[0].sessionId === results[0].sessionId;
+    if (!ok) {
+      duplicateTrial = trial;
+      break;
+    }
+  }
+  assert.equal(duplicateTrial, 0,
+    `trial ${duplicateTrial} launched duplicate reviewers (one launch, one binding, no orphaned loser required)`);
+});
