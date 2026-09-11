@@ -1,13 +1,13 @@
 /**
  * Minimal file-backed JSON store for durable Change persistence + append-only audit.
  * ponytail: module-level writeLock keyed by canonical (absolute) file path coordinates
- * writers within a process, plus a mkdir-based disk lock (acquireDiskLock) around every
- * state-changing operation's read-validate-mutate-audit-persist window so ACROSS-process
- * writers on one JSON file serialize and cannot lose each other's mutations or double-apply
- * stale transitions. Unique tmp paths prevent overlapping atomic writes from unlinking each
- * other's temp file. Each transition refreshes the target change from disk before
- * validating/mutating, so stale in-memory state is reconciled and rejected transitions
- * don't append events.
+ * writers within a process, plus a mkdir-based disk lock (acquireDiskLock) around
+ * compare-and-mutate operations' read-validate-mutate-audit-persist windows so
+ * ACROSS-process writers on one JSON file serialize and cannot lose each other's
+ * mutations or double-apply stale transitions. Unique tmp paths prevent overlapping
+ * atomic writes from unlinking each other's temp file. Each transition refreshes the
+ * target change from disk before validating/mutating, so stale in-memory state is
+ * reconciled and rejected transitions don't append events.
  */
 // @ts-nocheck
 import { readFile, writeFile, rename, unlink, mkdir, rmdir, stat } from 'node:fs/promises';
@@ -70,11 +70,18 @@ function rotate(key) {
  */
 async function acquireWriteLock(file) {
   const release = await acquireLock(file);
-  const releaseDisk = await acquireDiskLock(file);
-  return async () => {
-    await releaseDisk();
+  try {
+    const releaseDisk = await acquireDiskLock(file);
+    return async () => {
+      await releaseDisk();
+      release();
+    };
+  } catch (error) {
+    // A disk-lock timeout must not strand the process-local queue behind this
+    // failed operation; later calls on the same store must remain usable.
     release();
-  };
+    throw error;
+  }
 }
 
 /**
@@ -1012,7 +1019,7 @@ export class ChangeStore {
    * acceptedPlanId resets to null.
    */
   async submitPlan(changeId, content) {
-    const release = await acquireLock(this.#file);
+    const release = await acquireWriteLock(this.#file);
     try {
       await this.#refreshChange(changeId);
       const c = this.#changes.get(changeId);
@@ -1069,7 +1076,7 @@ export class ChangeStore {
       await this.#persist();
       return structuredClone(plan);
     } finally {
-      release();
+      await release();
     }
   }
 
@@ -1239,7 +1246,7 @@ export class ChangeStore {
    * binding durably (removal wins over disk state).
    */
   async unbindRole(changeId, sessionId, { actor } = {}) {
-    const release = await acquireLock(this.#file);
+    const release = await acquireWriteLock(this.#file);
     try {
       await this.#refreshChange(changeId);
       const c = this.#changes.get(changeId);
@@ -1266,7 +1273,7 @@ export class ChangeStore {
       await this.#persist();
       return { removed: true, changeId, sessionId };
     } finally {
-      release();
+      await release();
     }
   }
 
