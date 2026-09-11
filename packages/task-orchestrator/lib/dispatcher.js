@@ -502,18 +502,18 @@ export function workerCompletionOutputSchema() {
     type: 'object',
     additionalProperties: false,
     properties: {
-      protocol: { type: 'string', const: WORKER_COMPLETION_PROTOCOL },
-      beforeRevision: { type: 'string' },
-      afterRevision: { type: 'string' },
-      commit_sha: { type: 'string' },
-      files_changed: { type: 'array', items: { type: 'string' } },
-      tests_run: { type: 'array', items: { type: 'string' } },
-      remaining_blockers: { type: 'array', items: { type: 'string' } },
-      criteria: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { id: { type: 'string' }, satisfied: { type: 'boolean' } } } },
-      deviations: { type: 'array' },
-      workerChecks: { type: 'array', items: { type: 'string' } },
-      controllerPreflight: { type: 'array', items: { type: 'string' } },
-      summary: { type: 'string' },
+      protocol: { type: 'string', const: WORKER_COMPLETION_PROTOCOL, required: true },
+      beforeRevision: { type: 'string', required: true },
+      afterRevision: { type: 'string', required: true },
+      commit_sha: { type: 'string', required: true },
+      files_changed: { type: 'array', items: { type: 'string' }, required: true },
+      tests_run: { type: 'array', items: { type: 'string' }, required: true },
+      remaining_blockers: { type: 'array', items: { type: 'string' }, required: true },
+      criteria: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { id: { type: 'string' }, satisfied: { type: 'boolean' } } }, required: true },
+      deviations: { type: 'array', required: true },
+      workerChecks: { type: 'array', items: { type: 'string' }, required: true },
+      controllerPreflight: { type: 'array', items: { type: 'string' }, required: true },
+      summary: { type: 'string', required: true },
     },
   }
 }
@@ -553,7 +553,15 @@ export function validateWorkerCompletion(meta) {
     throw completionError('WORKER_COMPLETION_INVALID', 'worker completion criteria must be an array')
   }
   for (const criterion of meta.criteria) {
-    if (criterion === null || typeof criterion !== 'object' || typeof criterion.id !== 'string' || criterion.id.trim() === '' || typeof criterion.satisfied !== 'boolean') {
+    if (criterion === null || typeof criterion !== 'object' || Array.isArray(criterion)) {
+      throw completionError('WORKER_COMPLETION_INVALID', 'worker completion criteria entries must be { id: non-empty string, satisfied: boolean }')
+    }
+    for (const key of Object.keys(criterion)) {
+      if (key !== 'id' && key !== 'satisfied') {
+        throw completionError('WORKER_COMPLETION_INVALID', 'worker completion criterion has unexpected field: ' + key)
+      }
+    }
+    if (typeof criterion.id !== 'string' || criterion.id.trim() === '' || typeof criterion.satisfied !== 'boolean') {
       throw completionError('WORKER_COMPLETION_INVALID', 'worker completion criteria entries must be { id: non-empty string, satisfied: boolean }')
     }
   }
@@ -568,39 +576,61 @@ export function validateWorkerCompletion(meta) {
  */
 function extractWorkerCompletion(events, afterSeq) {
   const postBaseline = events.filter(event => event && Number.isSafeInteger(event.seq) && event.seq > afterSeq)
-  const completionCalls = new Set()
+  const completionCalls = []
   const results = []
   for (const event of postBaseline) {
     if (event.type === 'tool/call') {
       const callId = event.data?.callId
-      if (typeof callId === 'string' && event.data?.name === WORKER_COMPLETION_TOOL) completionCalls.add(callId)
+      if (typeof callId === 'string' && event.data?.name === WORKER_COMPLETION_TOOL) completionCalls.push(callId)
     } else if (event.type === 'tool/result') {
       const block = event.data?.message?.content?.[0]
       const toolCallId = block?.toolCallId
       if (typeof toolCallId === 'string') {
-        const meta = event.data?.meta
-        if (meta && typeof meta === 'object' && meta.protocol === WORKER_COMPLETION_PROTOCOL) {
-          results.push({ toolCallId, meta, failed: event.data?.error != null || block?.isError === true })
-        }
+        results.push({
+          toolCallId,
+          meta: event.data?.meta,
+          failed: event.data?.error != null || block?.isError === true,
+        })
       }
     }
   }
-  const completionAttempted = completionCalls.size > 0 || results.length > 0
+
+  // Every worker_complete tool/call is an attempt; every tool/result carrying the
+  // completion protocol marker (or attributable to a completion call) is also an
+  // attempt, so a malformed/failed/duplicate/unmatched completion can never be
+  // silently dropped in favour of one surviving valid result.
+  const isProtocolResult = result => result.meta && typeof result.meta === 'object' && result.meta.protocol === WORKER_COMPLETION_PROTOCOL
+  const completionResults = results.filter(result => isProtocolResult(result) || completionCalls.includes(result.toolCallId))
+  const completionAttempted = completionCalls.length > 0 || completionResults.length > 0
   if (!completionAttempted) return null
 
-  if (results.length === 0) {
+  if (completionCalls.length > 1) {
+    throw completionError('WORKER_COMPLETION_DUPLICATE', 'worker produced ' + completionCalls.length + ' completion calls; exactly one is required')
+  }
+  // Any attempted completion whose result is failed or lacks the protocol marker
+  // (wrong protocol / error / non-protocol meta for a completion call) fails
+  // closed even when another valid result exists.
+  for (const result of completionResults) {
+    if (result.failed) {
+      throw completionError('WORKER_COMPLETION_FAILED', 'worker completion tool reported an error')
+    }
+    if (!isProtocolResult(result)) {
+      throw completionError('WORKER_COMPLETION_MISSING', 'worker completed but its ' + WORKER_COMPLETION_TOOL + ' produced no ' + WORKER_COMPLETION_PROTOCOL + ' result')
+    }
+    if (completionCalls.length === 0 || !completionCalls.includes(result.toolCallId)) {
+      throw completionError('WORKER_COMPLETION_UNATTRIBUTED', 'worker completion result is not attributable to this session completion call')
+    }
+  }
+
+  const validResults = completionResults.filter(result => isProtocolResult(result) && !result.failed)
+  if (validResults.length === 0) {
     throw completionError('WORKER_COMPLETION_MISSING', 'worker completed but produced no ' + WORKER_COMPLETION_PROTOCOL + ' result')
   }
-  if (results.length > 1) {
-    throw completionError('WORKER_COMPLETION_DUPLICATE', 'worker produced ' + results.length + ' completion results; exactly one is required')
+  if (validResults.length > 1) {
+    throw completionError('WORKER_COMPLETION_DUPLICATE', 'worker produced ' + validResults.length + ' completion results; exactly one is required')
   }
-  const result = results[0]
-  if (result.failed) {
-    throw completionError('WORKER_COMPLETION_FAILED', 'worker completion tool reported an error')
-  }
-  // Attribute the result to a completion call in THIS session's window; an
-  // orphan/stale/replayed result (no matching call) fails closed.
-  if (!completionCalls.has(result.toolCallId)) {
+  const result = validResults[0]
+  if (completionCalls.length === 1 && result.toolCallId !== completionCalls[0]) {
     throw completionError('WORKER_COMPLETION_UNATTRIBUTED', 'worker completion result is not attributable to this session completion call')
   }
   return validateWorkerCompletion(result.meta)

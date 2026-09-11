@@ -44,6 +44,13 @@ test('the production tools seam registers a worker_complete tool with a presenta
   for (const key of ['protocol', 'beforeRevision', 'afterRevision', 'commit_sha', 'files_changed', 'tests_run', 'remaining_blockers', 'criteria', 'deviations', 'workerChecks', 'controllerPreflight', 'summary']) {
     assert.ok(key in tool.output.schema.properties, 'output schema missing envelope field: ' + key)
   }
+  // H9-FR-01: every envelope property is required in the compiled schema, so the
+  // producer cannot emit an incomplete envelope.
+  assert.deepEqual(
+    [...(tool.output.schema.required ?? [])].sort(),
+    ['afterRevision', 'beforeRevision', 'commit_sha', 'controllerPreflight', 'criteria', 'deviations', 'files_changed', 'protocol', 'remaining_blockers', 'summary', 'tests_run', 'workerChecks'].sort(),
+    'compiled output schema must mark all 12 envelope properties required',
+  )
 })
 
 test('the registered worker_complete tool produces the canonical envelope via presentationMeta', async () => {
@@ -122,4 +129,49 @@ test('buildWorkerCompletionEnvelope and workerCompletionOutputSchema agree on th
   assert.deepEqual(Object.keys(envelope).sort(), ['afterRevision', 'beforeRevision', 'commit_sha', 'controllerPreflight', 'criteria', 'deviations', 'files_changed', 'protocol', 'remaining_blockers', 'summary', 'tests_run', 'workerChecks'].sort())
   const schema = workerCompletionOutputSchema()
   assert.deepEqual(Object.keys(schema.properties).sort(), Object.keys(envelope).sort())
+})
+
+// H9-FR-01: the compiled DSH output schema must reject an empty object because
+// every envelope property is required (previously it validated `{}` cleanly).
+test('the compiled output schema requires all 12 envelope properties (rejects an empty object)', () => {
+  const tool = workerCompleteTool()
+  const required = tool.output.schema.required ?? []
+  const keys = Object.keys(tool.output.schema.properties)
+  // Every property is required, so `{}` triggers a missing-required violation
+  // for every key — the incomplete output can never pass the compiled schema.
+  assert.equal(keys.length, 12)
+  for (const key of keys) {
+    assert.ok(required.includes(key), 'compiled schema must require envelope field: ' + key)
+  }
+  assert.equal(required.length, 12)
+})
+
+// H9-FR-02: an extra key on a nested criterion is rejected by the producer
+// parameter schema (additionalProperties: false) — no partial criterion leaks.
+test('worker_complete rejects a criterion object with an unknown key', async () => {
+  const tool = workerCompleteTool()
+  await assert.rejects(() => tool.execute(validArgs({ criteria: [{ id: 'ship', satisfied: true, extra: 'unexpected' }] }), {}))
+})
+
+// H9-FR-02: the consumer validator rejects an unknown key on a nested criterion
+// even when the DSH value-schema subset cannot express nested required keys.
+test('validateWorkerCompletion rejects an unknown key on a nested criterion', () => {
+  const meta = {
+    protocol: WORKER_COMPLETION_PROTOCOL,
+    beforeRevision: 'main@baseline',
+    afterRevision: 'abc123',
+    commit_sha: 'abc123',
+    files_changed: [],
+    tests_run: [],
+    remaining_blockers: [],
+    criteria: [{ id: 'ship', satisfied: true, extra: 'unexpected' }],
+    deviations: [],
+    workerChecks: [],
+    controllerPreflight: [],
+    summary: 'done',
+  }
+  assert.throws(
+    () => validateWorkerCompletion(meta),
+    (e) => e?.code === 'WORKER_COMPLETION_INVALID' && /criterion/.test(e?.message),
+  )
 })

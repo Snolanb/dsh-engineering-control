@@ -330,6 +330,49 @@ test('session launcher fails closed on duplicate/replayed completion results', a
   assert.notEqual(result.exitCode, 0)
 })
 
+// H9-FR-02: an extra key on a nested criterion is rejected by the consumer even
+// when a otherwise-complete envelope otherwise validates.
+test('session launcher fails closed on an unknown key in a nested criterion', async () => {
+  const meta = completionEnvelope()
+  meta.criteria = [{ id: 'ship', satisfied: true, unexpected: 'key' }]
+  const { handle } = await launchCompletionSession(completionEvents(0, meta))
+  const result = await handle.wait()
+  assert.notEqual(result.exitCode, 0)
+  assert.equal(result.code, 'WORKER_COMPLETION_INVALID')
+  assert.match(result.error ?? result.stderr, /criterion .* unexpected field|unexpected field/)
+})
+
+// H9-FR-03: a second worker_complete call whose result carries the wrong protocol
+// is an attempted completion that must fail closed — it cannot be silently dropped
+// in favour of the one valid result.
+test('session launcher fails closed on a mixed valid/invalid completion (wrong-protocol result for a second call)', async () => {
+  const base = 0
+  const events = [
+    ...completionEvents(base, completionEnvelope()), // c1: valid
+    { event: { seq: base + 6, type: 'tool/call', data: { turn: 1, step: 2, callId: 'call-2', name: 'worker_complete', arguments: '{}' } } },
+    { event: { seq: base + 7, type: 'tool/result', data: { turn: 1, step: 2, message: { content: [{ type: 'tool-result', toolCallId: 'call-2', content: [{ type: 'text', text: 'done' }], isError: false }] }, meta: { protocol: 'other.protocol' } } } },
+    { event: { seq: base + 8, type: 'turn/end', data: { reason: { kind: 'completed' } } } },
+  ]
+  const { handle } = await launchCompletionSession(events)
+  const result = await handle.wait()
+  assert.notEqual(result.exitCode, 0)
+})
+
+// H9-FR-03: a failed (isError) worker_complete result cannot be ignored when a
+// valid result also exists — the whole completion must fail closed.
+test('session launcher fails closed on a mixed valid/failed completion (error result for a second call)', async () => {
+  const base = 0
+  const events = [
+    ...completionEvents(base, completionEnvelope()), // c1: valid
+    { event: { seq: base + 6, type: 'tool/call', data: { turn: 1, step: 2, callId: 'call-2', name: 'worker_complete', arguments: '{}' } } },
+    { event: { seq: base + 7, type: 'tool/result', data: { turn: 1, step: 2, message: { content: [{ type: 'tool-result', toolCallId: 'call-2', content: [{ type: 'text', text: 'boom' }], isError: true }] }, meta: completionEnvelope({ commit_sha: 'def456' }) } } },
+    { event: { seq: base + 8, type: 'turn/end', data: { reason: { kind: 'completed' } } } },
+  ]
+  const { handle } = await launchCompletionSession(events)
+  const result = await handle.wait()
+  assert.notEqual(result.exitCode, 0)
+})
+
 test('session launcher ignores stale completion results before the baseline sequence', async () => {
   // A completion tool/result from a PRIOR turn (seq <= baselineSeq) must not
   // be surfaced: the current completed turn carried no fresh completion call,
