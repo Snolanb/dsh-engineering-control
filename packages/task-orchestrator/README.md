@@ -154,10 +154,17 @@ A dispatcher should poll task_list({ ready_to_run: true, worker_profile }) or GE
 Session-mode workers return structured completion data through a DSH-native
 carrier, never parsed from assistant prose:
 
-- A worker-scoped ToolRuntime completion tool (`worker_complete`) emits its
-  strict result envelope via `output.presentationMeta()`. DSH appends that
-  meta verbatim to the durable `tool/result` SessionEvent, so the host
-  `session.history` RPC returns it as a raw event.
+- The Task Orchestrator tools seam registers a worker-scoped ToolRuntime
+  completion tool (`worker_complete`). Its `execute` assembles and validates
+  the strict 12-key envelope and its `output.presentationMeta()` returns it,
+  so DSH appends that meta verbatim to the durable `tool/result` SessionEvent
+  which the host `session.history` RPC returns as a raw event. `worker_complete`
+  only builds/validates the payload: it has no store access, no session
+  binding, and no governance transition, so a model can never self-bind or
+  advance Change state by calling it.
+- The worker prompt explicitly instructs workers to finish by calling
+  `worker_complete` with the real evidence (commit_sha, revisions, files,
+  tests, criteria).
 - The session launcher correlates the `tool/call` (name + `callId`) with the
   matching `tool/result` (`toolCallId` + `meta`) after its prompt baseline and
   surfaces exactly one envelope on the `wait()` outcome.

@@ -43,6 +43,13 @@ export function buildTaskPrompt(task, spec, runId) {
     '- Do not create GitHub issues or pull requests unless the task explicitly requests it.',
     '- Run the required tests before reporting completion.',
     '- Report blockers instead of hiding them in prose.',
+    '',
+    'Completion:',
+    '- When done, call the ' + WORKER_COMPLETION_TOOL + ' tool with the real evidence from your run:',
+    '  commit_sha (the commit you produced), beforeRevision, afterRevision,',
+    '  files_changed, tests_run, remaining_blockers, criteria (one entry per',
+    '  acceptance criterion above with id and satisfied), and summary.',
+    '- Do not report completion in prose if the ' + WORKER_COMPLETION_TOOL + ' tool is available.',
   ].join('\n')
 }
 
@@ -445,12 +452,15 @@ function sessionAssistantText(events, afterSeq = -1) {
 // fabricated. Exactly one valid envelope is required whenever a completion was
 // attempted; duplicate/missing/malformed/partial/stale/replayed results fail
 // closed.
-const WORKER_COMPLETION_PROTOCOL = 'dsh.worker-completion.v1'
-const WORKER_COMPLETION_TOOL = 'worker_complete'
+export const WORKER_COMPLETION_PROTOCOL = 'dsh.worker-completion.v1'
+export const WORKER_COMPLETION_TOOL = 'worker_complete'
 
 const REQUIRED_STRING_FIELDS = ['protocol', 'beforeRevision', 'afterRevision', 'commit_sha', 'summary']
 const REQUIRED_STRING_ARRAY_FIELDS = ['files_changed', 'tests_run', 'remaining_blockers', 'workerChecks', 'controllerPreflight']
 const REQUIRED_ARRAY_FIELDS = ['deviations']
+// Hoisted to module scope (H9-ADV-02) so the validator does not reallocate it
+// per call, and so the producer tool can reuse the exact key set.
+export const WORKER_COMPLETION_FIELDS = ['protocol', 'beforeRevision', 'afterRevision', 'commit_sha', 'files_changed', 'tests_run', 'remaining_blockers', 'criteria', 'deviations', 'workerChecks', 'controllerPreflight', 'summary']
 
 function completionError(code, message) {
   const error = new Error(message)
@@ -459,18 +469,67 @@ function completionError(code, message) {
 }
 
 /**
+ * Assemble and strict-validate the worker-owned completion envelope from the
+ * tool arguments supplied by the worker. `protocol` is injected by the tool
+ * (never trusted from the model); optional array fields default to [].
+ * Throws WORKER_COMPLETION_INVALID on any missing/malformed field.
+ */
+export function buildWorkerCompletionEnvelope(input) {
+  const envelope = {
+    protocol: WORKER_COMPLETION_PROTOCOL,
+    beforeRevision: input?.beforeRevision,
+    afterRevision: input?.afterRevision,
+    commit_sha: input?.commit_sha,
+    files_changed: input?.files_changed,
+    tests_run: input?.tests_run,
+    remaining_blockers: input?.remaining_blockers,
+    criteria: input?.criteria,
+    deviations: input?.deviations ?? [],
+    workerChecks: input?.workerChecks ?? [],
+    controllerPreflight: input?.controllerPreflight ?? [],
+    summary: input?.summary,
+  }
+  return validateWorkerCompletion(envelope)
+}
+
+/**
+ * Output value schema for the canonical envelope, expressed in the DSH
+ * value-schema DSL. Mirrors {@link validateWorkerCompletion} exactly: a
+ * consumer can never accept a producer envelope this schema would reject.
+ */
+export function workerCompletionOutputSchema() {
+  return {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      protocol: { type: 'string', const: WORKER_COMPLETION_PROTOCOL },
+      beforeRevision: { type: 'string' },
+      afterRevision: { type: 'string' },
+      commit_sha: { type: 'string' },
+      files_changed: { type: 'array', items: { type: 'string' } },
+      tests_run: { type: 'array', items: { type: 'string' } },
+      remaining_blockers: { type: 'array', items: { type: 'string' } },
+      criteria: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { id: { type: 'string' }, satisfied: { type: 'boolean' } } } },
+      deviations: { type: 'array' },
+      workerChecks: { type: 'array', items: { type: 'string' } },
+      controllerPreflight: { type: 'array', items: { type: 'string' } },
+      summary: { type: 'string' },
+    },
+  }
+}
+
+/**
  * Strictly validate the worker-owned completion envelope. All keys required
  * (no additionalProperties), types checked, required strings non-empty. Empty
  * revisions/commit ids are semantically invalid even though the DSH JSON-schema
  * subset lacks `minLength`, so we reject them here explicitly.
  */
-function validateWorkerCompletion(meta) {
+export function validateWorkerCompletion(meta) {
   if (meta === null || typeof meta !== 'object' || Array.isArray(meta)) {
     throw completionError('WORKER_COMPLETION_INVALID', 'worker completion meta must be an object')
   }
-  const allowed = new Set(['protocol', 'beforeRevision', 'afterRevision', 'commit_sha', 'files_changed', 'tests_run', 'remaining_blockers', 'criteria', 'deviations', 'workerChecks', 'controllerPreflight', 'summary'])
   for (const key of Object.keys(meta)) {
-    if (!allowed.has(key)) throw completionError('WORKER_COMPLETION_INVALID', 'worker completion meta has unexpected field: ' + key)
+    if (!WORKER_COMPLETION_FIELDS.includes(key)) throw completionError('WORKER_COMPLETION_INVALID', 'worker completion meta has unexpected field: ' + key)
   }
   for (const field of REQUIRED_STRING_FIELDS) {
     if (typeof meta[field] !== 'string' || meta[field].trim() === '') {
