@@ -43,6 +43,13 @@ export function buildTaskPrompt(task, spec, runId) {
     '- Do not create GitHub issues or pull requests unless the task explicitly requests it.',
     '- Run the required tests before reporting completion.',
     '- Report blockers instead of hiding them in prose.',
+    '',
+    'Completion:',
+    '- When done, call the ' + WORKER_COMPLETION_TOOL + ' tool with the real evidence from your run:',
+    '  commit_sha (the commit you produced), beforeRevision, afterRevision,',
+    '  files_changed, tests_run, remaining_blockers, criteria (one entry per',
+    '  acceptance criterion above with id and satisfied), and summary.',
+    '- Do not report completion in prose if the ' + WORKER_COMPLETION_TOOL + ' tool is available.',
   ].join('\n')
 }
 
@@ -336,12 +343,14 @@ export class WorkerDispatcher {
         ? stdout || 'worker completed without a final response'
         : stderr || stdout || outcome.error || 'worker exited with code ' + outcome.exitCode
     const result = {
-      result_summary: summary,
+      result_summary: typeof outcome?.summary === 'string' ? outcome.summary : summary,
       files_changed: [],
       tests_run: [],
       remaining_blockers: timedOut ? ['worker timeout'] : outcome.exitCode === 0 ? [] : ['worker exited unsuccessfully'],
-      // Thread any structured proof fields from the worker's raw outcome so the
-      // governed completion hook can use them instead of fabricating defaults.
+      // Thread the canonical structured completion envelope from the worker's
+      // real outcome (session launcher tool/result.meta) into the governed
+      // completion hook; fields absent from the outcome stay absent (the hook
+      // fails closed rather than substituting fabricated defaults).
       ...(outcome?.commit_sha ? { commit_sha: outcome.commit_sha } : {}),
       ...(Array.isArray(outcome?.files_changed) ? { files_changed: outcome.files_changed } : {}),
       ...(Array.isArray(outcome?.tests_run) ? { tests_run: outcome.tests_run } : {}),
@@ -353,10 +362,6 @@ export class WorkerDispatcher {
       ...(Array.isArray(outcome?.workerChecks) ? { workerChecks: outcome.workerChecks } : {}),
       ...(Array.isArray(outcome?.controllerPreflight) ? { controllerPreflight: outcome.controllerPreflight } : {}),
     }
-    // TODO(TH2-R2-04): Track the payload protocol gap — session/headless launchers
-    // should surface commit_sha/files_changed/tests_run in their outcome shape so
-    // the dispatcher can thread them automatically. Add a contract test using the
-    // REAL launcher outcome shape to make this gap explicit. Issue: pending.
     if (timedOut || outcome.exitCode !== 0 || outcome.error) {
       const failed = this.store.fail(task.id, result, { worker, actor: this.actor })
       return { dispatched: true, status: 'failed', task: failed, run_id: runId, worker, exit_code: outcome.exitCode, stdout, stderr }
@@ -435,6 +440,202 @@ function sessionAssistantText(events, afterSeq = -1) {
     .join('')
 }
 
+// ─── Canonical worker-completion protocol (T-H9) ──────────────────────────
+//
+// The DSH-native structured result carrier: a worker-scoped ToolRuntime
+// completion tool whose `output.presentationMeta()` returns the envelope below.
+// DSH appends that meta verbatim to the durable `tool/result` SessionEvent
+// (`data.meta`), which the host `session.history` RPC returns as a raw event.
+// We correlate the completion result's `toolCallId` with a `tool/call`'s
+// `callId` in the same post-baseline window so the proof is attributed to this
+// session's own completion call — never parsed from assistant prose, never
+// fabricated. Exactly one valid envelope is required whenever a completion was
+// attempted; duplicate/missing/malformed/partial/stale/replayed results fail
+// closed.
+export const WORKER_COMPLETION_PROTOCOL = 'dsh.worker-completion.v1'
+export const WORKER_COMPLETION_TOOL = 'worker_complete'
+
+const REQUIRED_STRING_FIELDS = ['protocol', 'beforeRevision', 'afterRevision', 'commit_sha', 'summary']
+const REQUIRED_STRING_ARRAY_FIELDS = ['files_changed', 'tests_run', 'remaining_blockers', 'workerChecks', 'controllerPreflight']
+const REQUIRED_ARRAY_FIELDS = ['deviations']
+// Hoisted to module scope (H9-ADV-02) so the validator does not reallocate it
+// per call, and so the producer tool can reuse the exact key set.
+export const WORKER_COMPLETION_FIELDS = ['protocol', 'beforeRevision', 'afterRevision', 'commit_sha', 'files_changed', 'tests_run', 'remaining_blockers', 'criteria', 'deviations', 'workerChecks', 'controllerPreflight', 'summary']
+
+function completionError(code, message) {
+  const error = new Error(message)
+  error.code = code
+  return error
+}
+
+/**
+ * Assemble and strict-validate the worker-owned completion envelope from the
+ * tool arguments supplied by the worker. `protocol` is injected by the tool
+ * (never trusted from the model); optional array fields default to [].
+ * Throws WORKER_COMPLETION_INVALID on any missing/malformed field.
+ */
+export function buildWorkerCompletionEnvelope(input) {
+  const envelope = {
+    protocol: WORKER_COMPLETION_PROTOCOL,
+    beforeRevision: input?.beforeRevision,
+    afterRevision: input?.afterRevision,
+    commit_sha: input?.commit_sha,
+    files_changed: input?.files_changed,
+    tests_run: input?.tests_run,
+    remaining_blockers: input?.remaining_blockers,
+    criteria: input?.criteria,
+    deviations: input?.deviations ?? [],
+    workerChecks: input?.workerChecks ?? [],
+    controllerPreflight: input?.controllerPreflight ?? [],
+    summary: input?.summary,
+  }
+  return validateWorkerCompletion(envelope)
+}
+
+/**
+ * Output value schema for the canonical envelope, expressed in the DSH
+ * value-schema DSL. Mirrors {@link validateWorkerCompletion} exactly: a
+ * consumer can never accept a producer envelope this schema would reject.
+ */
+export function workerCompletionOutputSchema() {
+  return {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      protocol: { type: 'string', const: WORKER_COMPLETION_PROTOCOL, required: true },
+      beforeRevision: { type: 'string', required: true },
+      afterRevision: { type: 'string', required: true },
+      commit_sha: { type: 'string', required: true },
+      files_changed: { type: 'array', items: { type: 'string' }, required: true },
+      tests_run: { type: 'array', items: { type: 'string' }, required: true },
+      remaining_blockers: { type: 'array', items: { type: 'string' }, required: true },
+      criteria: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { id: { type: 'string', required: true }, satisfied: { type: 'boolean', required: true } } }, required: true },
+      deviations: { type: 'array', required: true },
+      workerChecks: { type: 'array', items: { type: 'string' }, required: true },
+      controllerPreflight: { type: 'array', items: { type: 'string' }, required: true },
+      summary: { type: 'string', required: true },
+    },
+  }
+}
+
+/**
+ * Strictly validate the worker-owned completion envelope. All keys required
+ * (no additionalProperties), types checked, required strings non-empty. Empty
+ * revisions/commit ids are semantically invalid even though the DSH JSON-schema
+ * subset lacks `minLength`, so we reject them here explicitly.
+ */
+export function validateWorkerCompletion(meta) {
+  if (meta === null || typeof meta !== 'object' || Array.isArray(meta)) {
+    throw completionError('WORKER_COMPLETION_INVALID', 'worker completion meta must be an object')
+  }
+  for (const key of Object.keys(meta)) {
+    if (!WORKER_COMPLETION_FIELDS.includes(key)) throw completionError('WORKER_COMPLETION_INVALID', 'worker completion meta has unexpected field: ' + key)
+  }
+  for (const field of REQUIRED_STRING_FIELDS) {
+    if (typeof meta[field] !== 'string' || meta[field].trim() === '') {
+      throw completionError('WORKER_COMPLETION_INVALID', 'worker completion requires a non-empty ' + field)
+    }
+  }
+  if (meta.protocol !== WORKER_COMPLETION_PROTOCOL) {
+    throw completionError('WORKER_COMPLETION_INVALID', 'worker completion protocol must be ' + WORKER_COMPLETION_PROTOCOL)
+  }
+  for (const field of REQUIRED_STRING_ARRAY_FIELDS) {
+    if (!Array.isArray(meta[field]) || meta[field].some(item => typeof item !== 'string')) {
+      throw completionError('WORKER_COMPLETION_INVALID', 'worker completion ' + field + ' must be an array of strings')
+    }
+  }
+  for (const field of REQUIRED_ARRAY_FIELDS) {
+    if (!Array.isArray(meta[field])) {
+      throw completionError('WORKER_COMPLETION_INVALID', 'worker completion ' + field + ' must be an array')
+    }
+  }
+  if (!Array.isArray(meta.criteria)) {
+    throw completionError('WORKER_COMPLETION_INVALID', 'worker completion criteria must be an array')
+  }
+  for (const criterion of meta.criteria) {
+    if (criterion === null || typeof criterion !== 'object' || Array.isArray(criterion)) {
+      throw completionError('WORKER_COMPLETION_INVALID', 'worker completion criteria entries must be { id: non-empty string, satisfied: boolean }')
+    }
+    for (const key of Object.keys(criterion)) {
+      if (key !== 'id' && key !== 'satisfied') {
+        throw completionError('WORKER_COMPLETION_INVALID', 'worker completion criterion has unexpected field: ' + key)
+      }
+    }
+    if (typeof criterion.id !== 'string' || criterion.id.trim() === '' || typeof criterion.satisfied !== 'boolean') {
+      throw completionError('WORKER_COMPLETION_INVALID', 'worker completion criteria entries must be { id: non-empty string, satisfied: boolean }')
+    }
+  }
+  return meta
+}
+
+/**
+ * Extract the canonical envelope from post-baseline session events, or return
+ * null when no completion was attempted. Throws a structured
+ * WORKER_COMPLETION_* error when a completion was attempted but the result is
+ * missing/duplicate/malformed/partial/stale (unattributable).
+ */
+function extractWorkerCompletion(events, afterSeq) {
+  const postBaseline = events.filter(event => event && Number.isSafeInteger(event.seq) && event.seq > afterSeq)
+  const completionCalls = []
+  const results = []
+  for (const event of postBaseline) {
+    if (event.type === 'tool/call') {
+      const callId = event.data?.callId
+      if (typeof callId === 'string' && event.data?.name === WORKER_COMPLETION_TOOL) completionCalls.push(callId)
+    } else if (event.type === 'tool/result') {
+      const block = event.data?.message?.content?.[0]
+      const toolCallId = block?.toolCallId
+      if (typeof toolCallId === 'string') {
+        results.push({
+          toolCallId,
+          meta: event.data?.meta,
+          failed: event.data?.error != null || block?.isError === true,
+        })
+      }
+    }
+  }
+
+  // Every worker_complete tool/call is an attempt; every tool/result carrying the
+  // completion protocol marker (or attributable to a completion call) is also an
+  // attempt, so a malformed/failed/duplicate/unmatched completion can never be
+  // silently dropped in favour of one surviving valid result.
+  const isProtocolResult = result => result.meta && typeof result.meta === 'object' && result.meta.protocol === WORKER_COMPLETION_PROTOCOL
+  const completionResults = results.filter(result => isProtocolResult(result) || completionCalls.includes(result.toolCallId))
+  const completionAttempted = completionCalls.length > 0 || completionResults.length > 0
+  if (!completionAttempted) return null
+
+  if (completionCalls.length > 1) {
+    throw completionError('WORKER_COMPLETION_DUPLICATE', 'worker produced ' + completionCalls.length + ' completion calls; exactly one is required')
+  }
+  // Any attempted completion whose result is failed or lacks the protocol marker
+  // (wrong protocol / error / non-protocol meta for a completion call) fails
+  // closed even when another valid result exists.
+  for (const result of completionResults) {
+    if (result.failed) {
+      throw completionError('WORKER_COMPLETION_FAILED', 'worker completion tool reported an error')
+    }
+    if (!isProtocolResult(result)) {
+      throw completionError('WORKER_COMPLETION_MISSING', 'worker completed but its ' + WORKER_COMPLETION_TOOL + ' produced no ' + WORKER_COMPLETION_PROTOCOL + ' result')
+    }
+    if (completionCalls.length === 0 || !completionCalls.includes(result.toolCallId)) {
+      throw completionError('WORKER_COMPLETION_UNATTRIBUTED', 'worker completion result is not attributable to this session completion call')
+    }
+  }
+
+  const validResults = completionResults.filter(result => isProtocolResult(result) && !result.failed)
+  if (validResults.length === 0) {
+    throw completionError('WORKER_COMPLETION_MISSING', 'worker completed but produced no ' + WORKER_COMPLETION_PROTOCOL + ' result')
+  }
+  if (validResults.length > 1) {
+    throw completionError('WORKER_COMPLETION_DUPLICATE', 'worker produced ' + validResults.length + ' completion results; exactly one is required')
+  }
+  const result = validResults[0]
+  if (completionCalls.length === 1 && result.toolCallId !== completionCalls[0]) {
+    throw completionError('WORKER_COMPLETION_UNATTRIBUTED', 'worker completion result is not attributable to this session completion call')
+  }
+  return validateWorkerCompletion(result.meta)
+}
+
 function sessionTerminal(events, afterSeq) {
   return events.filter(event => event.seq > afterSeq && event.type === 'turn/end').at(-1)
 }
@@ -481,7 +682,37 @@ export function createSessionLauncher({ rpc = createSessionRpcClient(), pollInte
               if (terminal) {
                 const kind = terminal.data?.reason?.kind
                 const stdout = sessionAssistantText(events, baselineSeq)
-                if (kind === 'completed') return { exitCode: 0, signal: null, stdout, stderr: '', sessionId }
+                if (kind === 'completed') {
+                  // Surface the canonical structured completion envelope when the
+                  // worker attempted one; otherwise return a text-only outcome
+                  // (the governed hook rejects a proof-less success fail-closed).
+                  // A completion that was attempted but is missing/duplicate/
+                  // malformed/partial/stale is a structured failure, not a
+                  // success, so it funnels to a non-zero exit with a code.
+                  try {
+                    const completion = extractWorkerCompletion(events, baselineSeq)
+                    if (completion) {
+                      return {
+                        exitCode: 0, signal: null, stdout, stderr: '', sessionId,
+                        commit_sha: completion.commit_sha,
+                        beforeRevision: completion.beforeRevision,
+                        afterRevision: completion.afterRevision,
+                        files_changed: completion.files_changed,
+                        tests_run: completion.tests_run,
+                        remaining_blockers: completion.remaining_blockers,
+                        criteria: completion.criteria,
+                        deviations: completion.deviations,
+                        workerChecks: completion.workerChecks,
+                        controllerPreflight: completion.controllerPreflight,
+                        summary: completion.summary,
+                      }
+                    }
+                    return { exitCode: 0, signal: null, stdout, stderr: '', sessionId }
+                  } catch (completionFailure) {
+                    const message = completionFailure instanceof Error ? completionFailure.message : String(completionFailure)
+                    return { exitCode: 1, signal: null, stdout, stderr: message, error: message, sessionId, code: completionFailure?.code }
+                  }
+                }
                 const message = terminal.data?.reason?.error?.message ?? 'session turn ended with ' + (kind ?? 'unknown reason')
                 return { exitCode: 1, signal: null, stdout, stderr: message, error: message, sessionId }
               }

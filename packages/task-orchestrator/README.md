@@ -149,6 +149,59 @@ The browser client is exported as ./client and the reusable request wrapper as .
 
 A dispatcher should poll task_list({ ready_to_run: true, worker_profile }) or GET /dispatcher/ready, claim atomically, and treat a false claim result as a normal race. It can poll expired claims for recovery and in-review tasks for Sol review. subscribe is an in-process notification hook; the reliable cross-restart interface remains SQLite plus the query/API endpoints. The detailed worker-spec, profile/model routing, preflight, monitoring, and rollout design is documented in [docs/WORKER-DISPATCH-PLAN.md](docs/WORKER-DISPATCH-PLAN.md).
 
+## Canonical worker-completion protocol
+
+Session-mode workers return structured completion data through a DSH-native
+carrier, never parsed from assistant prose:
+
+- The Task Orchestrator tools seam registers a worker-scoped ToolRuntime
+  completion tool (`worker_complete`). Its `execute` assembles and validates
+  the strict 12-key envelope and its `output.presentationMeta()` returns it,
+  so DSH appends that meta verbatim to the durable `tool/result` SessionEvent
+  which the host `session.history` RPC returns as a raw event. `worker_complete`
+  only builds/validates the payload: it has no store access, no session
+  binding, and no governance transition, so a model can never self-bind or
+  advance Change state by calling it.
+- The worker prompt explicitly instructs workers to finish by calling
+  `worker_complete` with the real evidence (commit_sha, revisions, files,
+  tests, criteria).
+- The session launcher correlates the `tool/call` (name + `callId`) with the
+  matching `tool/result` (`toolCallId` + `meta`) after its prompt baseline and
+  surfaces exactly one envelope on the `wait()` outcome.
+
+The canonical envelope (all keys required, no additionalProperties):
+
+```
+{
+  protocol: 'dsh.worker-completion.v1',
+  beforeRevision: string,   // workspace revision at worker start (repair chains prior afterRevision)
+  afterRevision: string,    // new revision the run produced; distinct from beforeRevision on repair
+  commit_sha: string,       // never fabricated — must come from the structured worker result
+  files_changed: string[],
+  tests_run: string[],
+  remaining_blockers: string[],
+  criteria: { id: string, satisfied: boolean }[],  // ids must equal the live task acceptance_criteria
+  deviations: any[],
+  workerChecks: string[],
+  controllerPreflight: string[],
+  summary: string,
+}
+```
+
+Identity is not trusted from the model: the dispatcher pins `runId` and
+`handle.sessionId` separately, and the governed completion hook validates the
+session binding and worker identity. `beforeRevision`/`afterRevision` semantic
+authority lives with Change Control preflight (repair requires
+`beforeRevision` equal the latest recorded attempt revision and
+`afterRevision != beforeRevision`; preflight rejects a stale `afterRevision`).
+
+Fail-closed behavior: missing, duplicate, malformed, partial, or
+unattributable (stale/replayed) completion results surface a structured
+`WORKER_COMPLETION_*` error and a non-zero exit — never a silent success.
+Headless (process) workers emit only process text and carry no structured
+result, so a governed headless completion is explicitly proof-unavailable and
+rejected fail-closed by the governed completion hook (no proof is fabricated).
+
 This version intentionally does not implement GitHub synchronization, autonomous scheduling, chat, RBAC, cloud storage, or multi-host coordination. The worker registry, preflight, lease-aware process dispatcher, and session-backed model launcher are implemented; autonomous scheduling and production profile installation remain planned. GitHub linkage is storage only, and the HTTP surface is loopback-only with no remote authentication layer.
 
 ## Verification

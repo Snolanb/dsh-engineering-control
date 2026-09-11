@@ -1,5 +1,6 @@
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { previewPlanImport, applyPlanImport } from './plan-import.js'
+import { buildWorkerCompletionEnvelope, workerCompletionOutputSchema, WORKER_COMPLETION_PROTOCOL, WORKER_COMPLETION_TOOL } from './dispatcher.js'
 
 function text(value) {
   return [{ type: 'text', text: JSON.stringify(value, null, 2) }]
@@ -69,6 +70,35 @@ export function createTaskTools(store) {
   tools.push(tool('task_start', 'Start a claimed task, incrementing its attempt count.', schema({ id: { type: 'string' }, worker: { type: 'string' }, actor: { type: 'string' } }, ['id', 'worker']), (args, exec) => store.start(args.id, args.worker, { actor: actorFrom(args, exec) })))
   tools.push(tool('task_complete', 'Report structured worker output and move a running task into in_review.', schema({ id: { type: 'string' }, worker: { type: 'string' }, result_summary: { type: 'string' }, commit_sha: { type: 'string' }, files_changed: json, tests_run: json, remaining_blockers: json, actor: { type: 'string' } }, ['id', 'worker']), (args, exec) => { const { id, worker, actor, ...result } = args; return store.complete(id, result, { worker, actor: actor ?? actorFrom(args, exec) }) }))
   tools.push(tool('task_fail', 'Report structured worker failure and move a claimed/running task into failed.', schema({ id: { type: 'string' }, worker: { type: 'string' }, result_summary: { type: 'string' }, files_changed: json, tests_run: json, remaining_blockers: json, actor: { type: 'string' } }, ['id', 'worker']), (args, exec) => { const { id, worker, actor, ...result } = args; return store.fail(id, result, { worker, actor: actor ?? actorFrom(args, exec) }) }))
+  // T-H9 — the canonical structured worker-completion producer. A worker calls
+  // this tool to report the evidence for its run; the strict envelope is
+  // assembled + validated here, then carried to the durable `tool/result` via
+  // `output.presentationMeta`, which the session launcher reads back. It only
+  // builds/validates the payload — no store access, no session binding, no
+  // governance transition, so a model can never self-bind or advance state.
+  tools.push(defineTool({
+    name: WORKER_COMPLETION_TOOL,
+    description: 'Report the canonical structured completion envelope for the worker run (protocol ' + WORKER_COMPLETION_PROTOCOL + '). Supply the real evidence produced by the run: commit_sha, beforeRevision, afterRevision, files_changed, tests_run, remaining_blockers, criteria (exact acceptance-criteria ids with satisfied flags), and summary.',
+    parameters: {
+      commit_sha: { type: 'string', required: true },
+      beforeRevision: { type: 'string', required: true },
+      afterRevision: { type: 'string', required: true },
+      files_changed: { type: 'array', items: { type: 'string' }, required: true },
+      tests_run: { type: 'array', items: { type: 'string' }, required: true },
+      remaining_blockers: { type: 'array', items: { type: 'string' }, required: true },
+      criteria: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { id: { type: 'string' }, satisfied: { type: 'boolean' } } }, required: true },
+      summary: { type: 'string', required: true },
+      deviations: { type: 'array' },
+      workerChecks: { type: 'array', items: { type: 'string' } },
+      controllerPreflight: { type: 'array', items: { type: 'string' } },
+    },
+    output: {
+      schema: workerCompletionOutputSchema(),
+      render: (_args, value) => [{ type: 'text', text: 'worker completion recorded: ' + (value?.commit_sha ?? '') }],
+      presentationMeta: (_args, value) => value,
+    },
+    execute: async (args) => buildWorkerCompletionEnvelope(args),
+  }))
   tools.push(tool('task_block', 'Explicitly block a task, distinct from dependency blocking. A worker id is required when the task is claimed or running; managers may block unclaimed tasks.', schema({ id: { type: 'string' }, reason: { type: 'string' }, remaining_blockers: json, worker: { type: 'string' }, actor: { type: 'string' } }, ['id']), (args, exec) => store.block(args.id, args.reason, { worker: args.worker, remaining_blockers: args.remaining_blockers, actor: actorFrom(args, exec) })))
   tools.push(tool('task_unblock', 'Clear an explicit blocked status and return a task to ready.', schema({ id: { type: 'string' }, actor: { type: 'string' } }, ['id']), (args, exec) => store.unblock(args.id, { actor: actorFrom(args, exec) })))
   tools.push(tool('task_request_changes', 'Ask for review changes and move an in_review task to changes_requested.', schema({ id: { type: 'string' }, reason: { type: 'string' }, actor: { type: 'string' } }, ['id']), (args, exec) => store.requestChanges(args.id, args.reason, { actor: actorFrom(args, exec) })))
