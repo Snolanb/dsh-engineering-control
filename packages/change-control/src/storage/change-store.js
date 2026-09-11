@@ -1135,6 +1135,9 @@ export class ChangeStore {
   async updatePlan(planId, content) {
     const release = await acquireWriteLock(this.#file);
     try {
+      // Refresh plans and the associated Change while holding the durable lock;
+      // a stale host must not rewrite a plan accepted by another host.
+      await this.#refreshChange();
       const plan = (this.#plans ?? []).find((p) => p.id === planId);
       if (!plan) throw Object.assign(new Error(`Plan ${planId} not found`), { code: 'NOT_FOUND' });
       if (plan.status !== 'PLANNED') {
