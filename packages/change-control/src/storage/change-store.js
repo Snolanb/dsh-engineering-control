@@ -1,10 +1,13 @@
 /**
  * Minimal file-backed JSON store for durable Change persistence + append-only audit.
  * ponytail: module-level writeLock keyed by canonical (absolute) file path coordinates
- * writers across instances; unique tmp paths prevent overlapping atomic writes from
- * unlinking each other's temp file. Each transition refreshes the target change from
- * disk before validating/mutating, so stale in-memory state is reconciled and rejected
- * transitions don't append events.
+ * writers within a process, plus a mkdir-based disk lock (acquireDiskLock) around
+ * compare-and-mutate operations' read-validate-mutate-audit-persist windows so
+ * ACROSS-process writers on one JSON file serialize and cannot lose each other's
+ * mutations or double-apply stale transitions. Unique tmp paths prevent overlapping
+ * atomic writes from unlinking each other's temp file. Each transition refreshes the
+ * target change from disk before validating/mutating, so stale in-memory state is
+ * reconciled and rejected transitions don't append events.
  */
 // @ts-nocheck
 import { readFile, writeFile, rename, unlink, mkdir, rmdir, stat } from 'node:fs/promises';
@@ -58,19 +61,63 @@ function rotate(key) {
 }
 
 /**
- * Cross-process mutex for one store file, via atomic mkdir. Used ONLY on
- * paths that must hold lookup+create atomicity across host processes (work
- * item linkage). Process-local acquireLock stays the fast inner serializer.
+ * Serialize a full state-changing operation across host processes: acquire
+ * BOTH the process-local queue lock and the cross-process disk lock so the
+ * fresh read → validate → mutate → audit → persist window is atomic against
+ * other processes (not just other in-process instances). Returns one async
+ * release that unwinds both. #persist() re-acquires the disk lock for its own
+ * critical section; that inner acquisition nests via the reentrancy depth.
  */
+async function acquireWriteLock(file) {
+  const release = await acquireLock(file);
+  try {
+    const releaseDisk = await acquireDiskLock(file);
+    return async () => {
+      await releaseDisk();
+      release();
+    };
+  } catch (error) {
+    // A disk-lock timeout must not strand the process-local queue behind this
+    // failed operation; later calls on the same store must remain usable.
+    release();
+    throw error;
+  }
+}
+
+/**
+ * Cross-process mutex for one store file, via atomic mkdir. Serializes the
+ * #persist() read-merge-write across host processes so concurrent writers on
+ * the same JSON file cannot lose each other's mutations (the module-level
+ * acquireLock is process-local and cannot see another OS process).
+ * Reentrant within a process: acquireWriteLock holds the disk lock across a
+ * method's full read/mutate window and then #persist() acquires it again.
+ */
+/** Per-process reentrancy depth, keyed by canonical path. */
+const diskLockDepth = new Map();
+
 async function acquireDiskLock(file) {
-  const lockDir = canonicalPath(file) + '.linklock';
+  const key = canonicalPath(file);
+  const depth = diskLockDepth.get(key);
+  if (depth) {
+    diskLockDepth.set(key, depth + 1);
+    return async () => {
+      const d = diskLockDepth.get(key) - 1;
+      if (d === 0) diskLockDepth.delete(key);
+      else diskLockDepth.set(key, d);
+    };
+  }
+  const lockDir = key + '.linklock';
   const deadline = Date.now() + 10000;
   const staleMs = 30000;
   // eslint-disable-next-line no-constant-condition
   while (true) {
     try {
       await mkdir(lockDir);
-      return async () => { await rmdir(lockDir).catch(() => {}); };
+      diskLockDepth.set(key, 1);
+      return async () => {
+        await rmdir(lockDir).catch(() => {});
+        diskLockDepth.delete(key);
+      };
     } catch (err) {
       if (err?.code !== 'EEXIST') throw err;
       // Reap a crashed-holder lock (lock dir older than staleMs).
@@ -227,6 +274,8 @@ export class ChangeStore {
   #file;
   #changes;
   #audit;
+  /** Number of leading #audit entries already committed to disk (loaded or persisted). */
+  #auditCommitted = 0;
   /** @type {import('../domain/change.js').Plan[] | null} */
   #plans = null;
   /** @type {Map<string, Array<{changeId: string, sessionId: string, role: string}>}> */
@@ -323,6 +372,7 @@ export class ChangeStore {
       this.#changes.set(c.id, ch);
     }
     this.#audit = Array.isArray(data.audit) ? data.audit : [];
+    this.#auditCommitted = this.#audit.length;
     // Plans are serialised inline inside change records as a "plans" array (append-only).
     if (data.plans && Array.isArray(data.plans)) {
       this.#plans = data.plans;
@@ -472,6 +522,20 @@ export class ChangeStore {
   }
 
   async #persist() {
+    // Cross-process serialization of the read-merge-write: without it two
+    // host processes each read the same snapshot, overlay their own mutations,
+    // and rename over the file — the last rename wins and the first process's
+    // writes are silently lost. State-changing methods already hold the disk
+    // lock for their full window; this inner acquisition nests reentrantly.
+    const releaseDisk = await acquireDiskLock(this.#file);
+    try {
+      await this.#persistUnderLock();
+    } finally {
+      await releaseDisk();
+    }
+  }
+
+  async #persistUnderLock() {
     let diskData;
     try {
       diskData = await readJson(this.#file);
@@ -481,6 +545,19 @@ export class ChangeStore {
     const diskChanges = diskData?.changes ?? [];
     const diskAudit = Array.isArray(diskData?.audit) ? diskData.audit : [];
     const diskEventIds = new Set(diskAudit.map((e) => e.eventId));
+
+    // eventId is assigned here, UNDER the disk lock, against fresh disk state.
+    // The module-level eventIdSeq is process-local: two host processes both
+    // seeded from an empty (or stale) disk and assigned eventId 1 to their own
+    // DRAFT event. Without this reseed+reassign, the collision makes the
+    // dedup below treat the second writer's event as "already on disk" and
+    // silently DROP its change (the cross-process lost update).
+    let maxDiskId = 0;
+    for (const e of diskAudit) if (Number(e.eventId) > maxDiskId) maxDiskId = Number(e.eventId);
+    if (maxDiskId > eventIdSeq) eventIdSeq = maxDiskId;
+    for (let i = this.#auditCommitted; i < this.#audit.length; i += 1) {
+      this.#audit[i].eventId = nextEventId();
+    }
 
     // Merge: start from disk, overlay our local changes (by id).
     // Only overwrite state fields (domainState, planState) if this store
@@ -681,6 +758,9 @@ export class ChangeStore {
     this.#removedBindings.clear();
     this.#dirtyReviews.clear();
     this.#dirtyRepairClaims.clear();
+    // All local audit events are now committed; future persists reassign ids
+    // only to events appended after this point.
+    this.#auditCommitted = this.#audit.length;
   }
 
   async create(input) {
@@ -864,7 +944,7 @@ export class ChangeStore {
   }
 
   async transition(id, nextState) {
-    const release = await acquireLock(this.#file);
+    const release = await acquireWriteLock(this.#file);
     try {
       // Refresh the change entity from disk (but preserve local audit entries)
       await this.#refreshChange(id);
@@ -889,7 +969,7 @@ export class ChangeStore {
       await this.#persist();
       return freezeChange(c);
     } finally {
-      release();
+      await release();
     }
   }
 
@@ -939,7 +1019,7 @@ export class ChangeStore {
    * acceptedPlanId resets to null.
    */
   async submitPlan(changeId, content) {
-    const release = await acquireLock(this.#file);
+    const release = await acquireWriteLock(this.#file);
     try {
       await this.#refreshChange(changeId);
       const c = this.#changes.get(changeId);
@@ -996,7 +1076,7 @@ export class ChangeStore {
       await this.#persist();
       return structuredClone(plan);
     } finally {
-      release();
+      await release();
     }
   }
 
@@ -1009,7 +1089,7 @@ export class ChangeStore {
     if (!authorized) {
       throw Object.assign(new Error('Not authorized to accept plan'), { code: 'FORBIDDEN' });
     }
-    const release = await acquireLock(this.#file);
+    const release = await acquireWriteLock(this.#file);
     try {
       await this.#refreshChange(changeId);
       const c = this.#changes.get(changeId);
@@ -1045,7 +1125,7 @@ export class ChangeStore {
       await this.#persist();
       return structuredClone(currentPlan);
     } finally {
-      release();
+      await release();
     }
   }
 
@@ -1053,8 +1133,11 @@ export class ChangeStore {
    * Update plan content — rejected when plan is ACCEPTED (immutable).
    */
   async updatePlan(planId, content) {
-    const release = await acquireLock(this.#file);
+    const release = await acquireWriteLock(this.#file);
     try {
+      // Refresh plans and the associated Change while holding the durable lock;
+      // a stale host must not rewrite a plan accepted by another host.
+      await this.#refreshChange();
       const plan = (this.#plans ?? []).find((p) => p.id === planId);
       if (!plan) throw Object.assign(new Error(`Plan ${planId} not found`), { code: 'NOT_FOUND' });
       if (plan.status !== 'PLANNED') {
@@ -1077,7 +1160,7 @@ export class ChangeStore {
       await this.#persist();
       return structuredClone(plan);
     } finally {
-      release();
+      await release();
     }
   }
 
@@ -1119,7 +1202,7 @@ export class ChangeStore {
    * (changeId, sessionId) pair holds a different role without explicit rebind.
    */
   async bindRole(changeId, sessionId, role, opts = {}) {
-    const release = await acquireLock(this.#file);
+    const release = await acquireWriteLock(this.#file);
     try {
       await this.#refreshChange(changeId);
       const c = this.#changes.get(changeId);
@@ -1155,7 +1238,7 @@ export class ChangeStore {
       await this.#persist();
       return structuredClone(binding);
     } finally {
-      release();
+      await release();
     }
   }
 
@@ -1166,7 +1249,7 @@ export class ChangeStore {
    * binding durably (removal wins over disk state).
    */
   async unbindRole(changeId, sessionId, { actor } = {}) {
-    const release = await acquireLock(this.#file);
+    const release = await acquireWriteLock(this.#file);
     try {
       await this.#refreshChange(changeId);
       const c = this.#changes.get(changeId);
@@ -1193,7 +1276,7 @@ export class ChangeStore {
       await this.#persist();
       return { removed: true, changeId, sessionId };
     } finally {
-      release();
+      await release();
     }
   }
 

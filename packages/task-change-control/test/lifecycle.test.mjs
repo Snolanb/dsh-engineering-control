@@ -564,19 +564,43 @@ process.stdout.write(JSON.stringify({ outcome: result.outcome, sessionId: result
 `;
 
 /** Spawn one host process driving runGovernedSdlc against the shared store dir. */
-function spawnReviewerProcess(dir, taskId, { launchMs = 200 } = {}) {
+// Bounded execution: a healthy stress child launches/converges in ~1-2 s, so a
+// 2-minute ceiling gives generous headroom against SQLite/JSON writer
+// contention while still failing FAST (with its captured stderr) when the
+// reservation fails to converge — instead of letting a stuck child burn the
+// production 11-minute REVIEWER_CLAIM_WAIT_MS deadline per trial.
+const CHILD_TIMEOUT_MS = 2 * 60 * 1000;
+function spawnReviewerProcess(dir, taskId, { launchMs = 200, timeoutMs = CHILD_TIMEOUT_MS, context = '', t } = {}) {
+  const label = context ? `${context} ` : '';
   const child = spawn(process.execPath, ['--input-type=module', '-e', REVIEWER_CHILD_SCRIPT], {
     cwd: PKG_DIR,
     env: { ...process.env, TCC_DIR: dir, TCC_TASK_ID: taskId, TCC_LAUNCH_MS: String(launchMs) },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+  // Guaranteed reaping: any child still alive at test teardown (including an
+  // assertion failure before its promise settles) is SIGKILLed, so a hung host
+  // can never outlive the test or leak into CI teardown.
+  if (t) t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); });
   let stdout = '';
   let stderr = '';
   child.stdout.on('data', (d) => { stdout += d; });
   child.stderr.on('data', (d) => { stderr += d; });
   return new Promise((resolve) => {
-    child.on('error', (err) => resolve({ code: -1, stdout: stdout.trim(), stderr: stderr + String(err) }));
-    child.on('close', (code) => resolve({ code, stdout: stdout.trim(), stderr }));
+    // Bounded execution: a child that never exits (e.g. a reviewer launch deadlock)
+    // is killed and reported with its trial/child context instead of hanging CI.
+    const timer = setTimeout(() => {
+      const msg = `${label}timed out after ${timeoutMs}ms; killed pid ${child.pid}`;
+      child.kill('SIGKILL');
+      resolve({ code: -2, stdout: stdout.trim(), stderr: `${stderr}${msg}`.trim() });
+    }, timeoutMs);
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      resolve({ code: -1, stdout: stdout.trim(), stderr: `${stderr}${label}${String(err)}` });
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      resolve({ code, stdout: stdout.trim(), stderr });
+    });
   });
 }
 
@@ -589,8 +613,8 @@ test('T-H5 PR2-01: two host processes on one store launch exactly ONE reviewer (
   assert.equal((await ctx.changeControl.get(change.id)).state, 'PREFLIGHT');
 
   const [a, b] = await Promise.all([
-    spawnReviewerProcess(dir, task.id),
-    spawnReviewerProcess(dir, task.id),
+    spawnReviewerProcess(dir, task.id, { context: 'host A', t }),
+    spawnReviewerProcess(dir, task.id, { context: 'host B', t }),
   ]);
   assert.equal(a.code, 0, `host process A must complete: ${a.stderr || a.stdout}`);
   assert.equal(b.code, 0, `host process B must complete: ${b.stderr || b.stdout}`);
@@ -668,6 +692,27 @@ test('T-H5 PR2-01: a stale claim with no recorded session is taken over with exa
 
 // ─── T-H5 PR2-02 — stale-claim takeover race (multi-process stress) ────────
 
+/**
+ * Name the exact invariant a stress trial violated (or null when clean), so a
+ * flaky multi-process failure is self-diagnosing instead of reporting "duplicate
+ * reviewers" regardless of which guarantee broke. The five guarantees are
+ * exactly-one LAUNCH, one BINDING, one session (no orphan), REVIEW disk state,
+ * and session identity convergence across processes.
+ */
+function trialViolation({ launches, sessionIds, reviewers, diskState, firstSessionId }) {
+  if (launches !== 1) return `launched ${launches} reviewers (expected exactly 1)`;
+  const distinct = [...new Set(sessionIds.filter(Boolean))];
+  if (distinct.length !== 1) {
+    return `diverged to ${distinct.length} distinct reviewer sessions ${JSON.stringify(sessionIds)} (expected 1, no orphan)`;
+  }
+  if (reviewers.length !== 1) return `persisted ${reviewers.length} reviewer bindings (expected exactly 1)`;
+  if (diskState !== 'REVIEW') return `disk Change state is ${diskState} (expected REVIEW)`;
+  if (reviewers[0].sessionId !== firstSessionId) {
+    return `binding session ${reviewers[0].sessionId} != first process session ${firstSessionId}`;
+  }
+  return null;
+}
+
 test('T-H5 PR2-02: stress — many host processes racing to take over the same stale empty claim launch exactly ONE reviewer', async (t) => {
   // The pre-fix race: a stale reader reads the claim file and then deletes it
   // UNCONDITIONALLY; a fresh claim acquired by another process in that window
@@ -679,6 +724,7 @@ test('T-H5 PR2-02: stress — many host processes racing to take over the same s
   const LAUNCH_MS = 800;    // widen the "fresh claim, no session" window the race targets
   const MAX_TRIALS = 30;    // cap: post-fix every trial is clean, so all run
   let duplicateTrial = 0;
+  let duplicateReason = null;
   for (let trial = 1; trial <= MAX_TRIALS; trial += 1) {
     const { ctx, taskStore, dir } = await compose(t);
     const { task, change } = await governedReadyTask(ctx, taskStore, dir);
@@ -695,7 +741,11 @@ test('T-H5 PR2-02: stress — many host processes racing to take over the same s
       updatedAt: Date.now() - 2 * 10 * 60 * 1000,
     }), 'utf8');
 
-    const children = await Promise.all(Array.from({ length: N }, () => spawnReviewerProcess(dir, task.id, { launchMs: LAUNCH_MS })));
+    const children = await Promise.all(Array.from({ length: N }, (_, i) => spawnReviewerProcess(dir, task.id, {
+      launchMs: LAUNCH_MS,
+      context: `trial ${trial} host ${i}`,
+      t,
+    })));
     children.forEach((ch, i) => assert.equal(ch.code, 0, `trial ${trial} host ${i} must complete: ${ch.stderr || ch.stdout}`));
     const results = children.map((ch) => JSON.parse(ch.stdout));
     results.forEach((r, i) => assert.equal(r.outcome, 'review_pending', `trial ${trial} host ${i} converges to review_pending`));
@@ -711,15 +761,19 @@ test('T-H5 PR2-02: stress — many host processes racing to take over the same s
       .filter((b) => b.changeId === change.id && b.role === 'reviewer');
     const diskState = JSON.parse(readFileSync(join(dir, 'changes.json'), 'utf8')).changes
       .find((c) => c.id === change.id).domainState;
-    const ok = launches === 1 && sessions.size === 1 && reviewers.length === 1
-      && diskState === 'REVIEW' && reviewers[0].sessionId === results[0].sessionId;
-    if (!ok) {
+    const violation = trialViolation({
+      launches, sessionIds: [...sessions], reviewers, diskState, firstSessionId: results[0]?.sessionId ?? null,
+    });
+    if (violation) {
       duplicateTrial = trial;
+      duplicateReason = violation;
       break;
     }
   }
   assert.equal(duplicateTrial, 0,
-    `trial ${duplicateTrial} launched duplicate reviewers (one launch, one binding, no orphaned loser required)`);
+    duplicateTrial
+      ? `trial ${duplicateTrial} ${duplicateReason} (one launch, one binding, no orphaned loser required)`
+      : 'no trial violated the exactly-one invariant');
 });
 
 // ─── T-H5 PR2-03 — stale reclaim-lock recovery race (multi-process stress) ─
@@ -736,6 +790,7 @@ test('T-H5 PR2-03: stress — many host processes racing to reclaim a stale clai
   const N = 16;          // host processes per trial (sized to stay fast under full-suite parallel load)
   const MAX_TRIALS = 30; // cap: post-fix every trial is clean, so all run
   let duplicateTrial = 0;
+  let duplicateReason = null;
   for (let trial = 1; trial <= MAX_TRIALS; trial += 1) {
     const { ctx, taskStore, dir } = await compose(t);
     const { task, change } = await governedReadyTask(ctx, taskStore, dir);
@@ -757,7 +812,10 @@ test('T-H5 PR2-03: stress — many host processes racing to reclaim a stale clai
       updatedAt: Date.now() - 2 * 10 * 60 * 1000, // stale: beyond the 10-minute lease
     }), 'utf8');
 
-    const children = await Promise.all(Array.from({ length: N }, () => spawnReviewerProcess(dir, task.id)));
+    const children = await Promise.all(Array.from({ length: N }, (_, i) => spawnReviewerProcess(dir, task.id, {
+      context: `trial ${trial} host ${i}`,
+      t,
+    })));
     children.forEach((ch, i) => assert.equal(ch.code, 0, `trial ${trial} host ${i} must complete: ${ch.stderr || ch.stdout}`));
     const results = children.map((ch) => JSON.parse(ch.stdout));
     results.forEach((r, i) => assert.equal(r.outcome, 'review_pending', `trial ${trial} host ${i} converges to review_pending`));
@@ -773,13 +831,17 @@ test('T-H5 PR2-03: stress — many host processes racing to reclaim a stale clai
       .filter((b) => b.changeId === change.id && b.role === 'reviewer');
     const diskState = JSON.parse(readFileSync(join(dir, 'changes.json'), 'utf8')).changes
       .find((c) => c.id === change.id).domainState;
-    const ok = launches === 1 && sessions.size === 1 && reviewers.length === 1
-      && diskState === 'REVIEW' && reviewers[0].sessionId === results[0].sessionId;
-    if (!ok) {
+    const violation = trialViolation({
+      launches, sessionIds: [...sessions], reviewers, diskState, firstSessionId: results[0]?.sessionId ?? null,
+    });
+    if (violation) {
       duplicateTrial = trial;
+      duplicateReason = violation;
       break;
     }
   }
   assert.equal(duplicateTrial, 0,
-    `trial ${duplicateTrial} launched duplicate reviewers (one launch, one binding, no orphaned loser required)`);
+    duplicateTrial
+      ? `trial ${duplicateTrial} ${duplicateReason} (one launch, one binding, no orphaned loser required)`
+      : 'no trial violated the exactly-one invariant');
 });

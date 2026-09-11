@@ -222,6 +222,36 @@ test('concurrent transitions on same change: one succeeds, one rejects, single a
 }));
 
 // AC (repair-round-3): File paths are canonicalized (absolute/resolved).
+test('concurrent binds for one session reject the loser instead of overwriting its role', () => withStore(async (file) => {
+  const seed = await ChangeStore.open(file);
+  const created = await seed.create(input('Concurrent binding'));
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const storePath = new URL('../src/storage/change-store.js', import.meta.url).href;
+  const child = (role) => promisify(execFile)(process.execPath, ['--input-type=module', '-e', `
+    import { ChangeStore } from '${storePath}';
+    const store = await ChangeStore.open(process.argv[1]);
+    try {
+      await store.bindRole(process.argv[2], process.argv[3], process.argv[4]);
+      console.log(JSON.stringify({ ok: true, role: process.argv[4] }));
+    } catch (error) {
+      console.log(JSON.stringify({ ok: false, code: error.code }));
+    }
+  `, file, created.id, 'same-session', role]);
+
+  const results = await Promise.all([
+    child('worker'),
+    child('reviewer'),
+  ]);
+  const outcomes = results.map((result) => JSON.parse(result.stdout.trim()));
+  assert.equal(outcomes.filter((result) => result.ok).length, 1, 'one bind must succeed');
+  assert.deepEqual(outcomes.filter((result) => !result.ok).map((result) => result.code), ['ALREADY_BOUND']);
+
+  const bindings = await seed.listRoleBindings();
+  assert.equal(bindings.filter((binding) => binding.changeId === created.id).length, 1);
+  assert.equal(bindings[0].role, outcomes.find((result) => result.ok).role);
+}));
+
 test('canonicalizes file paths so relative and absolute paths target the same store', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-canonical-'));
   try {
@@ -429,6 +459,75 @@ test('stale store create after cross-process writes preserves creation event', a
     const allB = await storeFresh.history(changeB.id);
     const allSpawn = await storeFresh.history(spawnResult.bId);
     assert.equal(allAudit.length + allB.length + allSpawn.length, 7);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// AC (cross-process lost update): two HOST PROCESSES writing disjoint changes
+// (or bindings) concurrently must both survive — with only the process-local
+// writeLock, each process reads the same disk snapshot, overlays its own
+// mutation, and renames over the file, so the last rename silently drops the
+// other process's write. The mkdir disk lock around #persist() serializes them.
+test('cross-PROCESS lost update: two host processes create disjoint changes, both survive', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-xproc-lost-'));
+  try {
+    const file = join(dir, 'changes.json');
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const storePath = new URL('../src/storage/change-store.js', import.meta.url).href;
+    // No workItem: create() does NOT hold the disk lock for work-item linkage,
+    // so pre-fix this exercises the unguarded #persist() lost-update directly.
+    const child = (title) => promisify(execFile)(process.execPath, ['--input-type=module', '-e', `
+      import { ChangeStore } from '${storePath}';
+      const s = await ChangeStore.open(process.argv[1]);
+      const c = await s.create({ title: ${JSON.stringify(title)}, objective: 'o', acceptanceCriteria: [], risk: 'normal' });
+      console.log(c.id);
+    `, file]);
+
+    const [a, b] = await Promise.all([child('racer A'), child('racer B')]);
+    const idA = a.stdout.trim();
+    const idB = b.stdout.trim();
+    assert.ok(idA && idB, 'both processes created a change');
+    assert.notEqual(idA, idB, 'distinct changes');
+
+    const store = await ChangeStore.open(file);
+    assert.equal((await store.get(idA)).title, 'racer A');
+    assert.equal((await store.get(idB)).title, 'racer B');
+
+    const { readFile } = await import('node:fs/promises');
+    const disk = JSON.parse(await readFile(file, 'utf8'));
+    assert.equal(disk.changes.length, 2, 'exactly two changes persisted — no lost update');
+    assert.equal(disk.audit.filter((e) => e.from === null && e.to === 'DRAFT').length, 2);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('cross-PROCESS lost update: two host processes bind disjoint roles on the same change, both survive', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-xproc-bind-'));
+  try {
+    const file = join(dir, 'changes.json');
+    // Seed one change in this process first.
+    const seed = await ChangeStore.open(file);
+    const created = await seed.create(input('shared change'));
+
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const storePath = new URL('../src/storage/change-store.js', import.meta.url).href;
+    const child = (sessionId, role) => promisify(execFile)(process.execPath, ['--input-type=module', '-e', `
+      import { ChangeStore } from '${storePath}';
+      const s = await ChangeStore.open(process.argv[1]);
+      await s.bindRole(process.argv[2], process.argv[3], process.argv[4]);
+      console.log('ok');
+    `, file, created.id, sessionId, role]);
+
+    await Promise.all([child('sess-w', 'worker'), child('sess-r', 'reviewer')]);
+
+    const store = await ChangeStore.open(file);
+    const bindings = await store.listRoleBindings();
+    const bySession = Object.fromEntries(bindings.map((b) => [b.sessionId, b.role]));
+    assert.deepEqual(bySession, { 'sess-w': 'worker', 'sess-r': 'reviewer' }, 'both bindings survive — no lost update');
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
