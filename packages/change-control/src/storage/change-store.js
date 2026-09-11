@@ -1089,7 +1089,7 @@ export class ChangeStore {
     if (!authorized) {
       throw Object.assign(new Error('Not authorized to accept plan'), { code: 'FORBIDDEN' });
     }
-    const release = await acquireLock(this.#file);
+    const release = await acquireWriteLock(this.#file);
     try {
       await this.#refreshChange(changeId);
       const c = this.#changes.get(changeId);
@@ -1125,7 +1125,7 @@ export class ChangeStore {
       await this.#persist();
       return structuredClone(currentPlan);
     } finally {
-      release();
+      await release();
     }
   }
 
@@ -1133,7 +1133,7 @@ export class ChangeStore {
    * Update plan content — rejected when plan is ACCEPTED (immutable).
    */
   async updatePlan(planId, content) {
-    const release = await acquireLock(this.#file);
+    const release = await acquireWriteLock(this.#file);
     try {
       const plan = (this.#plans ?? []).find((p) => p.id === planId);
       if (!plan) throw Object.assign(new Error(`Plan ${planId} not found`), { code: 'NOT_FOUND' });
@@ -1157,7 +1157,7 @@ export class ChangeStore {
       await this.#persist();
       return structuredClone(plan);
     } finally {
-      release();
+      await release();
     }
   }
 
