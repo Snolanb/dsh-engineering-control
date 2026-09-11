@@ -336,12 +336,14 @@ export class WorkerDispatcher {
         ? stdout || 'worker completed without a final response'
         : stderr || stdout || outcome.error || 'worker exited with code ' + outcome.exitCode
     const result = {
-      result_summary: summary,
+      result_summary: typeof outcome?.summary === 'string' ? outcome.summary : summary,
       files_changed: [],
       tests_run: [],
       remaining_blockers: timedOut ? ['worker timeout'] : outcome.exitCode === 0 ? [] : ['worker exited unsuccessfully'],
-      // Thread any structured proof fields from the worker's raw outcome so the
-      // governed completion hook can use them instead of fabricating defaults.
+      // Thread the canonical structured completion envelope from the worker's
+      // real outcome (session launcher tool/result.meta) into the governed
+      // completion hook; fields absent from the outcome stay absent (the hook
+      // fails closed rather than substituting fabricated defaults).
       ...(outcome?.commit_sha ? { commit_sha: outcome.commit_sha } : {}),
       ...(Array.isArray(outcome?.files_changed) ? { files_changed: outcome.files_changed } : {}),
       ...(Array.isArray(outcome?.tests_run) ? { tests_run: outcome.tests_run } : {}),
@@ -353,10 +355,6 @@ export class WorkerDispatcher {
       ...(Array.isArray(outcome?.workerChecks) ? { workerChecks: outcome.workerChecks } : {}),
       ...(Array.isArray(outcome?.controllerPreflight) ? { controllerPreflight: outcome.controllerPreflight } : {}),
     }
-    // TODO(TH2-R2-04): Track the payload protocol gap — session/headless launchers
-    // should surface commit_sha/files_changed/tests_run in their outcome shape so
-    // the dispatcher can thread them automatically. Add a contract test using the
-    // REAL launcher outcome shape to make this gap explicit. Issue: pending.
     if (timedOut || outcome.exitCode !== 0 || outcome.error) {
       const failed = this.store.fail(task.id, result, { worker, actor: this.actor })
       return { dispatched: true, status: 'failed', task: failed, run_id: runId, worker, exit_code: outcome.exitCode, stdout, stderr }
@@ -435,6 +433,120 @@ function sessionAssistantText(events, afterSeq = -1) {
     .join('')
 }
 
+// ─── Canonical worker-completion protocol (T-H9) ──────────────────────────
+//
+// The DSH-native structured result carrier: a worker-scoped ToolRuntime
+// completion tool whose `output.presentationMeta()` returns the envelope below.
+// DSH appends that meta verbatim to the durable `tool/result` SessionEvent
+// (`data.meta`), which the host `session.history` RPC returns as a raw event.
+// We correlate the completion result's `toolCallId` with a `tool/call`'s
+// `callId` in the same post-baseline window so the proof is attributed to this
+// session's own completion call — never parsed from assistant prose, never
+// fabricated. Exactly one valid envelope is required whenever a completion was
+// attempted; duplicate/missing/malformed/partial/stale/replayed results fail
+// closed.
+const WORKER_COMPLETION_PROTOCOL = 'dsh.worker-completion.v1'
+const WORKER_COMPLETION_TOOL = 'worker_complete'
+
+const REQUIRED_STRING_FIELDS = ['protocol', 'beforeRevision', 'afterRevision', 'commit_sha', 'summary']
+const REQUIRED_STRING_ARRAY_FIELDS = ['files_changed', 'tests_run', 'remaining_blockers', 'workerChecks', 'controllerPreflight']
+const REQUIRED_ARRAY_FIELDS = ['deviations']
+
+function completionError(code, message) {
+  const error = new Error(message)
+  error.code = code
+  return error
+}
+
+/**
+ * Strictly validate the worker-owned completion envelope. All keys required
+ * (no additionalProperties), types checked, required strings non-empty. Empty
+ * revisions/commit ids are semantically invalid even though the DSH JSON-schema
+ * subset lacks `minLength`, so we reject them here explicitly.
+ */
+function validateWorkerCompletion(meta) {
+  if (meta === null || typeof meta !== 'object' || Array.isArray(meta)) {
+    throw completionError('WORKER_COMPLETION_INVALID', 'worker completion meta must be an object')
+  }
+  const allowed = new Set(['protocol', 'beforeRevision', 'afterRevision', 'commit_sha', 'files_changed', 'tests_run', 'remaining_blockers', 'criteria', 'deviations', 'workerChecks', 'controllerPreflight', 'summary'])
+  for (const key of Object.keys(meta)) {
+    if (!allowed.has(key)) throw completionError('WORKER_COMPLETION_INVALID', 'worker completion meta has unexpected field: ' + key)
+  }
+  for (const field of REQUIRED_STRING_FIELDS) {
+    if (typeof meta[field] !== 'string' || meta[field].trim() === '') {
+      throw completionError('WORKER_COMPLETION_INVALID', 'worker completion requires a non-empty ' + field)
+    }
+  }
+  if (meta.protocol !== WORKER_COMPLETION_PROTOCOL) {
+    throw completionError('WORKER_COMPLETION_INVALID', 'worker completion protocol must be ' + WORKER_COMPLETION_PROTOCOL)
+  }
+  for (const field of REQUIRED_STRING_ARRAY_FIELDS) {
+    if (!Array.isArray(meta[field]) || meta[field].some(item => typeof item !== 'string')) {
+      throw completionError('WORKER_COMPLETION_INVALID', 'worker completion ' + field + ' must be an array of strings')
+    }
+  }
+  for (const field of REQUIRED_ARRAY_FIELDS) {
+    if (!Array.isArray(meta[field])) {
+      throw completionError('WORKER_COMPLETION_INVALID', 'worker completion ' + field + ' must be an array')
+    }
+  }
+  if (!Array.isArray(meta.criteria)) {
+    throw completionError('WORKER_COMPLETION_INVALID', 'worker completion criteria must be an array')
+  }
+  for (const criterion of meta.criteria) {
+    if (criterion === null || typeof criterion !== 'object' || typeof criterion.id !== 'string' || criterion.id.trim() === '' || typeof criterion.satisfied !== 'boolean') {
+      throw completionError('WORKER_COMPLETION_INVALID', 'worker completion criteria entries must be { id: non-empty string, satisfied: boolean }')
+    }
+  }
+  return meta
+}
+
+/**
+ * Extract the canonical envelope from post-baseline session events, or return
+ * null when no completion was attempted. Throws a structured
+ * WORKER_COMPLETION_* error when a completion was attempted but the result is
+ * missing/duplicate/malformed/partial/stale (unattributable).
+ */
+function extractWorkerCompletion(events, afterSeq) {
+  const postBaseline = events.filter(event => event && Number.isSafeInteger(event.seq) && event.seq > afterSeq)
+  const completionCalls = new Set()
+  const results = []
+  for (const event of postBaseline) {
+    if (event.type === 'tool/call') {
+      const callId = event.data?.callId
+      if (typeof callId === 'string' && event.data?.name === WORKER_COMPLETION_TOOL) completionCalls.add(callId)
+    } else if (event.type === 'tool/result') {
+      const block = event.data?.message?.content?.[0]
+      const toolCallId = block?.toolCallId
+      if (typeof toolCallId === 'string') {
+        const meta = event.data?.meta
+        if (meta && typeof meta === 'object' && meta.protocol === WORKER_COMPLETION_PROTOCOL) {
+          results.push({ toolCallId, meta, failed: event.data?.error != null || block?.isError === true })
+        }
+      }
+    }
+  }
+  const completionAttempted = completionCalls.size > 0 || results.length > 0
+  if (!completionAttempted) return null
+
+  if (results.length === 0) {
+    throw completionError('WORKER_COMPLETION_MISSING', 'worker completed but produced no ' + WORKER_COMPLETION_PROTOCOL + ' result')
+  }
+  if (results.length > 1) {
+    throw completionError('WORKER_COMPLETION_DUPLICATE', 'worker produced ' + results.length + ' completion results; exactly one is required')
+  }
+  const result = results[0]
+  if (result.failed) {
+    throw completionError('WORKER_COMPLETION_FAILED', 'worker completion tool reported an error')
+  }
+  // Attribute the result to a completion call in THIS session's window; an
+  // orphan/stale/replayed result (no matching call) fails closed.
+  if (!completionCalls.has(result.toolCallId)) {
+    throw completionError('WORKER_COMPLETION_UNATTRIBUTED', 'worker completion result is not attributable to this session completion call')
+  }
+  return validateWorkerCompletion(result.meta)
+}
+
 function sessionTerminal(events, afterSeq) {
   return events.filter(event => event.seq > afterSeq && event.type === 'turn/end').at(-1)
 }
@@ -481,7 +593,37 @@ export function createSessionLauncher({ rpc = createSessionRpcClient(), pollInte
               if (terminal) {
                 const kind = terminal.data?.reason?.kind
                 const stdout = sessionAssistantText(events, baselineSeq)
-                if (kind === 'completed') return { exitCode: 0, signal: null, stdout, stderr: '', sessionId }
+                if (kind === 'completed') {
+                  // Surface the canonical structured completion envelope when the
+                  // worker attempted one; otherwise return a text-only outcome
+                  // (the governed hook rejects a proof-less success fail-closed).
+                  // A completion that was attempted but is missing/duplicate/
+                  // malformed/partial/stale is a structured failure, not a
+                  // success, so it funnels to a non-zero exit with a code.
+                  try {
+                    const completion = extractWorkerCompletion(events, baselineSeq)
+                    if (completion) {
+                      return {
+                        exitCode: 0, signal: null, stdout, stderr: '', sessionId,
+                        commit_sha: completion.commit_sha,
+                        beforeRevision: completion.beforeRevision,
+                        afterRevision: completion.afterRevision,
+                        files_changed: completion.files_changed,
+                        tests_run: completion.tests_run,
+                        remaining_blockers: completion.remaining_blockers,
+                        criteria: completion.criteria,
+                        deviations: completion.deviations,
+                        workerChecks: completion.workerChecks,
+                        controllerPreflight: completion.controllerPreflight,
+                        summary: completion.summary,
+                      }
+                    }
+                    return { exitCode: 0, signal: null, stdout, stderr: '', sessionId }
+                  } catch (completionFailure) {
+                    const message = completionFailure instanceof Error ? completionFailure.message : String(completionFailure)
+                    return { exitCode: 1, signal: null, stdout, stderr: message, error: message, sessionId, code: completionFailure?.code }
+                  }
+                }
                 const message = terminal.data?.reason?.error?.message ?? 'session turn ended with ' + (kind ?? 'unknown reason')
                 return { exitCode: 1, signal: null, stdout, stderr: message, error: message, sessionId }
               }

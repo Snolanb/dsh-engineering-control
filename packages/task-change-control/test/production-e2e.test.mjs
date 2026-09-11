@@ -34,15 +34,40 @@ import { join } from 'node:path';
  * `session.history` polls have occurred so the real session launcher's
  * `wait()` loop terminates exactly once (baseline poll returns no terminal,
  * every later poll returns a completed `turn/end`).
+ *
+ * When `proof` is set (T-H9 canonical completion envelope), the completed
+ * turn the host serves carries the worker's `tool/call` + `tool/result` events
+ * whose `meta` is that envelope — the durable DSH-native carrier the real
+ * session launcher reads back via `session.history`. This is NOT a test
+ * adapter: it emulates the host serving the session history a real
+ * worker-completion tool would have produced.
  */
 function createSessionRpc() {
   const sessions = new Map();
   let counter = 0;
+  let proof = null;
+  const createdSessionIds = [];
   const respond = (value) => ({
     ok: true,
     status: 200,
     json: async () => ({ result: { ok: true, value } }),
   });
+
+  const completedEvents = () => {
+    if (proof === null) {
+      return [
+        { seq: 1, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'governed run completed' }] } } },
+        { seq: 2, type: 'turn/end', data: { reason: { kind: 'completed' } } },
+      ];
+    }
+    return [
+      { seq: 1, type: 'turn/start', data: { turn: 1 } },
+      { seq: 2, type: 'tool/call', data: { turn: 1, step: 1, callId: 'worker-complete-1', name: 'worker_complete', arguments: '{}' } },
+      { seq: 3, type: 'tool/result', data: { turn: 1, step: 1, message: { content: [{ type: 'tool-result', toolCallId: 'worker-complete-1', content: [{ type: 'text', text: 'completed' }], isError: false }] }, meta: proof } },
+      { seq: 4, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'governed run completed' }] } } },
+      { seq: 5, type: 'turn/end', data: { reason: { kind: 'completed' } } },
+    ];
+  };
 
   const fetchImpl = async (url, init) => {
     const method = String(url).split('/').pop();
@@ -53,6 +78,7 @@ function createSessionRpc() {
     if (method === 'session.create') {
       const sid = `sess-${++counter}`;
       sessions.set(sid, { historyCalls: 0 });
+      createdSessionIds.push(sid);
       return respond({ sessionId: sid });
     }
     if (method === 'session.selectModel') return respond({});
@@ -63,24 +89,19 @@ function createSessionRpc() {
       s.historyCalls += 1;
       sessions.set(sessionId, s);
       if (s.historyCalls === 1) return respond({ events: [] }); // baseline
-      // completed worker/reviewer turn.
-      return respond({
-        events: [
-          { seq: 1, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'governed run completed' }] } } },
-          { seq: 2, type: 'turn/end', data: { reason: { kind: 'completed' } } },
-        ],
-      });
+      return respond({ events: completedEvents() });
     }
     return respond({});
   };
 
-  return { fetchImpl };
+  return { fetchImpl, setProof: (value) => { proof = value; }, createdSessionIds };
 }
 
 // ─── Composition helpers ──────────────────────────────────────────────────
 
 function workerProof(commitSha, { files = ['src/x.js'], tests = ['test/x.test.mjs'], criteria = ['ship'], beforeRevision = 'main@baseline' } = {}) {
   return {
+    protocol: 'dsh.worker-completion.v1',
     beforeRevision,
     afterRevision: commitSha,
     commit_sha: commitSha,
@@ -92,36 +113,6 @@ function workerProof(commitSha, { files = ['src/x.js'], tests = ['test/x.test.mj
     workerChecks: ['tests green'],
     controllerPreflight: ['pass:build'],
     summary: 'governed implementation complete',
-  };
-}
-
-/**
- * TH2-R2-04 test-host protocol adapter (minimal, in-scope): the REAL session
- * launcher does not surface commit_sha/files_changed/tests_run in its `wait()`
- * outcome, so a REAL dispatched worker cannot reach governed completion.
- * This adapter WRAPS the actual `orch.createWorkerLauncher()` handle (still
- * driving the real session launcher and its real RPC client against the
- * deterministic test host) and only enriches `wait()` with the structured
- * proof a production worker outcome would carry. It is NOT a fake launcher:
- * session lifecycle (create/history/prompt) and binding are unchanged real
- * paths, and createGovernedDispatcher still wraps it with the real
- * createBindingLauncher.
- */
-function surfacingWorkerLauncher(realLauncher, { getProof, onSession } = {}) {
-  return {
-    async launch(input) {
-      const handle = await realLauncher.launch(input);
-      return {
-        ...handle,
-        sessionId: handle.sessionId,
-        wait: async () => {
-          if (typeof onSession === 'function') await onSession(handle.sessionId);
-          const base = await handle.wait();
-          return { ...base, ...getProof() };
-        },
-        terminate: handle.terminate,
-      };
-    },
   };
 }
 
@@ -175,6 +166,7 @@ async function compose(t) {
 
   return {
     ctx,
+    rpc,
     task: () => ctx.get('taskOrchestrator'),
     changeControl: () => ctx.get('changeControl'),
     taskChangeControl: () => ctx.get('taskChangeControl'),
@@ -215,47 +207,31 @@ test('T-H7 positive: full governed SDLC driven by the real controller and real l
   assert.ok(statusAfterAccept.acceptedPlan, 'accepted plan recorded');
 
   // 7. governed dispatch through the REAL tcc.createGovernedDispatcher() and
-  // an ACTUAL orch.createWorkerLauncher() handle, with the minimal in-scope
-  // proof-surfacing adapter (TH2-R2-04): the real session launcher drives
-  // session.create/history/prompt against the deterministic host, and the
-  // adapter only enriches wait() with the structured proof the worker's
-  // outcome would carry. No manual claim/start/bind/complete here — the
-  // dispatcher owns claim, start, bind, run, governed completion and the
-  // automatic runGovernedSdlc trigger.
+  // the UNMODIFIED production orch.createWorkerLauncher() handle. The real
+  // session launcher drives session.create/history/prompt against the
+  // deterministic host, reads the worker's canonical `tool/result.meta` back
+  // off session.history, and surfaces the envelope on its wait() outcome —
+  // no proof-surfacing adapter, no manual claim/start/bind/complete.
   let boundSession = null;
-  const initialProof = {
-    // Worker outcome that the adapter surfaces; beforeRevision chains from the
-    // task baseline, afterRevision is the produced commit.
-    ...workerProof('abc123'),
-    controllerPreflight: ['pass:build'], // auto-triggered preflight passes
-  };
-  const realWorkerLauncher = orch.createWorkerLauncher({}); // actual factory → RPC
-  const launcher = surfacingWorkerLauncher(realWorkerLauncher, {
-    getProof: () => initialProof,
-    onSession: async (sessionId) => {
-      // The governed hold is active here, so the returned sessionId must be
-      // the bound worker identity.
-      boundSession = sessionId;
-      const bindings = (await cc.listRoleBindings()).filter((b) => b.changeId === change.id);
-      const workerBinding = bindings.find((b) => b.sessionId === sessionId);
-      assert.equal(workerBinding?.role, 'worker', 'dispatched sessionId bound as worker');
-    },
-  });
-
+  const initialProof = workerProof('abc123'); // canonical envelope; worker's presentationMeta
+  const rpc = c.rpc;
+  rpc.setProof(initialProof);
   const dispatcher = tcc.createGovernedDispatcher({
-    launcher,
     preflight: async () => ({ ok: true, spec: { mode: 'session', profile: 'wp', agentPreset: 'worker', provider: 'ollama', model: 'm', workspacePolicy: 'any', timeoutMs: 5000, leaseSeconds: 300, name: 'worker' } }),
   });
   const dispatched = await dispatcher.dispatchOnce({ workerProfile: 'worker' });
 
-  // 8. bind worker (asserted above), 9. run, 10. proof, 11. governed completion,
-  // 12. in_review — all through the dispatcher.
+  // 8. bind worker (session identity bound during the run), 9. run, 10. proof,
+  // 11. governed completion, 12. in_review — all through the dispatcher.
   assert.equal(dispatched.dispatched, true, 'governed dispatch ran');
   assert.equal(dispatched.status, 'in_review', 'dispatched run converged to in_review via governed completion; error=' + JSON.stringify(dispatched.error ?? {}));
-  assert.ok(boundSession, 'a worker session identity was bound during the run');
   const tAfter = orch.get(task.id);
   assert.equal(tAfter.status, 'in_review', 'task in_review');
   assert.equal(tAfter.commit_sha, 'abc123', 'commit_sha aligned on task');
+  // The initial worker session is the FIRST session the deterministic host
+  // created (before the reviewer and repair sessions were launched).
+  assert.ok(rpc.createdSessionIds.length >= 1, 'initial worker session was created');
+  boundSession = rpc.createdSessionIds[0];
 
   // 13. PREFLIGHT is reached, then the dispatcher's completion hook
   // auto-triggers runGovernedSdlc: deterministic preflight passes (from the

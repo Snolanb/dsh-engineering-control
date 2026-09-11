@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { TaskStore } from '../src/store.js'
-import { WorkerDispatcher, buildTaskPrompt, createSessionLauncher, createSessionRpcClient } from '../src/dispatcher.js'
+import { WorkerDispatcher, buildTaskPrompt, createSessionLauncher, createSessionRpcClient, createWorkerLauncher } from '../src/dispatcher.js'
 import { createBindingLauncher } from '../../task-change-control/src/binding.js'
 import { WorkerSpecRegistry } from '../src/worker-specs.js'
 
@@ -168,6 +168,235 @@ test('session launcher classifies a terminal model error as failure', async () =
   const result = await handle.wait()
   assert.equal(result.exitCode, 1)
   assert.match(result.stderr, /provider failed/)
+})
+
+// ─── Canonical worker-completion protocol (T-H9) ──────────────────────────
+
+// The canonical DSH-native carrier: a worker-scoped ToolRuntime completion tool
+// whose output.presentationMeta() carries the strict envelope below. DSH appends
+// that meta verbatim to the durable `tool/result` SessionEvent, which the host
+// session.history RPC returns as a raw event; the session launcher correlates
+// `tool/call` (name + callId) with `tool/result` (toolCallId + meta) after its
+// baseline sequence and surfaces the envelope on the wait() outcome — no
+// assistant-prose parsing, no fabricated proof.
+const WORKER_COMPLETION_PROTOCOL = 'dsh.worker-completion.v1'
+
+function completionEnvelope(overrides = {}) {
+  return {
+    protocol: WORKER_COMPLETION_PROTOCOL,
+    beforeRevision: 'main@baseline',
+    afterRevision: 'abc123',
+    commit_sha: 'abc123',
+    files_changed: ['src/x.js'],
+    tests_run: ['test/x.test.mjs'],
+    remaining_blockers: [],
+    criteria: [{ id: 'ship', satisfied: true }],
+    deviations: [],
+    workerChecks: ['tests green'],
+    controllerPreflight: ['pass:build'],
+    summary: 'governed implementation complete',
+    ...overrides,
+  }
+}
+
+function completionEvents(seqBase, meta, { callId = 'call-1', name = 'worker_complete' } = {}) {
+  return [
+    { event: { seq: seqBase + 1, type: 'turn/start', data: { turn: 1 } } },
+    { event: { seq: seqBase + 2, type: 'tool/call', data: { turn: 1, step: 1, callId, name, arguments: '{}' } } },
+    { event: { seq: seqBase + 3, type: 'tool/result', data: { turn: 1, step: 1, message: { content: [{ type: 'tool-result', toolCallId: callId, content: [{ type: 'text', text: 'done' }], isError: false }] }, meta } } },
+    { event: { seq: seqBase + 4, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'session completed' }] } } } },
+    { event: { seq: seqBase + 5, type: 'turn/end', data: { reason: { kind: 'completed' } } } },
+  ]
+}
+
+function createCompletionRpc({ historyCalls, events }) {
+  return {
+    async call(method) {
+      if (method === 'session.create') return { sessionId: 'session-1' }
+      if (method === 'session.history') {
+        historyCalls.push('history')
+        return historyCalls.length === 1 ? { events: [] } : { events }
+      }
+      return { accepted: true }
+    },
+  }
+}
+
+async function launchCompletionSession(events) {
+  const historyCalls = []
+  const launcher = createSessionLauncher({
+    pollIntervalMs: 0,
+    rpc: createCompletionRpc({ historyCalls, events }),
+  })
+  const handle = await launcher.launch({
+    task: { id: 'session-task', title: 'Session task', description: 'Do it.', workspace: '/repo', acceptance_criteria: ['ship'] },
+    spec: { name: 'minimax-standard', mode: 'session', agentPreset: 'standard' },
+    runId: 'session-run-1',
+  })
+  return { handle, historyCalls }
+}
+
+test('session launcher surfaces the canonical worker-completion envelope from tool/result meta', async () => {
+  const { handle } = await launchCompletionSession(completionEvents(0, completionEnvelope()))
+  const result = await handle.wait()
+  assert.equal(result.exitCode, 0)
+  assert.equal(result.commit_sha, 'abc123')
+  assert.equal(result.beforeRevision, 'main@baseline')
+  assert.equal(result.afterRevision, 'abc123')
+  assert.deepEqual(result.files_changed, ['src/x.js'])
+  assert.deepEqual(result.tests_run, ['test/x.test.mjs'])
+  assert.deepEqual(result.remaining_blockers, [])
+  assert.deepEqual(result.criteria, [{ id: 'ship', satisfied: true }])
+  assert.deepEqual(result.deviations, [])
+  assert.deepEqual(result.workerChecks, ['tests green'])
+  assert.deepEqual(result.controllerPreflight, ['pass:build'])
+  assert.equal(result.summary, 'governed implementation complete')
+})
+
+test('session launcher fails closed when the completion tool emits no valid result (missing structured result)', async () => {
+  // The worker emitted the completion tool call but its result meta carries a
+  // non-completion protocol — the structured completion never materialised.
+  const events = completionEvents(0, completionEnvelope({ protocol: 'other.protocol' }))
+  const { handle } = await launchCompletionSession(events)
+  const result = await handle.wait()
+  assert.notEqual(result.exitCode, 0)
+  assert.match(result.error ?? result.stderr, /worker-completion|WORKER_COMPLETION/)
+})
+
+test('session launcher leaves text-only outcome (exit 0) when no completion tool was called', async () => {
+  // A worker/reviewer session that never calls the completion tool completes
+  // with a text-only outcome and NO proof fields — the governed hook (not the
+  // launcher) rejects the missing commit_sha fail-closed downstream.
+  const historyCalls = []
+  const launcher = createSessionLauncher({
+    pollIntervalMs: 0,
+    rpc: {
+      async call(method) {
+        if (method === 'session.create') return { sessionId: 'session-1' }
+        if (method === 'session.history') {
+          historyCalls.push('history')
+          return historyCalls.length === 1 ? { events: [] } : { events: [
+            { event: { seq: 1, type: 'turn/start', data: { turn: 1 } } },
+            { event: { seq: 2, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'plain done' }] } } } },
+            { event: { seq: 3, type: 'turn/end', data: { reason: { kind: 'completed' } } } },
+          ] }
+        }
+        return { accepted: true }
+      },
+    },
+  })
+  const handle = await launcher.launch({
+    task: { id: 't', title: 't', workspace: '/repo' },
+    spec: { name: 's', mode: 'session', agentPreset: 'standard' },
+    runId: 'r',
+  })
+  const result = await handle.wait()
+  assert.equal(result.exitCode, 0)
+  assert.equal(result.commit_sha, undefined)
+})
+
+test('session launcher fails closed when commit_sha is missing', async () => {
+  const meta = completionEnvelope()
+  delete meta.commit_sha
+  const { handle } = await launchCompletionSession(completionEvents(0, meta))
+  const result = await handle.wait()
+  assert.notEqual(result.exitCode, 0)
+  assert.match(result.error ?? result.stderr, /commit_sha/)
+})
+
+test('session launcher fails closed on malformed field types', async () => {
+  const { handle } = await launchCompletionSession(completionEvents(0, completionEnvelope({ files_changed: 'not-an-array' })))
+  const result = await handle.wait()
+  assert.notEqual(result.exitCode, 0)
+})
+
+test('session launcher fails closed on a partial result (missing required field)', async () => {
+  const meta = completionEnvelope()
+  delete meta.beforeRevision
+  const { handle } = await launchCompletionSession(completionEvents(0, meta))
+  const result = await handle.wait()
+  assert.notEqual(result.exitCode, 0)
+  assert.match(result.error ?? result.stderr, /beforeRevision/)
+})
+
+test('session launcher fails closed on duplicate/replayed completion results', async () => {
+  const base = 0
+  const events = [
+    ...completionEvents(base, completionEnvelope()),
+    ...completionEvents(base + 5, completionEnvelope({ afterRevision: 'def456', commit_sha: 'def456' }), { callId: 'call-2' }),
+  ]
+  const { handle } = await launchCompletionSession(events)
+  const result = await handle.wait()
+  assert.notEqual(result.exitCode, 0)
+})
+
+test('session launcher ignores stale completion results before the baseline sequence', async () => {
+  // A completion tool/result from a PRIOR turn (seq <= baselineSeq) must not
+  // be surfaced: the current completed turn carried no fresh completion call,
+  // so the outcome is text-only (stale proof is never silently re-surfaced).
+  const historyCalls = []
+  const launcher = createSessionLauncher({
+    pollIntervalMs: 0,
+    rpc: {
+      async call(method) {
+        if (method === 'session.create') return { sessionId: 'session-1' }
+        if (method === 'session.history') {
+          historyCalls.push('history')
+          // Baseline poll already carried a prior turn with a completion meta;
+          // the subsequent poll yields only a fresh completed turn/end with no
+          // completion tool call after the baseline.
+          if (historyCalls.length === 1) {
+            return { events: [
+              { event: { seq: 1, type: 'tool/result', data: { turn: 0, step: 1, message: { content: [{ type: 'tool-result', toolCallId: 'stale-call', content: [], isError: false }] }, meta: completionEnvelope() } } },
+            ] }
+          }
+          return { events: [
+            { event: { seq: 2, type: 'turn/start', data: { turn: 1 } } },
+            { event: { seq: 3, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'fresh turn done' }] } } } },
+            { event: { seq: 4, type: 'turn/end', data: { reason: { kind: 'completed' } } } },
+          ] }
+        }
+        return { accepted: true }
+      },
+    },
+  })
+  const handle = await launcher.launch({
+    task: { id: 't', title: 't', workspace: '/repo' },
+    spec: { name: 's', mode: 'session', agentPreset: 'standard' },
+    runId: 'r',
+  })
+  const result = await handle.wait()
+  assert.equal(result.exitCode, 0)
+  assert.equal(result.commit_sha, undefined, 'stale pre-baseline completion is not surfaced')
+})
+
+test('session launcher fails closed on session identity mismatch (mismatched callId)', async () => {
+  // The tool/result's toolCallId does not match any tool/call, so the result
+  // cannot be attributed to this session's own completion call.
+  const events = [
+    { event: { seq: 1, type: 'tool/result', data: { turn: 1, step: 1, message: { content: [{ type: 'tool-result', toolCallId: 'orphan-call', content: [], isError: false }] }, meta: completionEnvelope() } } },
+    { event: { seq: 2, type: 'turn/end', data: { reason: { kind: 'completed' } } } },
+  ]
+  const { handle } = await launchCompletionSession(events)
+  const result = await handle.wait()
+  assert.notEqual(result.exitCode, 0)
+})
+
+test('headless launcher does not fabricate structured proof (explicit proof-unavailable)', async () => {
+  // The headless launcher only captures process text; it must NOT invent
+  // commit_sha/files_changed/tests_run. Its wait() outcome is text-only,
+  // which the governed completion hook rejects (never silent proof).
+  const launcher = createWorkerLauncher()
+  const headlessSpec = { name: 'headless-worker', mode: 'headless-profile', profile: 'p', command: process.execPath, timeoutMs: 1000, leaseSeconds: 30 }
+  const launched = await launcher.launch({
+    task: { id: 'h', title: 'h', description: '', workspace: '/repo', acceptance_criteria: [] },
+    spec: headlessSpec,
+    runId: 'h-run',
+  })
+  const result = await launched.wait()
+  assert.deepEqual(result.commit_sha, undefined, 'headless outcome carries no commit_sha')
+  assert.deepEqual(result.files_changed, undefined, 'headless outcome carries no files_changed')
+  assert.deepEqual(result.tests_run, undefined, 'headless outcome carries no tests_run')
 })
 
 test('completionHook routes governed success through the hook instead of raw store.complete', async t => {
