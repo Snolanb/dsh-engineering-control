@@ -10,7 +10,8 @@ import { registerGovernanceProvider as registerProviderWithStore } from './gover
  * Operation surface (authoritative, controller-facing — model-facing identity
  * derivation and authorization stay in the tool layer):
  *   create, get, submitPlan, acceptPlan, bindRole, unbindRole, resolveRole,
- *   submitProof, runPreflight, submitReview, submitRepair, history, status
+ *   submitProof, runPreflight, submitReview, submitRepair, getRepairContext,
+ *   history, status
  *
  * findByWorkItem is intentionally absent until the external work-item linkage
  * lands (Phase 3 ticket T3.1).
@@ -83,6 +84,9 @@ export function createChangeControlService(store) {
 
     /** Submit a repair (REPAIR → PREFLIGHT). */
     submitRepair: (changeId, repair, opts) => store.submitRepair(changeId, repair, opts),
+
+    /** Resolve repair context (unresolved findings, claims, revision, proof, preflight). */
+    getRepairContext: (changeId) => store.getRepairContext(changeId),
 
     /** Append-only audit history for a Change. */
     history: (changeId) => store.history(changeId),

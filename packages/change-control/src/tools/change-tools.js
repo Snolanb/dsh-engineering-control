@@ -19,8 +19,10 @@ function validateChangeId(changeId) {
 
 /**
  * Extract caller identity from exec context. Reject impersonation.
+ * Identity derivation stays tool-owned, but role resolution routes through the
+ * canonical changeControl facade (never ChangeStore directly).
  */
-async function deriveIdentity(args, exec, store) {
+async function deriveIdentity(args, exec, changeControl) {
   const sessionId = exec?.agent?.id;
   if (!sessionId) {
     throw new AuthorizationError('IDENTITY_MISSING', 'Session identity must be derived from invocation context');
@@ -28,7 +30,7 @@ async function deriveIdentity(args, exec, store) {
   if (args.sessionId && args.sessionId !== sessionId) {
     throw new AuthorizationError('SESSION_IMPERSONATION', 'Session impersonation is not allowed');
   }
-  const bindingRole = await store.resolveRole(args.changeId, sessionId).catch(() => null);
+  const bindingRole = await changeControl.resolveRole(args.changeId, sessionId).catch(() => null);
   if (!bindingRole) {
     throw new AuthorizationError('SESSION_NOT_BOUND', 'Session is not bound to this change');
   }
@@ -36,14 +38,14 @@ async function deriveIdentity(args, exec, store) {
 }
 
 /**
- * Wrap store.transition, converting domain errors to structured tool errors.
+ * Wrap the canonical transition, converting domain errors to structured tool errors.
  */
-async function transitionWithStructure(store, changeId, nextState) {
+async function transitionWithStructure(changeControl, changeId, nextState) {
   try {
-    return await store.transition(changeId, nextState);
+    return await changeControl.transition(changeId, nextState);
   } catch (err) {
     if (err instanceof ChangeDomainError || err.message?.includes('Cannot transition')) {
-      const change = await store.get(changeId);
+      const change = await changeControl.get(changeId);
       const allowed = TRANSITIONS[change.state] ?? [];
       throw Object.assign(new Error(err.message), {
         code: 'ILLEGAL_TRANSITION',
@@ -66,9 +68,13 @@ function toAuthState(domainState) {
 }
 
 /**
- * Create all five Change tools. Tool layer delegates auth/transitions to canonical ChangeService/domain.
+ * Create all five Change tools. The tool layer delegates every semantic
+ * persistence/lifecycle operation to the canonical changeControl facade while
+ * keeping invocation-context identity derivation, payload validation, and
+ * model-facing error shaping tool-owned.
+ * @param {ReturnType<import('../service/change-control-service.js').createChangeControlService>} changeControl
  */
-export function createChangeTools(store) {
+export function createChangeTools(changeControl) {
   const tools = [
     defineTool({
       name: 'change_get',
@@ -77,13 +83,13 @@ export function createChangeTools(store) {
       output: { schema: { type: 'object', additionalProperties: true }, render: (_a, v) => v },
       execute: async (args, exec) => {
         validateChangeId(args.changeId);
-        const { sessionId } = await deriveIdentity(args, exec, store);
-        const change = await store.get(args.changeId);
+        const { sessionId } = await deriveIdentity(args, exec, changeControl);
+        const change = await changeControl.get(args.changeId);
         const result = { id: change.id, state: change.state, title: change.title };
         // Expose unresolved findings when in REPAIR or REVIEW state
         if (change.state === 'REPAIR' || change.state === 'REVIEW') {
           try {
-            const context = await store.getRepairContext(args.changeId);
+            const context = await changeControl.getRepairContext(args.changeId);
             result.unresolvedFindings = context.unresolvedFindings;
             result.repairClaims = context.repairClaims;
             result.originalFindings = context.originalFindings;
@@ -107,14 +113,14 @@ export function createChangeTools(store) {
         if (!args.content || typeof args.content !== 'object') {
           throw Object.assign(new Error('content is required and must be an object'), { code: 'INVALID_CONTENT' });
         }
-        const { sessionId, role } = await deriveIdentity(args, exec, store);
-        const change = await store.get(args.changeId);
+        const { sessionId, role } = await deriveIdentity(args, exec, changeControl);
+        const change = await changeControl.get(args.changeId);
         const service = new ChangeService({ role, state: toAuthState(change.state), sessionBound: true });
         try { service.submitPlan(); } catch (err) {
           if (err instanceof AuthorizationError) throw Object.assign(new Error(err.message), { code: err.reason });
           throw err;
         }
-        const plan = await store.submitPlan(args.changeId, args.content);
+        const plan = await changeControl.submitPlan(args.changeId, args.content);
         return { planId: plan.id, status: plan.status };
       },
     }),
@@ -128,8 +134,8 @@ export function createChangeTools(store) {
         if (!args.proof || typeof args.proof !== 'string') {
           throw Object.assign(new Error('proof is required and must be a string'), { code: 'INVALID_PROOF' });
         }
-        const { sessionId, role } = await deriveIdentity(args, exec, store);
-        const change = await store.get(args.changeId);
+        const { sessionId, role } = await deriveIdentity(args, exec, changeControl);
+        const change = await changeControl.get(args.changeId);
         // V1: Derive planAccepted from persisted store state
         const planAccepted = !!change.acceptedPlanId;
         const service = new ChangeService({ role, state: toAuthState(change.state), sessionBound: true, planAccepted });
@@ -143,13 +149,13 @@ export function createChangeTools(store) {
         } catch {
           // Preserve the legacy transition-only contract for plain strings; no
           // proof is persisted, so preflight cannot treat arbitrary text as proof.
-          await transitionWithStructure(store, args.changeId, 'PREFLIGHT');
+          await transitionWithStructure(changeControl, args.changeId, 'PREFLIGHT');
           return { success: true };
         }
         if (!proofObj || typeof proofObj !== 'object' || Array.isArray(proofObj)) {
           throw Object.assign(new Error('proof must be a JSON object'), { code: 'INVALID_PROOF' });
         }
-        await store.submitProof(args.changeId, proofObj);
+        await changeControl.submitProof(args.changeId, proofObj);
         return { success: true };
       },
     }),
@@ -163,16 +169,16 @@ export function createChangeTools(store) {
         if (!args.review || typeof args.review !== 'object') {
           throw Object.assign(new Error('review is required and must be an object'), { code: 'INVALID_REVIEW' });
         }
-        const { sessionId, role } = await deriveIdentity(args, exec, store);
-        const change = await store.get(args.changeId);
+        const { sessionId, role } = await deriveIdentity(args, exec, changeControl);
+        const change = await changeControl.get(args.changeId);
 
         const service = new ChangeService({ role, state: toAuthState(change.state), sessionBound: true });
         try { service.submitReview(); } catch (err) {
           if (err instanceof AuthorizationError) throw Object.assign(new Error(err.message), { code: err.reason });
           throw err;
         }
-        // Forward structured review to store
-        const result = await store.submitReview(args.changeId, args.review, { sessionId });
+        // Forward structured review to the canonical facade
+        const result = await changeControl.submitReview(args.changeId, args.review, { sessionId });
         return result;
       },
     }),
@@ -190,8 +196,8 @@ export function createChangeTools(store) {
         if (!args.repair || typeof args.repair !== 'object') {
           throw Object.assign(new Error('repair is required and must be an object'), { code: 'INVALID_REPAIR' });
         }
-        const { sessionId, role } = await deriveIdentity(args, exec, store);
-        const change = await store.get(args.changeId);
+        const { sessionId, role } = await deriveIdentity(args, exec, changeControl);
+        const change = await changeControl.get(args.changeId);
         // V1: Derive planAccepted from persisted store state
         const planAccepted = !!change.acceptedPlanId;
         // For repair tool, we need to check authorization against REPAIR state
@@ -208,7 +214,7 @@ export function createChangeTools(store) {
         }
         // Strip unknown underscore-prefixed keys from repair before passing to store
         const { _legacy, ...cleanRepair } = args.repair;
-        const result = await store.submitRepair(args.changeId, cleanRepair, { workerId: sessionId });
+        const result = await changeControl.submitRepair(args.changeId, cleanRepair, { workerId: sessionId });
         return { success: true, state: result.state };
       },
     }),
@@ -228,7 +234,7 @@ export async function registerChangeTools(ctx, config) {
   // external packages integrate via ctx.changeControl only.
   const service = createChangeControlService(store);
   ctx.provide('changeControl', service);
-  const tools = createChangeTools(store);
+  const tools = createChangeTools(service);
   const registry = ctx.tools;
   if (!registry?.register) throw new Error('tools.register not available');
   for (const tool of tools) registry.register(tool);
