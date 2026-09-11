@@ -509,7 +509,7 @@ export function workerCompletionOutputSchema() {
       files_changed: { type: 'array', items: { type: 'string' }, required: true },
       tests_run: { type: 'array', items: { type: 'string' }, required: true },
       remaining_blockers: { type: 'array', items: { type: 'string' }, required: true },
-      criteria: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { id: { type: 'string' }, satisfied: { type: 'boolean' } } }, required: true },
+      criteria: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { id: { type: 'string', required: true }, satisfied: { type: 'boolean', required: true } } }, required: true },
       deviations: { type: 'array', required: true },
       workerChecks: { type: 'array', items: { type: 'string' }, required: true },
       controllerPreflight: { type: 'array', items: { type: 'string' }, required: true },

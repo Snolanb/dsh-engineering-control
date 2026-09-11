@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { valueSchemaSpecToJsonSchema, validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
 import { createTaskTools } from '../src/tools.js'
 import { buildWorkerCompletionEnvelope, validateWorkerCompletion, workerCompletionOutputSchema, WORKER_COMPLETION_PROTOCOL, WORKER_COMPLETION_TOOL } from '../src/dispatcher.js'
 import { TaskStore } from '../src/store.js'
@@ -144,6 +145,46 @@ test('the compiled output schema requires all 12 envelope properties (rejects an
     assert.ok(required.includes(key), 'compiled schema must require envelope field: ' + key)
   }
   assert.equal(required.length, 12)
+})
+
+// H9-FR-04: the compiled schema requires BOTH id and satisfied on each nested
+// criterion, so an empty/partial criterion cannot pass the producer's output
+// contract even though runtime validation already rejects it.
+test('the compiled output schema requires id and satisfied on each criterion item', () => {
+  const tool = workerCompleteTool()
+  const items = tool.output.schema.properties.criteria.items
+  assert.deepEqual([...(items.required ?? [])].sort(), ['id', 'satisfied'], 'criteria item must require id and satisfied')
+})
+
+test('the compiled output schema rejects empty and partial criterion objects', () => {
+  const schema = valueSchemaSpecToJsonSchema(workerCompletionOutputSchema())
+  const valid = {
+    protocol: WORKER_COMPLETION_PROTOCOL,
+    beforeRevision: 'main@baseline',
+    afterRevision: 'abc123',
+    commit_sha: 'abc123',
+    files_changed: [],
+    tests_run: [],
+    remaining_blockers: [],
+    deviations: [],
+    workerChecks: [],
+    controllerPreflight: [],
+    summary: 'done',
+  }
+  // Empty criterion object is missing both required keys.
+  assert.deepEqual(validateJsonSchemaValue(schema, { ...valid, criteria: [{}] }, 'value'), [
+    'missing required property "value.criteria[0].id"',
+    'missing required property "value.criteria[0].satisfied"',
+  ])
+  // Partial criterion object is missing exactly the un-supplied required key.
+  assert.deepEqual(validateJsonSchemaValue(schema, { ...valid, criteria: [{ id: 'ship' }] }, 'value'), [
+    'missing required property "value.criteria[0].satisfied"',
+  ])
+  assert.deepEqual(validateJsonSchemaValue(schema, { ...valid, criteria: [{ satisfied: true }] }, 'value'), [
+    'missing required property "value.criteria[0].id"',
+  ])
+  // A complete criterion is clean.
+  assert.deepEqual(validateJsonSchemaValue(schema, { ...valid, criteria: [{ id: 'ship', satisfied: true }] }, 'value'), [])
 })
 
 // H9-FR-02: an extra key on a nested criterion is rejected by the producer
