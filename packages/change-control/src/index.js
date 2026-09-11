@@ -62,18 +62,22 @@ async function apply(ctx, config) {
   const { store, service } = await registerChangeTools(ctx, config);
 
   // Register host-side manual /change-* commands when the host exposes a
-  // commands service (absent in tool-only compositions; the model-facing tools
-  // stay authoritative there). 'commands' is intentionally not in the inject
-  // list: cordis would block plugin startup on hosts without it. Instead, a
-  // host that advertises commands must accept them — a malformed or failing
-  // commands.register throws loudly rather than silently registering nothing.
-  // The returned disposers are retained and released on teardown.
-  let commands;
-  try { commands = ctx.commands; } catch { commands = null; }
-  let commandDisposers = [];
-  if (commands) {
-    commandDisposers = registerChangeCommands(commands, service);
-  }
+  // commands service — including a host where commands arrives AFTER startup,
+  // is removed, or is re-added. 'commands' stays out of the plugin's hard
+  // inject list (tool-only hosts must start without it); instead this inner
+  // inject fiber is parked until the service exists, then Cordis runs it and
+  // disposes/re-runs it on every service change (no polling). A malformed or
+  // failing commands.register makes the fiber throw: at startup the awaited
+  // promise rejects the plugin, later it surfaces on the fiber/logger. The
+  // registry disposers are the fiber's teardown effect.
+  await ctx.inject(['commands'], (c) => {
+    const disposers = registerChangeCommands(c.commands, service);
+    return () => {
+      for (const dispose of disposers) {
+        try { if (typeof dispose === 'function') dispose(); } catch { /* teardown best-effort */ }
+      }
+    };
+  });
 
   // Wire up the filesystem/tool policy pre-execute interceptor.
   // The policy reads the store's role bindings and change states to gate
@@ -82,17 +86,6 @@ async function apply(ctx, config) {
   if (policyGate) {
     ctx.events.on('tools/pre-execute', policyGate);
   }
-
-  ctx.effect(() => {
-    // Initialization logic runs exactly once per context
-    return () => {
-      // Release the host command registrations on plugin teardown.
-      for (const dispose of commandDisposers) {
-        try { if (typeof dispose === 'function') dispose(); } catch { /* teardown best-effort */ }
-      }
-      commandDisposers = [];
-    };
-  });
 }
 
 export { name, apply };
