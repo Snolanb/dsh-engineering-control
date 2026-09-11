@@ -6,10 +6,11 @@ import { tmpdir } from 'node:os';
 import { ChangeStore } from '../src/storage/change-store.js';
 import { PreflightRunner } from '../src/preflight/preflight-runner.js';
 import { createChangeTools } from '../src/tools/change-tools.js';
+import { createChangeControlService } from '../src/service/change-control-service.js';
 
 // Role-gated operations execute through the canonical tool boundary where
 // ChangeService authorization and session identity derivation are enforced.
-const toolsFor = (store) => Object.fromEntries(createChangeTools(store).map((tool) => [tool.name, tool]));
+const toolsFor = (store) => Object.fromEntries(createChangeTools(createChangeControlService(store)).map((tool) => [tool.name, tool]));
 const asSession = (sessionId) => ({ agent: { id: sessionId } });
 // Filter for assert.rejects: catches both AuthorizationError (.reason) and
 // tool-converted errors (.code) produced by the same authorization paths.
@@ -30,9 +31,52 @@ async function fixture(t) {
 // ─── Tool surface allowlist ──────────────────────────────────────────────────
 test('tool surface is exactly the canonical five-change allowlist', async (t) => {
   const f = await fixture(t);
-  const tools = createChangeTools(f.store);
+  const tools = createChangeTools(createChangeControlService(f.store));
   const names = tools.map((t) => t.name);
   assert.deepEqual(names, ['change_get', 'change_submit_plan', 'change_submit_proof', 'change_submit_review', 'change_submit_repair']);
+});
+
+test('model-facing tools delegate identity + lifecycle semantics through the canonical facade', async (t) => {
+  const f = await fixture(t);
+  await f.store.bindRole(f.change.id, 'planner-session', 'planner');
+  const facade = createChangeControlService(f.store);
+  const seen = new Set();
+  const spy = {};
+  for (const [prop, value] of Object.entries(facade)) {
+    spy[prop] = typeof value === 'function' ? (...args) => { seen.add(prop); return value(...args); } : value;
+  }
+  const tools = Object.fromEntries(createChangeTools(spy).map((t) => [t.name, t]));
+  const plan = await tools.change_submit_plan.execute(
+    { changeId: f.change.id, content: { steps: ['do it'] } },
+    asSession('planner-session'),
+  );
+  assert.ok(plan.planId, 'plan submission succeeds through the facade');
+  assert.ok(seen.has('resolveRole'), 'identity resolution routes through the facade');
+  assert.ok(seen.has('get'), 'reads route through the facade');
+  assert.ok(seen.has('submitPlan'), 'lifecycle persistence routes through the facade');
+});
+
+test('facade owns the repair-context projection and change_get resolves it through the facade', async (t) => {
+  const f = await fixture(t);
+  const facade = createChangeControlService(f.store);
+  // The canonical integration contract must ship every projection the model
+  // tools consume — getRepairContext is the one the store still exposed directly.
+  assert.equal(typeof facade.getRepairContext, 'function', 'facade exposes getRepairContext');
+
+  await f.store.bindRole(f.change.id, 'worker-session', 'worker');
+  await f.store.bindRole(f.change.id, 'reviewer-session', 'reviewer');
+  await f.store.transition(f.change.id, 'PLANNED');
+  await f.store.transition(f.change.id, 'READY');
+  await f.store.transition(f.change.id, 'IMPLEMENTING');
+  await f.store.recordAttempt(f.change.id, { attemptId: 'impl-1', workerId: 'worker-session', revision: 'impl-1', status: 'completed' });
+  await f.store.transition(f.change.id, 'PREFLIGHT');
+  await f.store.transition(f.change.id, 'REVIEW');
+  await f.store.submitReview(f.change.id, { verdict: 'fail', revision: 'impl-1', findings: [{ severity: 'critical', category: 'security', location: 'file.js:1', problem: 'Issue', requiredOutcome: 'Fix' }] }, { sessionId: 'reviewer-session' });
+
+  const tools = Object.fromEntries(createChangeTools(facade).map((t) => [t.name, t]));
+  const got = await tools.change_get.execute({ changeId: f.change.id }, asSession('worker-session'));
+  assert.equal(got.state, 'REPAIR');
+  assert.equal(got.unresolvedFindings.length, 1);
 });
 
 test('every tool rejects an unbound session with SESSION_NOT_BOUND', async (t) => {
