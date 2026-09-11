@@ -323,17 +323,56 @@ test('T-H7 positive: full governed SDLC driven by the real controller and real l
   assert.equal((await cc.get(change.id)).state, 'APPROVED', 'Change APPROVED');
   assert.equal(orch.get(task.id).status, 'done', 'task done');
 
-  // 24. cleanup — the production reconciliation operation clears orphaned
-  // worker bindings on the now-terminal task (auditable, real path).
-  const reconciliation = await tcc.reconcileTaskChange(task.id);
-  const leakedAfterCleanup = (await cc.listRoleBindings()).filter((b) => b.changeId === change.id && b.role === 'worker');
-  assert.equal(leakedAfterCleanup.length, 0, 'worker bindings cleaned up after terminal task');
-  assert.ok(reconciliation, 'reconciliation ran');
+  // 24. terminal binding outcomes — the WORKER bindings are transient and
+  // already released by the dispatcher/governor (audited UNBIND); the REVIEWER
+  // binding intentionally persisists as the durable review record and is NOT
+  // part of reconciliation. Capture both outcomes and the durable UNBIND
+  // audit evidence BEFORE reopening the stores.
+  const terminalBindings = (await cc.listRoleBindings()).filter((b) => b.changeId === change.id);
+  const terminalWorkers = terminalBindings.filter((b) => b.role === 'worker');
+  const terminalReviewers = terminalBindings.filter((b) => b.role === 'reviewer');
+  assert.equal(terminalWorkers.length, 0, 'no worker binding leaks at terminal (all released)');
+  assert.equal(terminalReviewers.length, 1, 'exactly one reviewer binding persists at terminal');
+  assert.equal(terminalReviewers[0].sessionId, reviewerSession, 'persisted reviewer binding is the review session');
+  assert.equal(terminalReviewers[0].worker, undefined, 'reviewer binding carries no worker identity');
 
-  // 25. restart both stores → 26. consistent audit
+  // 25. durable UNBIND audit evidence — the two worker dispatches (initial +
+  // repair) each produced a `type:'UNBIND'` record for the SESSION they bound;
+  // the reviewer session is never unbound (intentional reviewer lifecycle).
   const audit = await cc.history(change.id);
-  const actions = audit.map((e) => e.action ?? e.to ?? null);
-  assert.ok(actions.includes('review_pass_approved'), 'review_pass_approved audited');
+  const workerUnbinds = audit.filter((e) => e.type === 'UNBIND');
+  assert.equal(workerUnbinds.length, 2, 'initial + repair worker each produced a durable UNBIND record');
+  assert.ok(workerUnbinds.some((e) => e.sessionId === boundSession), 'unbind evidence for the initial dispatched worker session');
+  for (const u of workerUnbinds) {
+    assert.ok(typeof u.sessionId === 'string' && u.sessionId.length > 0, 'UNBIND record carries the sessionId');
+    assert.notEqual(u.sessionId, reviewerSession, 'reviewer session is never unbound');
+  }
+  // The reconciliation operation is idempotent here: no orphaned worker
+  // bindings remain, so it records nothing and must not fabricate an unbind.
+  const reconciliation = await tcc.reconcileTaskChange(task.id);
+  assert.ok(reconciliation, 'reconciliation ran');
+  assert.equal(reconciliation.repairs.length, 0, 'clean terminal path reports no orphaned worker repairs');
+  const auditAfterReconcile = await cc.history(change.id);
+  assert.equal(auditAfterReconcile.length, audit.length, 'reconciliation fabricates no spurious audit records');
+
+  // 26. ordered audit signature + state transitions (canonical projection of
+  // the durable fields; ts/eventId intentionally excluded as they are not part
+  // of the semantic record). Capture the EXACT ordered sequence.
+  const auditSignature = audit.map((e) => ({
+    type: e.type ?? null, action: e.action ?? null, to: e.to ?? null, from: e.from ?? null,
+    actor: e.actor ?? null, sessionId: e.sessionId ?? null, kind: e.kind ?? null,
+  }));
+  // The ordered state-transition chain: pure transition records carry `to`
+  // without a `type`/`action` (audit action/type records re-report the current
+  // state but are not state moves). This is the exact SDLC lifecycle.
+  const transitions = audit
+    .filter((e) => e.to != null && e.type == null && e.action == null)
+    .map((e) => e.to);
+  assert.deepEqual(
+    transitions,
+    ['DRAFT', 'PLANNED', 'READY', 'IMPLEMENTING', 'PREFLIGHT', 'REVIEW', 'REPAIR', 'PREFLIGHT', 'REVIEW', 'APPROVED'],
+    'exact ordered state transitions',
+  );
 
   // Reopen both durable stores fresh (new Context + new stores on same files).
   const ctx2 = new Context();
@@ -350,10 +389,23 @@ test('T-H7 positive: full governed SDLC driven by the real controller and real l
   assert.equal(store2.get(task.id).status, 'done', 'task done survives SQLite restart');
   assert.equal(store2.get(task.id).commit_sha, 'def456', 'final commit_sha survives restart');
 
-  // audit consistency across restart (same durable audit trail)
+  // 27. exact ordered audit + binding comparison across restart: the durable
+  // audit trail re-read from disk is BYTE-IDENTICAL in the semantic fields, in
+  // the same order, and the terminal binding outcome (reviewer persists, no
+  // worker leaks) is equally durable.
   const audit2 = await cc2.history(change.id);
+  const auditSignature2 = audit2.map((e) => ({
+    type: e.type ?? null, action: e.action ?? null, to: e.to ?? null, from: e.from ?? null,
+    actor: e.actor ?? null, sessionId: e.sessionId ?? null, kind: e.kind ?? null,
+  }));
   assert.equal(audit2.length, audit.length, 'audit trail length consistent across restart');
-  assert.ok(audit2.some((e) => e.action === 'review_pass_approved'), 'approved audit re-read from disk');
+  assert.deepEqual(auditSignature2, auditSignature, 'exact ordered audit records identical across restart');
+  const bindingsAfterRestart = (await cc2.listRoleBindings()).filter((b) => b.changeId === change.id);
+  assert.deepEqual(
+    bindingsAfterRestart.slice().sort((a, b) => a.sessionId.localeCompare(b.sessionId)),
+    terminalBindings.slice().sort((a, b) => a.sessionId.localeCompare(b.sessionId)),
+    'terminal binding outcome (reviewer persists, no worker leak) survives restart',
+  );
 });
 
 // ─── Test 2 — governed dispatch + completion hook wired & fails closed ────
