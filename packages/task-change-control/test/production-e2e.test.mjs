@@ -295,17 +295,19 @@ test('T-H7 positive: full governed SDLC driven by the real controller and real l
       && status.attempts.length === 2;
   });
   const statusAfterRepair = await cc.status(change.id);
-  // The next review round is bound to an independent reviewer session (the
-  // existing reservation policy may reuse the first reviewer; either way it
-  // must never be a worker implementation session).
+  // T-H12: the re-review is bound to a NEW independent reviewer session —
+  // each new REVIEW revision gets exactly one explicit reviewer request; the
+  // prior round's session/binding never satisfies it. Either way it must
+  // never be a worker implementation session.
   const nextReviewerSession = (await cc.listRoleBindings())
     .filter((b) => b.changeId === change.id && b.role === 'reviewer')
     .at(-1).sessionId;
   assert.ok(nextReviewerSession, 'a reviewer is bound for the re-review');
+  assert.notEqual(nextReviewerSession, reviewerSession, 'the new revision\'s reviewer session is fresh (T-H12)');
   assert.equal(statusAfterRepair.openFindings.length, 1, 'finding record persists for the re-review');
   assert.equal((await cc.get(change.id)).state, 'REVIEW', 'Change back in REVIEW after automatic repair');
 
-  // 17. The independent reviewer settles PASS through the same real
+   // 17. The independent reviewer settles PASS through the same real
   // structured seam; the woken controller converges APPROVED + done.
   const passReview = await reviewTool.execute(
     { changeId: change.id, review: { verdict: 'pass', revision: 'def456', findings: [] } },
@@ -318,22 +320,33 @@ test('T-H7 positive: full governed SDLC driven by the real controller and real l
 
   // 24. terminal binding outcomes — the WORKER bindings are transient and
   // already released by the dispatcher/governor (audited UNBIND); the REVIEWER
-  // binding intentionally persisists as the durable review record and is NOT
-  // part of reconciliation. Capture both outcomes and the durable UNBIND
-  // audit evidence BEFORE reopening the stores.
+  // bindings intentionally persist as the durable review records — TWO of
+  // them (T-H12: one per reviewed revision, rounds abc123 then def456) — and
+  // are NOT part of reconciliation. Capture both outcomes and the durable
+  // UNBIND audit evidence BEFORE reopening the stores.
   const terminalBindings = (await cc.listRoleBindings()).filter((b) => b.changeId === change.id);
   const terminalWorkers = terminalBindings.filter((b) => b.role === 'worker');
   const terminalReviewers = terminalBindings.filter((b) => b.role === 'reviewer');
   assert.equal(terminalWorkers.length, 0, 'no worker binding leaks at terminal (all released)');
-  assert.equal(terminalReviewers.length, 1, 'the independent reviewer binding persists at terminal');
-  assert.equal(terminalReviewers[0].sessionId, nextReviewerSession, 'persisted reviewer binding is the review session');
-  assert.equal(terminalReviewers[0].worker, undefined, 'reviewer binding carries no worker identity');
+  assert.equal(terminalReviewers.length, 2, 'one reviewer binding per reviewed revision persists at terminal');
+  assert.deepEqual(
+    terminalReviewers.map((b) => b.sessionId),
+    [reviewerSession, nextReviewerSession],
+    'persisted reviewer bindings are round 1 then round 2 review sessions',
+  );
+  for (const b of terminalReviewers) {
+    assert.equal(b.worker, undefined, 'reviewer binding carries no worker identity');
+  }
 
   // 25. durable UNBIND audit evidence — the two worker dispatches (initial +
   // repair) each produced a `type:'UNBIND'` record for the SESSION they bound;
   // the fresh reviewer's binding remains the terminal review record.
   const audit = await cc.history(change.id);
-  const reviewerSessionIds = new Set([reviewerSession, nextReviewerSession]);
+  const reviewerRequests = audit.filter((e) => e.kind === 'review_orchestration' && e.action === 'review_round_requested');
+   assert.equal(reviewerRequests.length, 2, 'exactly one durable reviewer request per reviewed revision');
+   assert.deepEqual(reviewerRequests.map((e) => e.revision), ['abc123', 'def456'], 'review request audit follows proof revisions');
+   assert.deepEqual(reviewerRequests.map((e) => e.sessionId), [reviewerSession, nextReviewerSession], 'review request audit is attributable to each bound session');
+   const reviewerSessionIds = new Set([reviewerSession, nextReviewerSession]);
   const workerSessionIds = rpc.createdSessionIds.filter((id) => !reviewerSessionIds.has(id));
   const workerUnbinds = audit.filter((e) => e.type === 'UNBIND' && workerSessionIds.includes(e.sessionId));
   assert.equal(workerUnbinds.length, 2, 'initial + repair worker each produced a durable UNBIND record');

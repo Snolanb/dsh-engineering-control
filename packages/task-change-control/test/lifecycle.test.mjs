@@ -97,7 +97,9 @@ async function compose(t, {
   withReviewerLauncher = true,
   storePrefix = 'tcc-th5-',
   reviewerLaunchDelay = 0,
-  reviewerSessionId = () => REVIEWER_SESSION,
+  // T-H12: each review round (new revision) launches its OWN reviewer
+  // session — default ids stay launch-unique, with the canonical first one.
+  reviewerSessionId = (n) => (n === 1 ? REVIEWER_SESSION : `${REVIEWER_SESSION}-${n}`),
 } = {}) {
   const dir = await mkdtemp(join(tmpdir(), storePrefix));
   t.after(() => rm(dir, { recursive: true, force: true }));
@@ -292,7 +294,7 @@ test('T-H5: fail verdict routes the repair worker automatically; the loop re-ent
   assert.equal(r1.outcome, 'review_pending', 'second review round awaits its verdict');
   assert.equal((await ctx.changeControl.get(change.id)).state, 'REVIEW');
   assert.equal((await taskStore.get(task.id)).status, 'in_review');
-  assert.equal(reviewerLaunches(), 1, 'the existing reviewer session is reused, not relaunched');
+  assert.equal(reviewerLaunches(), 2, 'T-H12: the new revision gets its own fresh reviewer session — the prior round\'s is never re-prompted');
 
   // The repair round claimed the UNRESOLVED FINDING ID from the fail verdict.
   const disk = JSON.parse(readFileSync(storePath, 'utf8'));
@@ -347,7 +349,7 @@ test('T-H5: repeated fail loops honor maxRepairRounds → escalation; re-invocat
   const escalations = (await ctx.changeControl.history(change.id))
     .filter((e) => e.kind === 'review_orchestration' && e.action === 'escalated');
   assert.equal(escalations.length, 1, 'escalation audited exactly once');
-  assert.equal(reviewerLaunches(), 1, 'no reviewer launch after escalation');
+  assert.equal(reviewerLaunches(), 3, 'one reviewer launch per revision: rounds a1, a2, a3; no reviewer launch after escalation');
 });
 
 test('T-H5: deterministic preflight fails closed (no reviewer launch); the controller resumes after correction', async (t) => {
@@ -366,6 +368,46 @@ test('T-H5: deterministic preflight fails closed (no reviewer launch); the contr
   assert.equal(out.outcome, 'review_pending');
   assert.equal((await ctx.changeControl.get(change.id)).state, 'REVIEW');
   assert.equal(reviewerLaunches(), 1);
+});
+
+test('T-H12: failed reviewer prompt claim is recoverable without a lease wait', async (t) => {
+  const { ctx, taskStore, dir, storePath, reviewerLaunches } = await compose(t, {
+    reviewerSessionId: (n) => {
+      if (n === 1) throw Object.assign(new Error('reviewer prompt failed'), { code: 'SESSION_PROMPT_FAILED' });
+      return `sess-review-retry-${n}`;
+    },
+  });
+  const { task, change } = await governedReadyTask(ctx, taskStore, dir);
+  await dispatchGovernedSuccess(ctx, taskStore, dir, change, { preflight: ['FAIL: build'] });
+  assert.equal((await ctx.changeControl.get(change.id)).state, 'PREFLIGHT');
+
+  await assert.rejects(
+    ctx.taskChangeControl.runGovernedReview(task.id, { controllerPreflightOverride: ['pass:build'] }),
+    (error) => error?.code === 'SESSION_PROMPT_FAILED',
+    'the first reviewer prompt failure remains attributable to its launch error',
+  );
+  assert.equal(reviewerLaunches(), 1, 'failed reviewer launch is counted once');
+  assert.equal(
+    (await ctx.changeControl.listRoleBindings()).filter((b) => b.changeId === change.id && b.role === 'reviewer').length,
+    0,
+    'failed reviewer launch leaves no reviewer binding',
+  );
+
+  const started = performance.now();
+  const retry = await ctx.taskChangeControl.runGovernedReview(task.id, { controllerPreflightOverride: ['pass:build'] });
+  const elapsed = performance.now() - started;
+  assert.ok(elapsed < 30_000, `retry must not wait for the ${10 * 60}s claim lease (elapsed ${elapsed}ms)`);
+  assert.equal(retry.outcome, 'review_started');
+  assert.equal(reviewerLaunches(), 2, 'retry launches one fresh reviewer session');
+  const reviewers = (await ctx.changeControl.listRoleBindings())
+    .filter((b) => b.changeId === change.id && b.role === 'reviewer');
+  assert.equal(reviewers.length, 1, 'retry persists exactly one reviewer binding');
+  const revision = (await ctx.changeControl.status(change.id)).revision;
+  const requests = (await ctx.changeControl.history(change.id))
+    .filter((e) => e.kind === 'review_orchestration' && e.action === 'review_round_requested');
+  assert.equal(requests.length, 1, 'only the successful retry records a reviewer request');
+  assert.equal(requests[0].revision, revision, 'request is attributed to the current proof revision');
+  assert.equal(requests[0].sessionId, 'sess-review-retry-2', 'request names the retry reviewer session');
 });
 
 test('T-H5: trigger degrades fail-soft when the reviewer launcher is unavailable (completion still converges)', async (t) => {
@@ -513,14 +555,16 @@ test('T-H5 PR1-02: concurrent runGovernedSdlc calls launch and bind exactly ONE 
 // ─── T-H5 PR2-01 — durable cross-process reviewer claim ───────────────────────
 
 /**
- * Durable claim-file convention (mirrors src/service.js, T-H5 PR2-01):
- *   <task.workspace>/.dsh-governance/reviewer-claims/reviewer-claim-<changeId>
+ * Durable claim-file convention (mirrors src/service.js, T-H5 PR2-01 + T-H12):
+ *   <task.workspace>/.dsh-governance/reviewer-claims/reviewer-claim-<changeId>-<encoded revision>
  * Exclusive-create claims it; atomic rewrites record the launched session
  * BEFORE binding so a crashed owner's reviewer is adopted, not re-launched.
+ * The claim is keyed by the Change's CURRENT revision: dispatchGovernedSuccess
+ * defaults to afterRevision 'a1', so the round-1 claim encodes 'a1'.
  */
-function reviewerClaimFileFor(task, change) {
+function reviewerClaimFileFor(task, change, revision = 'a1') {
   const base = typeof task?.workspace === 'string' && task.workspace.trim() !== '' ? task.workspace : tmpdir();
-  return join(base, '.dsh-governance', 'reviewer-claims', `reviewer-claim-${String(change.id)}`);
+  return join(base, '.dsh-governance', 'reviewer-claims', `reviewer-claim-${String(change.id)}-${encodeURIComponent(String(revision))}`);
 }
 
 /** Self-contained host process: same composition as compose(), racing runGovernedSdlc. */
