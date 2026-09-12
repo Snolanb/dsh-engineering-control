@@ -1595,6 +1595,20 @@ export class ChangeStore {
         }
       }
 
+      // Fail closed on any criterion the worker reports unsatisfied. The
+      // worker's structured {id, satisfied} is authoritative: a false criterion
+      // must never advance the Change to PREFLIGHT as though it passed. This
+      // check runs BEFORE any state/audit/proof mutation so a rejected proof
+      // leaves the Change byte-for-byte untouched.
+      for (const crit of proof.criteria) {
+        if (crit.satisfied === false) {
+          throw Object.assign(
+            new Error(`Criterion not satisfied: ${crit.id}`),
+            { code: 'UNSATISFIED_CRITERION', criterionId: crit.id },
+          );
+        }
+      }
+
       // All validations passed — transition state and persist proof
       const before = c.state;
       c.transitionTo('PREFLIGHT');

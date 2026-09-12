@@ -29,6 +29,59 @@ function unavailable(detail) {
 }
 
 /**
+ * Validate worker criterion evidence against the canonical acceptance criteria
+ * with the SAME authoritative checks ChangeStore.submitProof applies: exact
+ * array shape ({id: non-empty string, satisfied: boolean}), exact coverage, and
+ * no duplicates, unknown, missing, or unsatisfied criteria. Throws on the first
+ * violation with the authoritative Change-side code. Mirrors submitProof so the
+ * governed completion and replay paths cannot accept evidence the proof boundary
+ * would reject.
+ * @param {string[]} acceptedCriteria canonical criterion IDs
+ * @param {Array<{id: string, satisfied: boolean}>} criteria worker criterion evidence
+ */
+function validateProofCriteria(acceptedCriteria, criteria) {
+  const acceptedIds = new Set((acceptedCriteria ?? []).map(String));
+  if (!Array.isArray(criteria)) {
+    throw Object.assign(
+      new Error('proof.criteria is required and must be an array'),
+      { code: 'INVALID_PROOF', field: 'criteria' },
+    );
+  }
+  const seen = new Set();
+  for (const crit of criteria) {
+    if (!crit || typeof crit !== 'object' || Array.isArray(crit)) {
+      throw Object.assign(new Error('Each criterion must be an object'), { code: 'INVALID_PROOF' });
+    }
+    if (typeof crit.id !== 'string' || crit.id.trim() === '') {
+      throw Object.assign(new Error('Criterion id must be a non-empty string'), { code: 'INVALID_PROOF' });
+    }
+    if (typeof crit.satisfied !== 'boolean') {
+      throw Object.assign(new Error(`Criterion satisfied must be a boolean for id: ${crit.id}`), { code: 'INVALID_PROOF' });
+    }
+    if (!acceptedIds.has(crit.id)) {
+      throw Object.assign(new Error(`Unknown criterion ID: ${crit.id}`), { code: 'UNKNOWN_CRITERION' });
+    }
+    if (seen.has(crit.id)) {
+      throw Object.assign(new Error(`Duplicate criterion ID: ${crit.id}`), { code: 'DUPLICATE_CRITERION' });
+    }
+    seen.add(crit.id);
+  }
+  for (const id of acceptedIds) {
+    if (!seen.has(id)) {
+      throw Object.assign(new Error(`Missing criterion: ${id}`), { code: 'MISSING_CRITERION' });
+    }
+  }
+  for (const crit of criteria) {
+    if (crit.satisfied === false) {
+      throw Object.assign(
+        new Error(`Criterion not satisfied: ${crit.id}`),
+        { code: 'UNSATISFIED_CRITERION', criterionId: crit.id },
+      );
+    }
+  }
+}
+
+/**
  * Minimal typed views of the two domain services this package depends on.
  * @typedef {{ get: (id: string) => any, update: (id: string, patch: any) => Promise<any>, updateIf: (id: string, expected: any, patch: any) => any, complete?: (id: string, result: object, options?: any) => any, createDispatcher: (options?: any) => any, createWorkerLauncher?: (options?: any) => any, createReviewerLauncher?: (options?: any) => any, claim?: (id: string, worker: string, options?: any) => any, start?: (id: string, worker: string, options?: any) => any, release?: (id: string, worker: string, options?: any) => any }} TaskOrchestratorApi
  * @typedef {{ get: (id: string) => Promise<any>, findByWorkItem: (system: string, id: string) => Promise<any>, findOrCreateForWorkItem: (input: { system: string, id: string, change: object }) => Promise<any>, resolveRole: (changeId: string, sessionId: string) => Promise<string>, getBinding: (changeId: string, sessionId: string) => Promise<any>, getBindingSync: (changeId: string, sessionId: string) => any, getBindingFromDisk: (changeId: string, sessionId: string) => any, listByWorkItem: (system: string, id: string) => Promise<any[]>, listRoleBindings: () => Promise<any[]>, status: (changeId: string) => Promise<any>, appendAudit: (event: any) => Promise<any>, submitProof: (changeId: string, proof: any, expected?: { sessionId?: string, expectedWorker?: string }) => Promise<any>, bindRole: (changeId: string, sessionId: string, role: string, opts?: any) => Promise<any>, submitReview: (changeId: string, review: any, opts: any) => Promise<any>, submitRepair?: (changeId: string, repair: object, opts?: any) => Promise<any>, runPreflight: (changeId: string, input?: any) => Promise<any>, history: (changeId?: string) => Promise<any[]>, getGovernanceMode?: (scope: { projectId?: string|null, workspace?: string|null }) => Promise<string>, unbindRole: (changeId: string, sessionId: string, opts?: any) => Promise<any>, transition: (changeId: string, toState: string, opts?: any) => Promise<any> }} ChangeControlApi
@@ -269,9 +322,8 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
           // Thread the worker's ACTUAL structured completion payload into the proof.
           // Fail governed completion when required evidence is absent rather than
           // substituting fabricated values — prevents false PREFLIGHT transitions.
-          // Fetch the task to get acceptance_criteria for proof alignment.
-          const taskRecord = await Promise.resolve(requireTask().get(taskId));
-          const acceptanceCriteria = Array.isArray(taskRecord?.acceptance_criteria) ? taskRecord.acceptance_criteria : [];
+          // (No acceptance-criteria snapshot here: the canonical criteria are
+          // re-read at proof time in completeGovernedTask, never synthesized here.)
 
           // TH2-R2-02: Make governed completion conditional on actual linkage.
           // If no Change is linked to this task, fall back to raw store.complete
@@ -295,6 +347,18 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
             );
           }
 
+          // Require the worker's structured criterion evidence exactly as-is.
+          // The H9 {id, satisfied} envelope is authoritative: absent criterion
+          // evidence fails closed rather than synthesizing satisfied:true for
+          // every canonical criterion (which would fabricate worker success).
+          const criteria = result.criteria;
+          if (!Array.isArray(criteria)) {
+            throw Object.assign(
+              new Error('governed completion requires structured worker criteria [{id, satisfied}]'),
+              { code: 'PROOF_FIELD_REQUIRED', field: 'criteria' },
+            );
+          }
+
           const proof = {
             beforeRevision: result.beforeRevision ?? 'initial',
             afterRevision: result.afterRevision ?? commitSha,
@@ -302,9 +366,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
             files_changed: Array.isArray(result.files_changed) ? result.files_changed : [],
             tests_run: Array.isArray(result.tests_run) ? result.tests_run : [],
             remaining_blockers: Array.isArray(result.remaining_blockers) ? result.remaining_blockers : [],
-            criteria: Array.isArray(result.criteria)
-              ? result.criteria
-              : acceptanceCriteria.map((/** @type {string} */ c) => ({ id: c, satisfied: true })),
+            criteria,
             deviations: Array.isArray(result.deviations) ? result.deviations : [],
             workerChecks: Array.isArray(result.workerChecks) ? result.workerChecks : [],
             controllerPreflight: Array.isArray(result.controllerPreflight) ? result.controllerPreflight : [],
@@ -394,6 +456,17 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
                   { code: 'PROOF_MISMATCH', changeId: existingLink.id },
                 );
               }
+              // T-H10: re-read the CANONICAL task acceptance criteria even on the
+              // already-converged replay path, and validate the replay payload's
+              // criteria with the SAME authoritative shape/coverage/duplicate/
+              // unknown/missing/satisfied checks ChangeStore.submitProof applies.
+              // If the task's criteria changed after the worker completed, or the
+              // replay payload is malformed/false/duplicate, fail closed rather
+              // than returning ok against stale or fabricated evidence.
+              validateProofCriteria(
+                Array.isArray(task.acceptance_criteria) ? task.acceptance_criteria : [],
+                proof.criteria,
+              );
               return { ok: true, taskId, changeId: existingLink.id };
             }
           }

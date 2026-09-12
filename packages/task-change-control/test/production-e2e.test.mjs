@@ -557,6 +557,38 @@ test('T-H7: negative — preflight fails closed on exhausted controller checks',
   assert.equal(orch.get(task.id).status, 'in_review', 'task stays in_review');
 });
 
+test('T-H10: negative criterion case cannot reach PREFLIGHT/APPROVED/success', async (t) => {
+  const c = await compose(t);
+  const orch = c.task();
+  const tcc = c.taskChangeControl();
+  const cc = c.changeControl();
+
+  const task = orch.create({ title: 'neg-crit', description: 'd', status: 'ready', workspace: c.dir, worker_profile: 'worker', acceptance_criteria: ['ship'] });
+  const { change } = await tcc.bootstrapTask(task.id);
+  const plan = await cc.submitPlan(change.id, { steps: ['s'] });
+  await cc.acceptPlan(change.id, plan.id, { authorized: true, actor: 'host' });
+
+  // The worker reports satisfaction=false for the sole criterion — the real
+  // session launcher surfaces this via the canonical `tool/result.meta` envelope.
+  let falseProof = workerProof('neg111');
+  falseProof = { ...falseProof, criteria: [{ id: 'ship', satisfied: false }] };
+  c.rpc.setProof(falseProof);
+
+  const dispatcher = tcc.createGovernedDispatcher({
+    preflight: async () => ({ ok: true, spec: { mode: 'session', profile: 'wp', agentPreset: 'worker', provider: 'ollama', model: 'm', workspacePolicy: 'any', timeoutMs: 5000, leaseSeconds: 300, name: 'worker' } }),
+  });
+  const result = await dispatcher.dispatchOnce({ workerProfile: 'worker' });
+
+  // The governed completion hook funnels the false criterion to failed; success
+  // must not be reachable.
+  assert.equal(result.dispatched, true, 'dispatcher ran the worker');
+  assert.notEqual(result.status, 'in_review', 'negative criterion must NOT reach in_review');
+  assert.notEqual(orch.get(task.id).status, 'done', 'task must NOT reach done');
+  const chAfter = await cc.get(change.id);
+  assert.notEqual(chAfter.state, 'PREFLIGHT', 'Change must NOT reach PREFLIGHT on a false criterion');
+  assert.notEqual(chAfter.state, 'APPROVED', 'Change must NOT reach APPROVED on a false criterion');
+});
+
 // ─── Test — model-facing tool surface: no self-binding, unauthorized bind ──
 
 test('T-H7: composed production ToolRuntime has no change_bind/change_create tool; unbound/wrong-role sessions cannot mutate', async (t) => {

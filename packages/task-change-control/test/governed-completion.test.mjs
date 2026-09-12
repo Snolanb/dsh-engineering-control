@@ -196,6 +196,169 @@ test('acceptance_criteria drift between claim and complete funnels to CRITERIA_M
   assert.equal(changeNow.state, 'IMPLEMENTING', 'Change NOT mutated by failed completion');
 });
 
+test('T-H10: satisfied:false criterion fails closed (no PREFLIGHT, no in_review)', async (t) => {
+  const { ctx, taskStore, dir } = await compose(t);
+  const { task, change, runId } = await runningGovernedTask(ctx, taskStore, dir);
+  const proof = {
+    beforeRevision: 'a', afterRevision: 'x',
+    commit_sha: 'a', files_changed: ['f'], tests_run: ['t'], remaining_blockers: [],
+    criteria: [{ id: 'ship', satisfied: false }], deviations: [], workerChecks: ['w'], controllerPreflight: ['cp'], summary: 's',
+  };
+  await assert.rejects(
+    ctx.taskChangeControl.completeGovernedTask(task.id, { sessionId: 'sess-worker-1', worker: runId, proof }),
+    (e) => e && (e.code === 'UNSATISFIED_CRITERION' || /false|satisfied|criterion/i.test(e.message)),
+  );
+  const tAfter = await taskStore.get(task.id);
+  assert.equal(tAfter.status, 'running', 'task NOT completed on false criterion');
+  assert.equal((await ctx.changeControl.get(change.id)).state, 'IMPLEMENTING', 'Change NOT mutated to PREFLIGHT');
+});
+
+test('T-H10: omitted criterion fails closed (CRITERIA_MISMATCH)', async (t) => {
+  const { ctx, taskStore, dir } = await compose(t);
+  const task = await taskStore.create({
+    title: 'g', description: 'd', status: 'ready', workspace: dir,
+    worker_profile: 'worker', acceptance_criteria: ['a', 'b'],
+  });
+  const { change } = await ctx.taskChangeControl.bootstrapTask(task.id);
+  const plan = await ctx.changeControl.submitPlan(change.id, { steps: ['s'] });
+  await ctx.changeControl.acceptPlan(change.id, plan.id, { authorized: true, actor: 'host' });
+  await ctx.changeControl.transition(change.id, 'IMPLEMENTING', {});
+  const claim = await taskStore.claim(task.id, 'w:om1', { lease_seconds: 300 });
+  await taskStore.start(task.id, 'w:om1', {});
+  await ctx.changeControl.bindRole(change.id, 'sess-om', 'worker', { worker: 'w:om1' });
+  const proof = {
+    beforeRevision: 'a', afterRevision: 'x',
+    commit_sha: 'abc', files_changed: ['x'], tests_run: ['t'], remaining_blockers: [],
+    criteria: [{ id: 'a', satisfied: true }], deviations: [], workerChecks: [], controllerPreflight: [], summary: 's',
+  };
+  await assert.rejects(
+    ctx.taskChangeControl.completeGovernedTask(task.id, { sessionId: 'sess-om', worker: 'w:om1', proof }),
+    (e) => e?.code === 'CRITERIA_MISMATCH',
+  );
+  assert.equal((await taskStore.get(task.id)).status, 'running', 'task NOT completed');
+  assert.equal((await ctx.changeControl.get(change.id)).state, 'IMPLEMENTING', 'Change NOT mutated');
+});
+
+test('T-H10: unknown criterion fails closed (CRITERIA_MISMATCH)', async (t) => {
+  const { ctx, taskStore, dir } = await compose(t);
+  const { task, change, runId } = await runningGovernedTask(ctx, taskStore, dir);
+  const proof = {
+    beforeRevision: 'a', afterRevision: 'x',
+    commit_sha: 'a', files_changed: ['f'], tests_run: ['t'], remaining_blockers: [],
+    criteria: [{ id: 'ship', satisfied: true }, { id: 'not-a-criterion', satisfied: true }],
+    deviations: [], workerChecks: ['w'], controllerPreflight: ['cp'], summary: 's',
+  };
+  await assert.rejects(
+    ctx.taskChangeControl.completeGovernedTask(task.id, { sessionId: 'sess-worker-1', worker: runId, proof }),
+    (e) => e?.code === 'CRITERIA_MISMATCH',
+  );
+  assert.equal((await taskStore.get(task.id)).status, 'running', 'task NOT completed');
+  assert.equal((await ctx.changeControl.get(change.id)).state, 'IMPLEMENTING', 'Change NOT mutated');
+});
+
+test('T-H10: duplicate criterion fails closed (UNKNOWN/DUP rejected at boundary)', async (t) => {
+  const { ctx, taskStore, dir } = await compose(t);
+  const { task, change, runId } = await runningGovernedTask(ctx, taskStore, dir);
+  // Duplicate id: proof set collapses to a single 'ship', so CRITERIA_MISMATCH
+  // fires at the alignment stage even before ChangeStore's duplicate check.
+  const proof = {
+    beforeRevision: 'a', afterRevision: 'x',
+    commit_sha: 'a', files_changed: ['f'], tests_run: ['t'], remaining_blockers: [],
+    criteria: [{ id: 'ship', satisfied: true }, { id: 'ship', satisfied: true }],
+    deviations: [], workerChecks: ['w'], controllerPreflight: ['cp'], summary: 's',
+  };
+  await assert.rejects(
+    ctx.taskChangeControl.completeGovernedTask(task.id, { sessionId: 'sess-worker-1', worker: runId, proof }),
+    (e) => e && (e.code === 'CRITERIA_MISMATCH' || e.code === 'DUPLICATE_CRITERION'),
+  );
+  assert.equal((await taskStore.get(task.id)).status, 'running', 'task NOT completed');
+  assert.equal((await ctx.changeControl.get(change.id)).state, 'IMPLEMENTING', 'Change NOT mutated');
+});
+
+test('T-H10: proof replay against changed criteria fails closed (idempotent path re-reads criteria)', async (t) => {
+  const { ctx, taskStore, dir } = await compose(t);
+  const { task, change, runId } = await runningGovernedTask(ctx, taskStore, dir);
+  const proof = {
+    beforeRevision: 'a', afterRevision: 'x',
+    commit_sha: 'a', files_changed: ['f'], tests_run: ['t'], remaining_blockers: [],
+    criteria: [{ id: 'ship', satisfied: true }], deviations: [], workerChecks: ['w'], controllerPreflight: ['cp'], summary: 's',
+  };
+  const res1 = await ctx.taskChangeControl.completeGovernedTask(task.id, { sessionId: 'sess-worker-1', worker: runId, proof });
+  assert.ok(res1.ok);
+  assert.equal((await taskStore.get(task.id)).status, 'in_review');
+
+  // Change the canonical task criteria AFTER the worker completed but BEFORE a replay.
+  await taskStore.update(task.id, { acceptance_criteria: ['ship', 'extra-shipping'] });
+
+  // Replay the SAME converged proof — the idempotent fast-path must re-read the
+  // canonical criteria and fail closed (the new canonical criterion is missing
+  // from the replay payload) instead of returning ok.
+  await assert.rejects(
+    ctx.taskChangeControl.completeGovernedTask(task.id, { sessionId: 'sess-worker-1', worker: runId, proof }),
+    (e) => e?.code === 'MISSING_CRITERION' || e?.code === 'CRITERIA_MISMATCH',
+  );
+});
+
+test('T-H10: replay payload with malformed criterion entry fails closed (shape)', async (t) => {
+  const { ctx, taskStore, dir } = await compose(t);
+  const { task, runId } = await runningGovernedTask(ctx, taskStore, dir);
+  const proof = {
+    beforeRevision: 'a', afterRevision: 'x',
+    commit_sha: 'a', files_changed: ['f'], tests_run: ['t'], remaining_blockers: [],
+    criteria: [{ id: 'ship', satisfied: true }], deviations: [], workerChecks: ['w'], controllerPreflight: ['cp'], summary: 's',
+  };
+  await ctx.taskChangeControl.completeGovernedTask(task.id, { sessionId: 'sess-worker-1', worker: runId, proof });
+  assert.equal((await taskStore.get(task.id)).status, 'in_review');
+
+  // Replay with a MALFORMED criterion (missing `satisfied` boolean) but identical
+  // integration fields — must be rejected by the replay path's shape check.
+  const bad = { ...proof, criteria: [{ id: 'ship', satisfied: 'yes' }] };
+  await assert.rejects(
+    ctx.taskChangeControl.completeGovernedTask(task.id, { sessionId: 'sess-worker-1', worker: runId, proof: bad }),
+    (e) => e && (e.code === 'INVALID_PROOF' || /satisfied|criterion/i.test(e.message)),
+  );
+});
+
+test('T-H10: replay payload with satisfied:false criterion fails closed', async (t) => {
+  const { ctx, taskStore, dir } = await compose(t);
+  const { task, runId } = await runningGovernedTask(ctx, taskStore, dir);
+  const proof = {
+    beforeRevision: 'a', afterRevision: 'x',
+    commit_sha: 'a', files_changed: ['f'], tests_run: ['t'], remaining_blockers: [],
+    criteria: [{ id: 'ship', satisfied: true }], deviations: [], workerChecks: ['w'], controllerPreflight: ['cp'], summary: 's',
+  };
+  await ctx.taskChangeControl.completeGovernedTask(task.id, { sessionId: 'sess-worker-1', worker: runId, proof });
+  assert.equal((await taskStore.get(task.id)).status, 'in_review');
+
+  // Replay with satisfied:false — the replay path must not return ok as though
+  // the criterion passed.
+  const bad = { ...proof, criteria: [{ id: 'ship', satisfied: false }] };
+  await assert.rejects(
+    ctx.taskChangeControl.completeGovernedTask(task.id, { sessionId: 'sess-worker-1', worker: runId, proof: bad }),
+    (e) => e?.code === 'UNSATISFIED_CRITERION',
+  );
+});
+
+test('T-H10: replay payload with duplicate criterion fails closed', async (t) => {
+  const { ctx, taskStore, dir } = await compose(t);
+  const { task, runId } = await runningGovernedTask(ctx, taskStore, dir);
+  const proof = {
+    beforeRevision: 'a', afterRevision: 'x',
+    commit_sha: 'a', files_changed: ['f'], tests_run: ['t'], remaining_blockers: [],
+    criteria: [{ id: 'ship', satisfied: true }], deviations: [], workerChecks: ['w'], controllerPreflight: ['cp'], summary: 's',
+  };
+  await ctx.taskChangeControl.completeGovernedTask(task.id, { sessionId: 'sess-worker-1', worker: runId, proof });
+  assert.equal((await taskStore.get(task.id)).status, 'in_review');
+
+  // Replay with a DUPLICATE criterion id — the Set-based id comparison would
+  // collapse this and erroneously pass, so the replay path must detect duplicates.
+  const bad = { ...proof, criteria: [{ id: 'ship', satisfied: true }, { id: 'ship', satisfied: true }] };
+  await assert.rejects(
+    ctx.taskChangeControl.completeGovernedTask(task.id, { sessionId: 'sess-worker-1', worker: runId, proof: bad }),
+    (e) => e?.code === 'DUPLICATE_CRITERION',
+  );
+});
+
 test('governed dispatcher success routes through completeGovernedTask: proof → PREFLIGHT → task in_review', async (t) => {
   // This is the RED→GREEN regression for T-H2: before the completionHook seam,
   // createGovernedDispatcher dispatched governed tasks through raw store.complete,
@@ -269,7 +432,7 @@ test('governed dispatcher success routes through completeGovernedTask: proof →
         // BEFORE the completion hook runs (i.e., during the worker's execution).
         if (!implemented) { implemented = true; await ctx.changeControl.transition(change.id, 'IMPLEMENTING', {}); }
         // Return a realistic worker result with commit_sha and proof fields.
-        return { exitCode: 0, stdout: 'done', stderr: '', commit_sha: 'abc123', files_changed: ['src/foo.js'], tests_run: ['test/foo.test.js'] };
+        return { exitCode: 0, stdout: 'done', stderr: '', commit_sha: 'abc123', files_changed: ['src/foo.js'], tests_run: ['test/foo.test.js'], criteria: [{ id: 'ship', satisfied: true }] };
       }, async terminate() { return true; } }
     },
   };
