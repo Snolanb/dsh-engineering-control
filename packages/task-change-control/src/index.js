@@ -100,43 +100,92 @@ export default {
     // model-supplied verdict: runGovernedSdlc re-reads the persisted
     // Task/Change pair and converges APPROVED→done / REPAIR→changes_requested
     // from durable state. Convergence is CAS/idempotent (updateIf), so
-    // duplicate/concurrent deliveries settle exactly once. Started in the
-    // same fiber, a crash AFTER review persistence but BEFORE task
-    // convergence is recovered at startup by re-scanning every in_review
-    // task whose Change already advanced. No polling: native lifecycle events
+    // duplicate/concurrent deliveries settle exactly once. Durable persisted
+    // state (not the in-memory event) is the recovery source: a crash at ANY
+    // FAIL-stage point (in_review, changes_requested, ready, or an expired
+    // claimed/running repair) is reconciled at startup by a paginated scan
+    // over every relevant task status. No polling: native lifecycle events
     // plus one persisted-state scan per service activation.
     await ctx.inject(['taskOrchestrator', 'changeControl'], (c) => {
       const cc = c.get('changeControl');
       const orch = c.get('taskOrchestrator');
       if (!cc || !orch) throw new Error('taskOrchestrator/changeControl inactive in the H11 wake fiber');
 
+      /** @param {string} changeId */
       const converge = async (changeId) => {
         // Resolve the authoritative task from the Change-side work item (the
         // canonical linkage), then resume the controller with no verdict.
         let change;
         try { change = await cc.get(changeId); } catch { return; }
         if (!change?.workItem || change.workItem.system !== WORK_ITEM_SYSTEM) return;
-        try { await service.runGovernedSdlc(change.workItem.id, {}); } catch { /* resumable; converge on next wake */ }
+        await resumeTask(change.workItem.id);
+      };
+
+      /** @param {string} taskId */
+      const resumeTask = async (taskId) => {
+        // runGovernedSdlc is idempotent/resumable (re-reads persisted state,
+        // CAS-converges via updateIf) — a throw leaves the durable state
+        // untouched, so the next wake or restart retries rather than strands.
+        try {
+          await service.runGovernedSdlc(taskId, {});
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          // Best-effort audit so a failed convergence is not invisible; never
+          // re-throw (the event dispatch must not disrupt other listeners).
+          try {
+            const link = await cc.findByWorkItem(WORK_ITEM_SYSTEM, taskId).catch(() => null)
+              ?? (await cc.listByWorkItem(WORK_ITEM_SYSTEM, taskId).catch(() => []))?.at?.(-1);
+            if (link) await cc.appendAudit({ kind: 'review_orchestration', changeId: link.id, action: 'review_wake_failed', detail });
+          } catch { /* audit is best-effort */ }
+        }
       };
 
       const disposed = ctx.events.on('change-control/review-settled', (payload) => {
         if (payload && typeof payload.changeId === 'string') converge(payload.changeId);
       });
 
-      // Startup/restart recovery: resume in_review tasks whose Change already
-      // advanced past REVIEW (persisted post-crash). Idempotent — runGovernedSdlc
-      // re-reads and CAS-converges; a task that is still legitimately in REVIEW
-      // is left alone (its Change state is REVIEW, not APPROVED/REPAIR).
-      // Fire-and-forget: the fiber's teardown only unsubscribes the listener.
-      (async () => {
-        let tasks = [];
-        try { tasks = orch.list({ in_review: true, limit: 500 }) ?? []; } catch { return; }
-        for (const task of tasks) {
-          const all = await cc.listByWorkItem(WORK_ITEM_SYSTEM, task.id).catch(() => []);
-          const change = (Array.isArray(all) ? all : []).at(-1);
-          if (change && (change.state === 'APPROVED' || change.state === 'REPAIR')) {
-            try { await service.runGovernedSdlc(task.id, {}); } catch { /* resumable */ }
+      // Startup/restart recovery. Paginate each scan until a short page is
+      // returned so every relevant row is examined (no 500-row cap). Cover the
+      // full FAIL-stage task surface — in_review (APPROVED|REPAIR) plus
+      // changes_requested/ready (REPAIR) plus expired claimed/running repair
+      // claims (REPAIR) — and CAS-reconcile each through the idempotent
+      // controller. Per-task failure is isolated (cannot strand or duplicate:
+      // t.claim/updateIf are the single writers).
+      const pageSize = 100;
+      /** @param {object} opts taskOrchestrator list options (statuses|in_review|expired_claims) */
+      const scanAndResume = async (opts) => {
+        for (let offset = 0; ; offset += pageSize) {
+          let page = [];
+          try { page = (await orch.list({ ...opts, limit: pageSize, offset })) ?? []; } catch { return; }
+          for (const task of page) {
+            await resumeTask(task.id);
           }
+          if (page.length < pageSize) break;
+        }
+      };
+      // Fire-and-forget recovery; the fiber's teardown only unsubscribes the listener.
+      (async () => {
+        // 1. in_review → Change APPROVED (PASS) or REPAIR (FAIL) persisted.
+        await scanAndResume({ in_review: true });
+        // 2. FAIL settled to changes_requested / prepared to ready, Change REPAIR.
+        await scanAndResume({ statuses: ['changes_requested', 'ready'] });
+        // 3. Expired repair claims (claimed/running past their lease), Change REPAIR:
+        //    CAS-reset to ready so the controller re-claims, never re-runs a dead lease.
+        for (let offset = 0; ; offset += pageSize) {
+          let page = [];
+          try { page = (await orch.list({ expired_claims: true, limit: pageSize, offset })) ?? []; } catch { break; }
+          for (const task of page) {
+            const all = await cc.listByWorkItem(WORK_ITEM_SYSTEM, task.id).catch(() => []);
+            const change = (Array.isArray(all) ? all : []).at(-1);
+            if (change && change.state === 'REPAIR') {
+              // Only release OUR observed expired lease (CAS on claimed_by+status+lease).
+              try {
+                orch.updateIf(task.id, { status: task.status, claimed_by: task.claimed_by, lease_expires_at: task.lease_expires_at }, { status: 'ready' });
+              } catch { /* still-claimed by a live owner → leave untouched */ }
+              await resumeTask(task.id);
+            }
+          }
+          if (page.length < pageSize) break;
         }
       })();
 

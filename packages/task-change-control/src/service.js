@@ -1822,12 +1822,18 @@ async function routeRepairAttempt({ t, c, api, taskId, change, options }) {
   const openFindings = Array.isArray(statusNow?.openFindings) ? statusNow.openFindings : [];
   const revision = statusNow?.revision ?? null;
   // T-H11: autonomous repair routing. When the woken controller resumes with
-  // no caller-supplied repair worker/proof, derive them from the task's own
-  // worker profile and the orchestrator's real launcher factory — the repair
+  // no caller-supplied repair worker/proof, resolve the AUTHORITATIVE worker
+  // profile + model from the task through the Task Orchestrator registry /
+  // preflight, so the repair session inherits mode, agentPreset/profile, model,
+  // timeout and lease exactly as a governed dispatch would. The repair
   // worker's structured completion envelope is surfaced from handle.wait()
   // (the deterministic DSH tool/result.meta carrier), never fabricated. The
   // explicit-worker options remain for the host-driven repair path.
   let workerLauncher = options.workerLauncher;
+  // Resolve the spec only on the autonomous path (a caller-supplied launcher
+  // already carries its own spec/lease intent). A headless-profile/session
+  // profile must survive into the launch spec — never a hardcoded session.
+  let resolvedSpec = null;
   if (!workerLauncher) {
     if (typeof t.createWorkerLauncher !== 'function') {
       // Stop at the resumable repair_routed boundary: no launcher means a
@@ -1842,21 +1848,56 @@ async function routeRepairAttempt({ t, c, api, taskId, change, options }) {
         },
       };
     }
+    // Authoritative registry resolution. Fail closed BEFORE any claim when
+    // the profile is unknown, malformed, or disabled — an invalid profile
+    // must never strand or half-dispatch a repair worker.
+    const profile = task.worker_profile;
+    try {
+      resolvedSpec = typeof t.resolveWorkerSpec === 'function'
+        ? await Promise.resolve(t.resolveWorkerSpec(profile, task.worker_model))
+        : null;
+    } catch {
+      resolvedSpec = null;
+    }
+    if (!resolvedSpec || resolvedSpec.enabled === false) {
+      return {
+        stopped: true,
+        result: {
+          outcome: 'repair_profile_unavailable', taskId, changeId: change.id,
+          workerProfile: profile,
+          reason: 'worker profile unavailable or unsupported',
+        },
+      };
+    }
     workerLauncher = t.createWorkerLauncher({});
   }
   const runId = options.worker ?? `repair-${change.id}-${Date.now()}`;
-  const claim = await Promise.resolve(t.claim(taskId, runId, { lease_seconds: options.leaseSeconds ?? 600, actor: 'sdlc-controller' }));
+  const leaseSeconds = options.leaseSeconds ?? resolvedSpec?.leaseSeconds ?? 600;
+  const claim = await Promise.resolve(t.claim(taskId, runId, { lease_seconds: leaseSeconds, actor: 'sdlc-controller' }));
   if (!claim || claim.claimed !== true) {
     return { stopped: true, result: { outcome: 'repair_claim_failed', taskId, changeId: change.id, reason: claim?.reason } };
   }
   await Promise.resolve(t.start(taskId, runId, { actor: 'sdlc-controller' }));
   const liveTask = await Promise.resolve(t.get(taskId));
   const governedLauncher = createBindingLauncher(workerLauncher, c, WORK_ITEM_SYSTEM);
+  // The launch spec carries the resolved profile's mode/agentPreset/profile/
+  // model/timeout so a session vs headless-profile task is honored; the repair
+  // prompt is woven in only for the prompt-bearing session mode (headless
+  // profiles run their own command/profile).
+  const launchSpec = resolvedSpec
+    ? {
+        mode: resolvedSpec.mode,
+        prompt: buildRepairPrompt(taskId, change.id, revision, openFindings),
+        ...(resolvedSpec.mode === 'headless-profile'
+          ? { profile: resolvedSpec.profile, command: resolvedSpec.command, model: resolvedSpec.model, timeoutMs: resolvedSpec.timeoutMs }
+          : { agentPreset: resolvedSpec.agentPreset, model: resolvedSpec.model, timeoutMs: resolvedSpec.timeoutMs }),
+      }
+    : { mode: 'session', prompt: buildRepairPrompt(taskId, change.id, revision, openFindings) };
   let handle;
   try {
     handle = await governedLauncher.launch({
       task: liveTask,
-      spec: { mode: 'session', prompt: buildRepairPrompt(taskId, change.id, revision, openFindings) },
+      spec: launchSpec,
       worker: runId,
     });
   } catch (/** @type {any} */ error) {
