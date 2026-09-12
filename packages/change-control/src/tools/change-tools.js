@@ -73,8 +73,9 @@ function toAuthState(domainState) {
  * keeping invocation-context identity derivation, payload validation, and
  * model-facing error shaping tool-owned.
  * @param {ReturnType<import('../service/change-control-service.js').createChangeControlService>} changeControl
+ * @param {import('@deepseek-ai/cordis').Context} [ctx] host context (for the T-H11 review-settled event emission)
  */
-export function createChangeTools(changeControl) {
+export function createChangeTools(changeControl, ctx) {
   const tools = [
     defineTool({
       name: 'change_get',
@@ -179,6 +180,22 @@ export function createChangeTools(changeControl) {
         }
         // Forward structured review to the canonical facade
         const result = await changeControl.submitReview(args.changeId, args.review, { sessionId });
+        // T-H11: the structured review seam (change_submit_review) is the SOLE
+        // reviewer wake-up. After the authoritative REVIEW→APPROVED|REPAIR
+        // transition is already durably persisted, emit one narrow native
+        // Cordis lifecycle event so the SDLC controller resumes with no
+        // model-supplied verdict. Durable state — not this in-memory event —
+        // is the recovery source; the emission is fire-and-forget so a
+        // listener failure can never roll back a persisted settlement.
+        if (ctx && typeof ctx.events?.parallel === 'function') {
+          ctx.events.parallel({}, 'change-control/review-settled', {
+            changeId: args.changeId,
+            reviewId: result.id,
+            verdict: result.verdict,
+            revision: result.revision,
+            sessionId: sessionId ?? result.sessionId,
+          }).catch(() => {});
+        }
         return result;
       },
     }),
@@ -234,7 +251,7 @@ export async function registerChangeTools(ctx, config) {
   // external packages integrate via ctx.changeControl only.
   const service = createChangeControlService(store);
   ctx.provide('changeControl', service);
-  const tools = createChangeTools(service);
+  const tools = createChangeTools(service, ctx);
   const registry = ctx.tools;
   if (!registry?.register) throw new Error('tools.register not available');
   for (const tool of tools) registry.register(tool);

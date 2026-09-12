@@ -93,5 +93,56 @@ export default {
       }));
       return () => { if (typeof unregister === 'function') unregister(); };
     });
+
+    // T-H11 — automatic reviewer-settlement wake-up. When both domain
+    // services are present (the real governed composition), subscribe to the
+    // change-control review-settled event and resume the controller with NO
+    // model-supplied verdict: runGovernedSdlc re-reads the persisted
+    // Task/Change pair and converges APPROVED→done / REPAIR→changes_requested
+    // from durable state. Convergence is CAS/idempotent (updateIf), so
+    // duplicate/concurrent deliveries settle exactly once. Started in the
+    // same fiber, a crash AFTER review persistence but BEFORE task
+    // convergence is recovered at startup by re-scanning every in_review
+    // task whose Change already advanced. No polling: native lifecycle events
+    // plus one persisted-state scan per service activation.
+    await ctx.inject(['taskOrchestrator', 'changeControl'], (c) => {
+      const cc = c.get('changeControl');
+      const orch = c.get('taskOrchestrator');
+      if (!cc || !orch) throw new Error('taskOrchestrator/changeControl inactive in the H11 wake fiber');
+
+      const converge = async (changeId) => {
+        // Resolve the authoritative task from the Change-side work item (the
+        // canonical linkage), then resume the controller with no verdict.
+        let change;
+        try { change = await cc.get(changeId); } catch { return; }
+        if (!change?.workItem || change.workItem.system !== WORK_ITEM_SYSTEM) return;
+        try { await service.runGovernedSdlc(change.workItem.id, {}); } catch { /* resumable; converge on next wake */ }
+      };
+
+      const disposed = ctx.events.on('change-control/review-settled', (payload) => {
+        if (payload && typeof payload.changeId === 'string') converge(payload.changeId);
+      });
+
+      // Startup/restart recovery: resume in_review tasks whose Change already
+      // advanced past REVIEW (persisted post-crash). Idempotent — runGovernedSdlc
+      // re-reads and CAS-converges; a task that is still legitimately in REVIEW
+      // is left alone (its Change state is REVIEW, not APPROVED/REPAIR).
+      // Fire-and-forget: the fiber's teardown only unsubscribes the listener.
+      (async () => {
+        let tasks = [];
+        try { tasks = orch.list({ in_review: true, limit: 500 }) ?? []; } catch { return; }
+        for (const task of tasks) {
+          const all = await cc.listByWorkItem(WORK_ITEM_SYSTEM, task.id).catch(() => []);
+          const change = (Array.isArray(all) ? all : []).at(-1);
+          if (change && (change.state === 'APPROVED' || change.state === 'REPAIR')) {
+            try { await service.runGovernedSdlc(task.id, {}); } catch { /* resumable */ }
+          }
+        }
+      })();
+
+      return () => {
+        if (typeof disposed === 'function') disposed();
+      };
+    });
   },
 };

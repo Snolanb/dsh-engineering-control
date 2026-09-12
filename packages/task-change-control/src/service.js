@@ -1058,6 +1058,19 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
             }
             return { outcome: 'approved', taskId, changeId: change.id };
           }
+          // T-H11: a reviewer-submitted FAIL persisted REVIEW→REPAIR before the
+          // controller was woken (the review-settled event fires AFTER durable
+          // persistence). Settle the still-in_review task side here, symmetric
+          // with the APPROVED block above, so the change never bypasses the
+          // task-side changes_requested transition and its settlement audit.
+          if (state === 'REPAIR' && task.status === 'in_review') {
+            const settled = await settleReviewedFailure(taskId, change.id, t, c, maxRepairRounds);
+            if (settled !== null) {
+              if (settled.outcome === 'task_update_race') continue; // re-read
+              return settled; // 'escalated'
+            }
+            // task is now changes_requested — fall through to repair routing
+          }
           if (task.status === 'failed' && state === 'REPAIR' && await hasEscalationAudit(c, change.id)) {
             return { outcome: 'escalated', taskId, changeId: change.id };
           }
@@ -1808,28 +1821,37 @@ async function routeRepairAttempt({ t, c, api, taskId, change, options }) {
   const statusNow = await c.status(change.id);
   const openFindings = Array.isArray(statusNow?.openFindings) ? statusNow.openFindings : [];
   const revision = statusNow?.revision ?? null;
-  if (!options.worker || !options.workerLauncher || options.repairProof == null) {
-    // Resumable boundary: the repair stage is prepped; a re-invocation
-    // (possibly after a restart, possibly with the repair worker and its
-    // structured proof) continues.
-    return {
-      stopped: true,
-      result: {
-        outcome: 'repair_routed', taskId, changeId: change.id,
-        openFindingIds: openFindings.map((/** @type {any} */ f) => f.id),
-        revision,
-        missing: options.worker && options.workerLauncher ? 'repairProof' : 'repairWorker',
-      },
-    };
+  // T-H11: autonomous repair routing. When the woken controller resumes with
+  // no caller-supplied repair worker/proof, derive them from the task's own
+  // worker profile and the orchestrator's real launcher factory — the repair
+  // worker's structured completion envelope is surfaced from handle.wait()
+  // (the deterministic DSH tool/result.meta carrier), never fabricated. The
+  // explicit-worker options remain for the host-driven repair path.
+  let workerLauncher = options.workerLauncher;
+  if (!workerLauncher) {
+    if (typeof t.createWorkerLauncher !== 'function') {
+      // Stop at the resumable repair_routed boundary: no launcher means a
+      // repair worker cannot be dispatched (consistent with the old contract).
+      return {
+        stopped: true,
+        result: {
+          outcome: 'repair_routed', taskId, changeId: change.id,
+          openFindingIds: openFindings.map((/** @type {any} */ f) => f.id),
+          revision,
+          missing: 'repairWorker',
+        },
+      };
+    }
+    workerLauncher = t.createWorkerLauncher({});
   }
-  const runId = options.worker;
+  const runId = options.worker ?? `repair-${change.id}-${Date.now()}`;
   const claim = await Promise.resolve(t.claim(taskId, runId, { lease_seconds: options.leaseSeconds ?? 600, actor: 'sdlc-controller' }));
   if (!claim || claim.claimed !== true) {
     return { stopped: true, result: { outcome: 'repair_claim_failed', taskId, changeId: change.id, reason: claim?.reason } };
   }
   await Promise.resolve(t.start(taskId, runId, { actor: 'sdlc-controller' }));
   const liveTask = await Promise.resolve(t.get(taskId));
-  const governedLauncher = createBindingLauncher(options.workerLauncher, c, WORK_ITEM_SYSTEM);
+  const governedLauncher = createBindingLauncher(workerLauncher, c, WORK_ITEM_SYSTEM);
   let handle;
   try {
     handle = await governedLauncher.launch({
@@ -1860,10 +1882,26 @@ async function routeRepairAttempt({ t, c, api, taskId, change, options }) {
     settle = await handle.wait?.();
     if (settle && settle.exitCode === 0 && !settle.error) {
       try {
-        await c.submitRepair(change.id, { findings: claims, proof: options.repairProof }, { workerId: runId });
+        // The repair proof is caller-supplied on the host-driven path, or the
+        // worker's surfaced structured completion envelope on the autonomous
+        // path (handle.wait() returns the canonical tool/result.meta fields).
+        const repairProof = options.repairProof ?? {
+          beforeRevision: settle.beforeRevision ?? revision,
+          afterRevision: settle.afterRevision ?? settle.commit_sha,
+          commit_sha: settle.commit_sha,
+          files_changed: Array.isArray(settle.files_changed) ? settle.files_changed : [],
+          tests_run: Array.isArray(settle.tests_run) ? settle.tests_run : [],
+          remaining_blockers: Array.isArray(settle.remaining_blockers) ? settle.remaining_blockers : [],
+          criteria: Array.isArray(settle.criteria) ? settle.criteria : [],
+          deviations: Array.isArray(settle.deviations) ? settle.deviations : [],
+          workerChecks: Array.isArray(settle.workerChecks) ? settle.workerChecks : [],
+          controllerPreflight: Array.isArray(settle.controllerPreflight) ? settle.controllerPreflight : [],
+          summary: settle.summary ?? '',
+        };
+        await c.submitRepair(change.id, { findings: claims, proof: repairProof }, { workerId: runId });
         // Governed completion converges the task side (PREFLIGHT idempotent
         // fast path: the stored repair proof matches this payload).
-        await api.completeGovernedTask(taskId, { sessionId: handle.sessionId, worker: runId, proof: options.repairProof });
+        await api.completeGovernedTask(taskId, { sessionId: handle.sessionId, worker: runId, proof: repairProof });
       } catch (/** @type {any} */ error) {
         submitError = error;
       }
