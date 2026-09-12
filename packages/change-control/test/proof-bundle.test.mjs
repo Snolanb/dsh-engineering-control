@@ -51,6 +51,31 @@ test('Proof Bundle rejects missing and duplicate criterion entries', async (t) =
   assert.equal((await store.get(change.id)).state, 'IMPLEMENTING');
 });
 
+// 2b. A criterion the worker reports as unsatisfied (satisfied: false) must
+// fail closed BEFORE any state/audit/proof mutation — a governed completion
+// can never advance to PREFLIGHT as though the criterion passed.
+test('Proof Bundle rejects a satisfied:false criterion before mutation', async (t) => {
+  const { store, change } = await implementingStore(t);
+  const proof = validProof();
+  proof.criteria = [{ id: 'AC-1', satisfied: true }, { id: 'AC-2', satisfied: false }];
+  await assert.rejects(() => store.submitProof(change.id, proof), /satisfied|false|criterion/i);
+  assert.equal((await store.get(change.id)).state, 'IMPLEMENTING', 'Change must NOT advance to PREFLIGHT on a false criterion');
+  await assert.rejects(() => store.getProof(change.id), /No proof found/i, 'no proof persisted on rejected false-criterion submission');
+});
+
+test('Proof Bundle rejects extra criterion keys before mutation', async (t) => {
+  const { store, change } = await implementingStore(t);
+  const proof = validProof();
+  proof.criteria[0] = { id: 'AC-1', satisfied: true, evidence: 'side-channel' };
+  const before = await store.get(change.id);
+  await assert.rejects(
+    () => store.submitProof(change.id, proof),
+    (error) => error?.code === 'INVALID_PROOF',
+  );
+  assert.deepEqual(await store.get(change.id), before, 'extra criterion key must not mutate Change');
+  await assert.rejects(() => store.getProof(change.id), /No proof found/i, 'no proof persisted on rejected extra key');
+});
+
 // 3. Unknown criterion IDs are rejected.
 test('Proof Bundle rejects unknown criterion IDs without mutation', async (t) => {
   const { store, change } = await implementingStore(t);

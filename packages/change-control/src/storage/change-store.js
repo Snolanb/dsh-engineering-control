@@ -1564,6 +1564,11 @@ export class ChangeStore {
         if (!crit || typeof crit !== 'object') {
           throw Object.assign(new Error('Each criterion must be an object'), { code: 'INVALID_PROOF' });
         }
+        for (const key of Object.keys(crit)) {
+          if (key !== 'id' && key !== 'satisfied') {
+            throw Object.assign(new Error(`Criterion has unexpected field: ${key}`), { code: 'INVALID_PROOF' });
+          }
+        }
         if (typeof crit.id !== 'string') {
           throw Object.assign(new Error('Criterion id must be a string'), { code: 'INVALID_PROOF' });
         }
@@ -1592,6 +1597,20 @@ export class ChangeStore {
       for (const id of acceptedIds) {
         if (!seenIds.has(id)) {
           throw Object.assign(new Error(`Missing criterion: ${id}`), { code: 'MISSING_CRITERION' });
+        }
+      }
+
+      // Fail closed on any criterion the worker reports unsatisfied. The
+      // worker's structured {id, satisfied} is authoritative: a false criterion
+      // must never advance the Change to PREFLIGHT as though it passed. This
+      // check runs BEFORE any state/audit/proof mutation so a rejected proof
+      // leaves the Change byte-for-byte untouched.
+      for (const crit of proof.criteria) {
+        if (crit.satisfied === false) {
+          throw Object.assign(
+            new Error(`Criterion not satisfied: ${crit.id}`),
+            { code: 'UNSATISFIED_CRITERION', criterionId: crit.id },
+          );
         }
       }
 

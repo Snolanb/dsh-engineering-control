@@ -29,6 +29,112 @@ function unavailable(detail) {
 }
 
 /**
+ * Validate worker criterion evidence against the canonical acceptance criteria
+ * with the SAME authoritative checks ChangeStore.submitProof applies: exact
+ * array shape ({id: non-empty string, satisfied: boolean}), exact coverage, and
+ * no duplicates, unknown, missing, or unsatisfied criteria. Throws on the first
+ * violation with the authoritative Change-side code. Mirrors submitProof so the
+ * governed completion and replay paths cannot accept evidence the proof boundary
+ * would reject.
+ * @param {string[]} acceptedCriteria canonical criterion IDs
+ * @param {Array<{id: string, satisfied: boolean}>} criteria worker criterion evidence
+ */
+function validateProofCriteria(acceptedCriteria, criteria) {
+  const acceptedIds = new Set((acceptedCriteria ?? []).map(String));
+  if (!Array.isArray(criteria)) {
+    throw Object.assign(
+      new Error('proof.criteria is required and must be an array'),
+      { code: 'INVALID_PROOF', field: 'criteria' },
+    );
+  }
+  const seen = new Set();
+  for (const crit of criteria) {
+    if (!crit || typeof crit !== 'object' || Array.isArray(crit)) {
+      throw Object.assign(new Error('Each criterion must be an object'), { code: 'INVALID_PROOF' });
+    }
+    // H9 {id, satisfied} allows no other keys — an extra field (e.g. a freeform
+    // `evidence` key) is rejected so a criterion's satisfaction can never be
+    // laundered through an undocumented side channel.
+    for (const key of Object.keys(crit)) {
+      if (key !== 'id' && key !== 'satisfied') {
+        throw Object.assign(new Error(`Criterion has unexpected field: ${key}`), { code: 'INVALID_PROOF' });
+      }
+    }
+    if (typeof crit.id !== 'string' || crit.id.trim() === '') {
+      throw Object.assign(new Error('Criterion id must be a non-empty string'), { code: 'INVALID_PROOF' });
+    }
+    if (typeof crit.satisfied !== 'boolean') {
+      throw Object.assign(new Error(`Criterion satisfied must be a boolean for id: ${crit.id}`), { code: 'INVALID_PROOF' });
+    }
+    if (!acceptedIds.has(crit.id)) {
+      throw Object.assign(new Error(`Unknown criterion ID: ${crit.id}`), { code: 'UNKNOWN_CRITERION' });
+    }
+    if (seen.has(crit.id)) {
+      throw Object.assign(new Error(`Duplicate criterion ID: ${crit.id}`), { code: 'DUPLICATE_CRITERION' });
+    }
+    seen.add(crit.id);
+  }
+  for (const id of acceptedIds) {
+    if (!seen.has(id)) {
+      throw Object.assign(new Error(`Missing criterion: ${id}`), { code: 'MISSING_CRITERION' });
+    }
+  }
+  for (const crit of criteria) {
+    if (crit.satisfied === false) {
+      throw Object.assign(
+        new Error(`Criterion not satisfied: ${crit.id}`),
+        { code: 'UNSATISFIED_CRITERION', criterionId: crit.id },
+      );
+    }
+  }
+}
+
+/**
+ * The worker-owned proof fields the governed-completion contract defines.
+ * Exact stored-proof replay equality is judged over ONLY these fields (the
+ * stored proof may additionally carry an injected sessionId, which is not part
+ * of the worker's payload and must not force a spurious replay mismatch).
+ */
+const PROOF_CONTRACT_FIELDS = [
+  'beforeRevision', 'afterRevision', 'commit_sha',
+  'files_changed', 'tests_run', 'remaining_blockers',
+  'criteria', 'deviations', 'workerChecks', 'controllerPreflight',
+  'summary',
+];
+
+/**
+ * Deep-compare one proof field for exact replay equality. Arrays/objects are
+ * compared by canonical JSON; scalars by ===. Criteria order, values, and keys
+ * are therefore compared exactly (array order is preserved by JSON.stringify).
+ * @param {any} a
+ * @param {any} b
+ */
+function proofFieldEqual(a, b) {
+  if (Array.isArray(a) || Array.isArray(b)) {
+    return JSON.stringify(a) === JSON.stringify(b);
+  }
+  if (a !== null && b !== null && typeof a === 'object' && typeof b === 'object') {
+    return JSON.stringify(a) === JSON.stringify(b);
+  }
+  return a === b;
+}
+
+/**
+ * True when the replay payload exactly matches the stored proof on every
+ * worker-owned contract field. Any difference (summary, revisions, deviations,
+ * worker checks, criteria order/id/satisfied/keys, …) is a PROOF_MISMATCH.
+ * @param {object|null} stored
+ * @param {object} proof
+ */
+function proofsEqualExactly(stored, proof) {
+  if (stored == null) return false;
+  for (const field of PROOF_CONTRACT_FIELDS) {
+    if (!proofFieldEqual(stored[field], proof[field])) return false;
+  }
+  return true;
+}
+
+/**
  * Minimal typed views of the two domain services this package depends on.
  * @typedef {{ get: (id: string) => any, update: (id: string, patch: any) => Promise<any>, updateIf: (id: string, expected: any, patch: any) => any, complete?: (id: string, result: object, options?: any) => any, createDispatcher: (options?: any) => any, createWorkerLauncher?: (options?: any) => any, createReviewerLauncher?: (options?: any) => any, claim?: (id: string, worker: string, options?: any) => any, start?: (id: string, worker: string, options?: any) => any, release?: (id: string, worker: string, options?: any) => any }} TaskOrchestratorApi
  * @typedef {{ get: (id: string) => Promise<any>, findByWorkItem: (system: string, id: string) => Promise<any>, findOrCreateForWorkItem: (input: { system: string, id: string, change: object }) => Promise<any>, resolveRole: (changeId: string, sessionId: string) => Promise<string>, getBinding: (changeId: string, sessionId: string) => Promise<any>, getBindingSync: (changeId: string, sessionId: string) => any, getBindingFromDisk: (changeId: string, sessionId: string) => any, listByWorkItem: (system: string, id: string) => Promise<any[]>, listRoleBindings: () => Promise<any[]>, status: (changeId: string) => Promise<any>, appendAudit: (event: any) => Promise<any>, submitProof: (changeId: string, proof: any, expected?: { sessionId?: string, expectedWorker?: string }) => Promise<any>, bindRole: (changeId: string, sessionId: string, role: string, opts?: any) => Promise<any>, submitReview: (changeId: string, review: any, opts: any) => Promise<any>, submitRepair?: (changeId: string, repair: object, opts?: any) => Promise<any>, runPreflight: (changeId: string, input?: any) => Promise<any>, history: (changeId?: string) => Promise<any[]>, getGovernanceMode?: (scope: { projectId?: string|null, workspace?: string|null }) => Promise<string>, unbindRole: (changeId: string, sessionId: string, opts?: any) => Promise<any>, transition: (changeId: string, toState: string, opts?: any) => Promise<any> }} ChangeControlApi
@@ -269,9 +375,8 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
           // Thread the worker's ACTUAL structured completion payload into the proof.
           // Fail governed completion when required evidence is absent rather than
           // substituting fabricated values — prevents false PREFLIGHT transitions.
-          // Fetch the task to get acceptance_criteria for proof alignment.
-          const taskRecord = await Promise.resolve(requireTask().get(taskId));
-          const acceptanceCriteria = Array.isArray(taskRecord?.acceptance_criteria) ? taskRecord.acceptance_criteria : [];
+          // (No acceptance-criteria snapshot here: the canonical criteria are
+          // re-read at proof time in completeGovernedTask, never synthesized here.)
 
           // TH2-R2-02: Make governed completion conditional on actual linkage.
           // If no Change is linked to this task, fall back to raw store.complete
@@ -295,6 +400,18 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
             );
           }
 
+          // Require the worker's structured criterion evidence exactly as-is.
+          // The H9 {id, satisfied} envelope is authoritative: absent criterion
+          // evidence fails closed rather than synthesizing satisfied:true for
+          // every canonical criterion (which would fabricate worker success).
+          const criteria = result.criteria;
+          if (!Array.isArray(criteria)) {
+            throw Object.assign(
+              new Error('governed completion requires structured worker criteria [{id, satisfied}]'),
+              { code: 'PROOF_FIELD_REQUIRED', field: 'criteria' },
+            );
+          }
+
           const proof = {
             beforeRevision: result.beforeRevision ?? 'initial',
             afterRevision: result.afterRevision ?? commitSha,
@@ -302,9 +419,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
             files_changed: Array.isArray(result.files_changed) ? result.files_changed : [],
             tests_run: Array.isArray(result.tests_run) ? result.tests_run : [],
             remaining_blockers: Array.isArray(result.remaining_blockers) ? result.remaining_blockers : [],
-            criteria: Array.isArray(result.criteria)
-              ? result.criteria
-              : acceptanceCriteria.map((/** @type {string} */ c) => ({ id: c, satisfied: true })),
+            criteria,
             deviations: Array.isArray(result.deviations) ? result.deviations : [],
             workerChecks: Array.isArray(result.workerChecks) ? result.workerChecks : [],
             controllerPreflight: Array.isArray(result.controllerPreflight) ? result.controllerPreflight : [],
@@ -377,21 +492,43 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
           if (existingLink) {
             const existing = await c.get(existingLink.id);
             if (existing.state === 'PREFLIGHT') {
-              // The completion already converged. Verify the stored proof
-              // matches THIS caller's payload on the integration fields —
-              // identical ok, different → PROOF_MISMATCH (retry after a
-              // legit repair retry should agree with the stored proof).
+              // The completion already converged. Before returning ok, re-read the
+              // CANONICAL task acceptance criteria AFTER the Change awaits
+              // (findByWorkItem/get/status) — never the stale task snapshot read
+              // at method entry — so a criteria mutation landing during any await
+              // is observed and fails closed.
               const s = await c.status(existingLink.id).catch(() => null);
               const stored = s && s.proof ? s.proof : null;
-              const equal = stored
-                && stored.commit_sha === proof.commit_sha
-                && JSON.stringify(stored.files_changed) === JSON.stringify(proof.files_changed)
-                && JSON.stringify(stored.tests_run) === JSON.stringify(proof.tests_run)
-                && JSON.stringify(stored.remaining_blockers) === JSON.stringify(proof.remaining_blockers);
-              if (!equal) {
+              const freshTask = await Promise.resolve(taskOrchestrator.get(taskId));
+              if (!freshTask) {
+                throw Object.assign(new Error(`task missing at proof time`), { code: 'TASK_NOT_FOUND' });
+              }
+              const canonical = Array.isArray(freshTask.acceptance_criteria) ? freshTask.acceptance_criteria : [];
+              // 1. Authoritative criteria validation of the replay payload against
+              // the fresh canonical set: shape/coverage/duplicate/unknown/missing/
+              // satisfied:true/allowed-keys (the same checks ChangeStore.submitProof
+              // applies). Malformed/false/duplicate payloads fail closed here with
+              // their authoritative codes.
+              validateProofCriteria(canonical, proof.criteria);
+              // 2. Exact stored-proof equality: the caller's replay payload must
+              // match the immutable stored proof on every worker-owned contract
+              // field (revisions, integration fields, summary, deviations, worker
+              // checks, and criteria — including order). Any difference → PROOF_MISMATCH.
+              if (!proofsEqualExactly(stored, proof)) {
                 throw Object.assign(
-                  new Error(`stored Change proof does not match the completion payload`),
+                  new Error(`stored Change proof does not exactly match the completion payload`),
                   { code: 'PROOF_MISMATCH', changeId: existingLink.id },
+                );
+              }
+              // 3. REPLAY-003: the freshly-read canonical criteria must also equal
+              // the criteria the stored proof was accepted against (exact canonical
+              // ORDER and IDs) — a criteria reorder/change during the replay race
+              // must not masquerade as a converged completion.
+              const storedCriterionIds = (Array.isArray(stored.criteria) ? stored.criteria : []).map((/** @type {any} */ entry) => entry?.id);
+              if (!proofFieldEqual(canonical.map(String), storedCriterionIds)) {
+                throw Object.assign(
+                  new Error(`task acceptance criteria changed during completion`),
+                  { code: 'CRITERIA_MISMATCH', task: canonical.map(String) },
                 );
               }
               return { ok: true, taskId, changeId: existingLink.id };
@@ -479,7 +616,20 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
           const liveTask = await Promise.resolve(taskOrchestrator.get(taskId));
           if (!liveTask) throw Object.assign(new Error('task missing at proof time'), { code: 'TASK_NOT_FOUND' });
           const taskCriteria = Array.isArray(liveTask.acceptance_criteria) ? liveTask.acceptance_criteria : [];
-          const taskIds = new Set(taskCriteria.map(String));
+           try {
+             validateProofCriteria(taskCriteria, proof.criteria);
+           } catch (error) {
+             // Preserve the integration boundary's historical mismatch code for
+             // coverage drift while retaining strict validator codes for shape,
+             // duplicate, false, and unexpected-key failures.
+             if (error?.code === 'MISSING_CRITERION' || error?.code === 'UNKNOWN_CRITERION') {
+               throw Object.assign(new Error('proof criteria do not match task acceptance_criteria'), {
+                 code: 'CRITERIA_MISMATCH', task: taskCriteria, proof: proof.criteria,
+               });
+             }
+             throw error;
+           }
+           const taskIds = new Set(taskCriteria.map(String));
           const proofIds = new Set((proof.criteria ?? []).map(/** @param {any} c */ (c) => (c && typeof c === 'object' ? c.id : c)));
           if (taskIds.size !== proofIds.size || [...taskIds].some((id) => !proofIds.has(id))) {
             throw Object.assign(
