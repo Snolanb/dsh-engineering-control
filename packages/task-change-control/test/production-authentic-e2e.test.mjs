@@ -158,6 +158,7 @@ function listen(server) {
 async function startReviewBridge(t) {
   let executeReview = null;
   const calls = [];
+  const results = [];
   const server = createServer(async (req, res) => {
     try {
       const chunks = [];
@@ -166,6 +167,7 @@ async function startReviewBridge(t) {
       if (message.method !== 'change_submit_review' || typeof executeReview !== 'function') throw new Error('review bridge is not ready');
       calls.push(message.payload);
       const value = await executeReview(message.payload);
+      results.push(value);
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ result: { ok: true, value } }));
     } catch (error) {
@@ -178,6 +180,7 @@ async function startReviewBridge(t) {
   return {
     url: `http://127.0.0.1:${port}`,
     calls,
+    results,
     setExecutor(fn) { executeReview = fn; },
   };
 }
@@ -256,11 +259,17 @@ test('authentic production E2E executes worker_complete and change_submit_review
   const orch = ctx.get('taskOrchestrator');
   const cc = ctx.get('changeControl');
   const tcc = ctx.get('taskChangeControl');
-  const reviewTool = ctx.tools.view().visible.get('change_submit_review');
-  bridge.setExecutor(({ sessionId, changeId, review }) => reviewTool.execute(
-    { changeId, review },
-    { agent: { id: sessionId } },
-  ));
+  bridge.setExecutor(async ({ sessionId, changeId, review }) => {
+    const outcome = await ctx.tools.execute({
+      callId: `authentic-review-${bridge.calls.length}`,
+      name: 'change_submit_review',
+      arguments: { changeId, review },
+      agent: { id: sessionId },
+      signal: new AbortController().signal,
+    });
+    assert.equal(outcome.isError, false, JSON.stringify(outcome));
+    return outcome;
+  });
 
   const task = orch.create({
     title: 'authentic governed e2e', description: 'execute real session-host tool calls',
@@ -287,6 +296,8 @@ test('authentic production E2E executes worker_complete and change_submit_review
   assert.equal(reviewCalls.length, 2, 'FAIL and PASS were submitted through change_submit_review');
   assert.deepEqual(reviewCalls.map((event) => event.verdict), ['fail', 'pass']);
   assert.equal(bridge.calls.length, 2, 'the child session invoked the parent host review tool bridge twice');
+  assert.equal(bridge.results.length, 2, 'the parent ToolRuntime returned both review outcomes');
+  assert(bridge.results.every((outcome) => outcome.isError === false), JSON.stringify(bridge.results));
   assert.equal(orch.get(task.id).status, 'done');
   assert.equal((await cc.get(change.id)).state, 'APPROVED');
 });
