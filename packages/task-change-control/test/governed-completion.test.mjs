@@ -275,6 +275,23 @@ test('T-H10: duplicate criterion fails closed (UNKNOWN/DUP rejected at boundary)
   assert.equal((await ctx.changeControl.get(change.id)).state, 'IMPLEMENTING', 'Change NOT mutated');
 });
 
+test('T-H10: initial completion rejects extra criterion keys before mutation', async (t) => {
+  const { ctx, taskStore, dir } = await compose(t);
+  const { task, change, runId } = await runningGovernedTask(ctx, taskStore, dir);
+  const proof = {
+    beforeRevision: 'a', afterRevision: 'x',
+    commit_sha: 'a', files_changed: ['f'], tests_run: ['t'], remaining_blockers: [],
+    criteria: [{ id: 'ship', satisfied: true, evidence: 'side-channel' }],
+    deviations: [], workerChecks: ['w'], controllerPreflight: ['cp'], summary: 's',
+  };
+  await assert.rejects(
+    ctx.taskChangeControl.completeGovernedTask(task.id, { sessionId: 'sess-worker-1', worker: runId, proof }),
+    (e) => e?.code === 'INVALID_PROOF',
+  );
+  assert.equal((await taskStore.get(task.id)).status, 'running', 'task NOT completed');
+  assert.equal((await ctx.changeControl.get(change.id)).state, 'IMPLEMENTING', 'Change NOT mutated');
+});
+
 test('T-H10: proof replay against changed criteria fails closed (idempotent path re-reads criteria)', async (t) => {
   const { ctx, taskStore, dir } = await compose(t);
   const { task, change, runId } = await runningGovernedTask(ctx, taskStore, dir);

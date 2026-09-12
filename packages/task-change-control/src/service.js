@@ -616,7 +616,20 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
           const liveTask = await Promise.resolve(taskOrchestrator.get(taskId));
           if (!liveTask) throw Object.assign(new Error('task missing at proof time'), { code: 'TASK_NOT_FOUND' });
           const taskCriteria = Array.isArray(liveTask.acceptance_criteria) ? liveTask.acceptance_criteria : [];
-          const taskIds = new Set(taskCriteria.map(String));
+           try {
+             validateProofCriteria(taskCriteria, proof.criteria);
+           } catch (error) {
+             // Preserve the integration boundary's historical mismatch code for
+             // coverage drift while retaining strict validator codes for shape,
+             // duplicate, false, and unexpected-key failures.
+             if (error?.code === 'MISSING_CRITERION' || error?.code === 'UNKNOWN_CRITERION') {
+               throw Object.assign(new Error('proof criteria do not match task acceptance_criteria'), {
+                 code: 'CRITERIA_MISMATCH', task: taskCriteria, proof: proof.criteria,
+               });
+             }
+             throw error;
+           }
+           const taskIds = new Set(taskCriteria.map(String));
           const proofIds = new Set((proof.criteria ?? []).map(/** @param {any} c */ (c) => (c && typeof c === 'object' ? c.id : c)));
           if (taskIds.size !== proofIds.size || [...taskIds].some((id) => !proofIds.has(id))) {
             throw Object.assign(

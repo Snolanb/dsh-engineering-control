@@ -63,6 +63,19 @@ test('Proof Bundle rejects a satisfied:false criterion before mutation', async (
   await assert.rejects(() => store.getProof(change.id), /No proof found/i, 'no proof persisted on rejected false-criterion submission');
 });
 
+test('Proof Bundle rejects extra criterion keys before mutation', async (t) => {
+  const { store, change } = await implementingStore(t);
+  const proof = validProof();
+  proof.criteria[0] = { id: 'AC-1', satisfied: true, evidence: 'side-channel' };
+  const before = await store.get(change.id);
+  await assert.rejects(
+    () => store.submitProof(change.id, proof),
+    (error) => error?.code === 'INVALID_PROOF',
+  );
+  assert.deepEqual(await store.get(change.id), before, 'extra criterion key must not mutate Change');
+  await assert.rejects(() => store.getProof(change.id), /No proof found/i, 'no proof persisted on rejected extra key');
+});
+
 // 3. Unknown criterion IDs are rejected.
 test('Proof Bundle rejects unknown criterion IDs without mutation', async (t) => {
   const { store, change } = await implementingStore(t);

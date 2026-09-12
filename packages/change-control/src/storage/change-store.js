@@ -1564,6 +1564,11 @@ export class ChangeStore {
         if (!crit || typeof crit !== 'object') {
           throw Object.assign(new Error('Each criterion must be an object'), { code: 'INVALID_PROOF' });
         }
+        for (const key of Object.keys(crit)) {
+          if (key !== 'id' && key !== 'satisfied') {
+            throw Object.assign(new Error(`Criterion has unexpected field: ${key}`), { code: 'INVALID_PROOF' });
+          }
+        }
         if (typeof crit.id !== 'string') {
           throw Object.assign(new Error('Criterion id must be a string'), { code: 'INVALID_PROOF' });
         }
