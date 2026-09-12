@@ -1819,6 +1819,16 @@ async function routeRepairAttempt({ t, c, api, taskId, change, options }) {
     throw Object.assign(new Error('changeControl facade does not expose submitRepair — repair routing unavailable'), { code: 'SUBMIT_REPAIR_UNAVAILABLE' });
   }
   const statusNow = await c.status(change.id);
+  // T-H11 (H11-RECOVERY-STATE-GUARD): the authoritative Change must be in
+  // REPAIR before any task mutation/claim/launch. A stale snapshot or a
+  // non-REPAIR Change (e.g. a normal READY task swept in by the recovery scan)
+  // must never launch a repair worker or consume an attempt.
+  if (!statusNow || statusNow.state !== 'REPAIR') {
+    return {
+      stopped: true,
+      result: { outcome: 'lifecycle_mismatch', taskId, changeId: change.id, taskStatus: task.status, changeState: statusNow?.state ?? null },
+    };
+  }
   const openFindings = Array.isArray(statusNow?.openFindings) ? statusNow.openFindings : [];
   const revision = statusNow?.revision ?? null;
   // T-H11: autonomous repair routing. When the woken controller resumes with
@@ -1867,6 +1877,70 @@ async function routeRepairAttempt({ t, c, api, taskId, change, options }) {
           workerProfile: profile,
           reason: 'worker profile unavailable or unsupported',
         },
+      };
+    }
+    // H11-REPAIR-HEADLESS-IDENTITY: a headless-profile repair has no bound
+    // session (createBindingLauncher only binds session-mode), so governed
+    // repair completion cannot carry a durable worker session identity. Fail
+    // closed BEFORE claiming rather than persisting a Change-side transition
+    // the task side can never converge.
+    if (resolvedSpec.mode === 'headless-profile') {
+      return {
+        stopped: true,
+        result: {
+          outcome: 'repair_profile_unavailable', taskId, changeId: change.id,
+          workerProfile: profile,
+          reason: 'headless-profile repair lacks a durable bound-session identity',
+        },
+      };
+    }
+    // H11-REPAIR-PREFLIGHT-BYPASS: run the authoritative worker preflight for
+    // the task profile/model/workspace and require an ok result before any
+    // claim. A returned ok:false with a hard blocker (workspace policy,
+    // provider/model availability, preset/launcher resource) fails closed.
+    if (typeof t.preflightWorker === 'function') {
+      let preflight = null;
+      try {
+        preflight = await Promise.resolve(t.preflightWorker({
+          worker_profile: profile,
+          worker_model: task.worker_model,
+          workspace: task.workspace,
+        }));
+      } catch {
+          // The host cannot run preflight at all (e.g. no LLM catalog injected).
+          // We still fail closed on every check the registry itself can express
+          // (unknown/disabled/headless above), and below on a non-`any` workspace
+          // policy we cannot verify without preflight. The model/preset/launcher
+          // dimensions the registry cannot express are only enforceable where an
+          // LLM catalog exists (real hosts), where preflight runs and fails closed.
+        preflight = null;
+      }
+      if (preflight && preflight.ok === true) {
+        resolvedSpec = preflight.spec ?? resolvedSpec;
+      } else if (preflight && preflight.ok === false) {
+        const blockers = Array.isArray(preflight.blockers) ? preflight.blockers : [];
+        const hard = blockers.filter((/** @type {any} */ b) => !/CHECK_UNAVAILABLE$/.test(b?.code ?? '') && !/MODEL_(CATALOG|PROVIDER_LIST|LIST|RESOLUTION)/.test(b?.code ?? ''));
+        if (hard.length > 0) {
+          return {
+            stopped: true,
+            result: {
+              outcome: 'repair_preflight_failed', taskId, changeId: change.id,
+              workerProfile: profile,
+              reason: hard.map((/** @type {any} */ b) => b?.code ?? b?.message ?? String(b)).join(', '),
+            },
+          };
+        }
+        // Only "host lacks a checker/catalog" soft blockers: keep the spec.
+      }
+    }
+    // A declared restricted workspace policy (non-`any`) has roots that must be
+    // verified before dispatch; when the authoritative preflight did not run
+    // (unavailable/soft-skipped), fail closed rather than bypass a restriction.
+    const policy = resolvedSpec?.workspacePolicy ?? { type: 'any' };
+    if (policy.type !== 'any' && typeof task.workspace !== 'string') {
+      return {
+        stopped: true,
+        result: { outcome: 'repair_profile_unavailable', taskId, changeId: change.id, workerProfile: profile, reason: 'task workspace required by worker policy' },
       };
     }
     workerLauncher = t.createWorkerLauncher({});
@@ -1920,7 +1994,34 @@ async function routeRepairAttempt({ t, c, api, taskId, change, options }) {
   let settle;
   let submitError = null;
   try {
-    settle = await handle.wait?.();
+    // H11-REPAIR-CLAIM-LIVENESS: enforce the resolved profile's timeout (not
+    // an unbounded wait) and renew the claim lease while the worker runs, so
+    // a hung repair cannot hold a running task past its lease on our watch.
+    const timeoutMs = resolvedSpec?.timeoutMs ?? options.timeoutMs ?? null;
+    let renewTimer = null;
+    if (typeof t.renewLease === 'function') {
+      const intervalMs = Math.max(250, Math.floor(leaseSeconds * 1000 / 3));
+      renewTimer = setInterval(() => {
+        Promise.resolve(t.renewLease(taskId, runId, { lease_seconds: leaseSeconds, actor: 'sdlc-controller' })).catch(() => {});
+      }, intervalMs);
+      renewTimer.unref?.();
+    }
+    try {
+      const waitPromise = Promise.resolve(handle.wait?.());
+      if (timeoutMs && Number.isFinite(timeoutMs) && timeoutMs > 0) {
+        const timeoutPromise = new Promise((_, reject) => {
+          const timer = setTimeout(() => {
+            reject(Object.assign(new Error(`repair worker timed out after ${timeoutMs}ms`), { code: 'REPAIR_TIMEOUT' }));
+          }, timeoutMs);
+          timer.unref?.();
+        });
+        settle = await Promise.race([waitPromise, timeoutPromise]);
+      } else {
+        settle = await waitPromise;
+      }
+    } finally {
+      if (renewTimer) clearInterval(renewTimer);
+    }
     if (settle && settle.exitCode === 0 && !settle.error) {
       try {
         // The repair proof is caller-supplied on the host-driven path, or the
@@ -1939,6 +2040,13 @@ async function routeRepairAttempt({ t, c, api, taskId, change, options }) {
           controllerPreflight: Array.isArray(settle.controllerPreflight) ? settle.controllerPreflight : [],
           summary: settle.summary ?? '',
         };
+        // H11-REPAIR-HEADLESS-IDENTITY: never persist a repair completion
+        // without a durable worker session identity (the binding launcher only
+        // binds session-mode). Missing sessionId → fail, not a half-committed
+        // Change-side REPAIR→PREFLIGHT with an unconverged task.
+        if (typeof handle.sessionId !== 'string' || handle.sessionId === '') {
+          throw Object.assign(new Error('repair worker completed without a bound session identity'), { code: 'SESSION_ID_MISSING' });
+        }
         await c.submitRepair(change.id, { findings: claims, proof: repairProof }, { workerId: runId });
         // Governed completion converges the task side (PREFLIGHT idempotent
         // fast path: the stored repair proof matches this payload).

@@ -144,48 +144,59 @@ export default {
         if (payload && typeof payload.changeId === 'string') converge(payload.changeId);
       });
 
-      // Startup/restart recovery. Paginate each scan until a short page is
-      // returned so every relevant row is examined (no 500-row cap). Cover the
-      // full FAIL-stage task surface — in_review (APPROVED|REPAIR) plus
-      // changes_requested/ready (REPAIR) plus expired claimed/running repair
-      // claims (REPAIR) — and CAS-reconcile each through the idempotent
-      // controller. Per-task failure is isolated (cannot strand or duplicate:
-      // t.claim/updateIf are the single writers).
+      // Startup/restart recovery. SNAPSHOT every candidate task ID first (a
+      // stable collection before any mutation), then CAS-reconcile each
+      // against its authoritative linked Change state — so a converging
+      // mutation can never skip or double-process a batch. Per-task failure is
+      // isolated (cannot strand or duplicate: t.claim/updateIf are the single
+      // writers).
       const pageSize = 100;
       /** @param {object} opts taskOrchestrator list options (statuses|in_review|expired_claims) */
-      const scanAndResume = async (opts) => {
+      const collectIds = async (opts) => {
+        const ids = /** @type {string[]} */ ([]);
         for (let offset = 0; ; offset += pageSize) {
           let page = [];
-          try { page = (await orch.list({ ...opts, limit: pageSize, offset })) ?? []; } catch { return; }
-          for (const task of page) {
-            await resumeTask(task.id);
-          }
+          try { page = (await orch.list({ ...opts, limit: pageSize, offset })) ?? []; } catch { break; }
+          for (const task of page) ids.push(task.id);
           if (page.length < pageSize) break;
         }
+        return ids;
       };
       // Fire-and-forget recovery; the fiber's teardown only unsubscribes the listener.
       (async () => {
-        // 1. in_review → Change APPROVED (PASS) or REPAIR (FAIL) persisted.
-        await scanAndResume({ in_review: true });
-        // 2. FAIL settled to changes_requested / prepared to ready, Change REPAIR.
-        await scanAndResume({ statuses: ['changes_requested', 'ready'] });
-        // 3. Expired repair claims (claimed/running past their lease), Change REPAIR:
-        //    CAS-reset to ready so the controller re-claims, never re-runs a dead lease.
-        for (let offset = 0; ; offset += pageSize) {
-          let page = [];
-          try { page = (await orch.list({ expired_claims: true, limit: pageSize, offset })) ?? []; } catch { break; }
-          for (const task of page) {
-            const all = await cc.listByWorkItem(WORK_ITEM_SYSTEM, task.id).catch(() => []);
-            const change = (Array.isArray(all) ? all : []).at(-1);
-            if (change && change.state === 'REPAIR') {
+        // 1. in_review → ONLY Change APPROVED (PASS) or REPAIR (FAIL) persisted.
+        const inReview = await collectIds({ in_review: true });
+        for (const id of inReview) {
+          const all = await cc.listByWorkItem(WORK_ITEM_SYSTEM, id).catch(() => []);
+          const change = (Array.isArray(all) ? all : []).at(-1);
+          if (change && (change.state === 'APPROVED' || change.state === 'REPAIR')) await resumeTask(id);
+        }
+        // 2. FAIL settled to changes_requested / prepared to ready → ONLY Change REPAIR.
+        const repairStage = await collectIds({ statuses: ['changes_requested', 'ready'] });
+        for (const id of repairStage) {
+          const all = await cc.listByWorkItem(WORK_ITEM_SYSTEM, id).catch(() => []);
+          const change = (Array.isArray(all) ? all : []).at(-1);
+          if (change && change.state === 'REPAIR') await resumeTask(id);
+        }
+        // 3. Expired repair claims (claimed/running whose lease has lapsed) →
+        //    ONLY Change REPAIR: CAS-reset to ready so the controller re-claims,
+        //    never re-runs a dead lease. A live repair renews its lease (see
+        //    routeRepairAttempt), so only a crashed/abandoned attempt's lease
+        //    lapses and is reconciled here; active leases are left untouched.
+        const claimTasks = await collectIds({ expired_claims: true });
+        for (const id of claimTasks) {
+          const all = await cc.listByWorkItem(WORK_ITEM_SYSTEM, id).catch(() => []);
+          const change = (Array.isArray(all) ? all : []).at(-1);
+          if (change && change.state === 'REPAIR') {
+            const claimed = await orch.get(id).catch(() => null);
+            if (claimed && (claimed.status === 'claimed' || claimed.status === 'running')) {
               // Only release OUR observed expired lease (CAS on claimed_by+status+lease).
               try {
-                orch.updateIf(task.id, { status: task.status, claimed_by: task.claimed_by, lease_expires_at: task.lease_expires_at }, { status: 'ready' });
-              } catch { /* still-claimed by a live owner → leave untouched */ }
-              await resumeTask(task.id);
+                orch.updateIf(id, { status: claimed.status, claimed_by: claimed.claimed_by, lease_expires_at: claimed.lease_expires_at }, { status: 'ready' });
+              } catch { /* still-owned by a live owner → leave untouched */ }
             }
+            await resumeTask(id);
           }
-          if (page.length < pageSize) break;
         }
       })();
 
