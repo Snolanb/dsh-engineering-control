@@ -19,10 +19,20 @@ export function apply(ctx, config = {}) {
     maxAttemptsDefault: config.maxAttemptsDefault,
   })
   const workerRegistry = new WorkerSpecRegistry(config.workerSpecs ?? {})
+  const preflightDefaults = config.preflightOptions ?? {}
   const preflight = (request = {}, options = {}) => preflightWorker(workerRegistry, request, {
+    ...preflightDefaults,
     ...options,
-    llm: options.llm ?? ctx.llm,
-    workspaceRoots: options.workspaceRoots ?? config.workspaceRoots,
+    llm: options.llm ?? preflightDefaults.llm ?? ctx.llm,
+    workspaceRoots: options.workspaceRoots ?? preflightDefaults.workspaceRoots ?? config.workspaceRoots,
+  })
+  const workerLauncherDefaults = config.workerLauncherOptions ?? {}
+  const reviewerLauncherDefaults = config.reviewerLauncherOptions ?? {}
+  const mergeLauncherOptions = (defaults, options = {}) => ({
+    ...defaults,
+    ...options,
+    headlessOptions: { ...defaults.headlessOptions, ...options.headlessOptions },
+    sessionOptions: { ...defaults.sessionOptions, ...options.sessionOptions },
   })
   const api = Object.freeze({
     version: 2,
@@ -72,8 +82,8 @@ export function apply(ctx, config = {}) {
     getWorkerSpec: workerRegistry.get.bind(workerRegistry),
     resolveWorkerSpec: workerRegistry.resolve.bind(workerRegistry),
     preflightWorker: preflight,
-    createWorkerLauncher: (options = {}) => createWorkerLauncher(options),
-    createReviewerLauncher: (options = {}) => createReviewerLauncher(options),
+    createWorkerLauncher: (options = {}) => createWorkerLauncher(mergeLauncherOptions(workerLauncherDefaults, options)),
+    createReviewerLauncher: (options = {}) => createReviewerLauncher(mergeLauncherOptions(reviewerLauncherDefaults, options)),
     createDispatcher: (options = {}) => new WorkerDispatcher({
       store,
       registry: workerRegistry,

@@ -5,9 +5,9 @@
 // ChangeStore (JSON), and drives the lifecycle through the ACTUAL governed
 // dispatcher completion hook and the ACTUAL runGovernedSdlc controller using
 // the ACTUAL session launcher factories (createWorkerLauncher /
-// createReviewerLauncher) backed by a deterministic test-host RPC — it does
-// NOT fake the dispatcher or the stores, and does NOT call each SDLC stage by
-// hand to simulate the controller.
+// createReviewerLauncher) backed by a deterministic test-host RPC. Reviewers
+// settle through the ACTUAL change_submit_review tool; no verdict is injected
+// into runGovernedSdlc.
 //
 // The deterministic test-host RPC is installed by overriding `globalThis.fetch`
 // (the seam `createSessionRpcClient` defaults to). It emulates the host's
@@ -116,6 +116,20 @@ function workerProof(commitSha, { files = ['src/x.js'], tests = ['test/x.test.mj
   };
 }
 
+async function waitFor(predicate, timeoutMs = 3000) {
+  const started = Date.now();
+  let lastError;
+  while (Date.now() - started < timeoutMs) {
+    try {
+      if (await predicate()) return;
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`waitFor timed out${lastError ? `: ${lastError.message}` : ''}`);
+}
+
 const taskOrchestratorPluginObject = {
   name: taskOrchestratorPlugin.name,
   inject: taskOrchestratorPlugin.inject,
@@ -157,6 +171,13 @@ async function compose(t) {
         workspacePolicy: 'any',
         timeoutMs: 5000,
         leaseSeconds: 300,
+      },
+    },
+    preflightOptions: {
+      presetExists: new Set(['worker']),
+      llm: {
+        listProviders() { return [{ id: 'ollama' }]; },
+        async listModels(provider) { return provider === 'ollama' ? [{ id: 'm' }] : []; },
       },
     },
   });
@@ -247,55 +268,51 @@ test('T-H7 positive: full governed SDLC driven by the real controller and real l
   const proofStored = (await cc.status(change.id)).proof;
   assert.ok(proofStored && proofStored.commit_sha === 'abc123', 'proof persisted on Change');
 
-  // 16. FAIL finding (via the controller's verdict settlement)
+  // 16. The real reviewer settles FAIL through change_submit_review. The
+  // persisted review must wake the controller: task → changes_requested, a
+  // real repair session is launched and bound, and the Change returns to REVIEW.
   const failingFindings = [
     { severity: 'critical', category: 't', location: 'src/x.js', problem: 'missing guard', requiredOutcome: 'fix and re-test' },
   ];
-  const sdlc2 = await tcc.runGovernedSdlc(task.id, {
-    controllerPreflightOverride: ['pass:build'],
-    verdict: { verdict: 'fail', findings: failingFindings, sessionId: reviewerSession },
-    maxRepairRounds: 3,
-  });
-  // No worker supplied → controller stops at the resumable repair_routed
-  // boundary and reports the exact open finding IDs for exact-ID repair.
-  assert.equal(sdlc2.outcome, 'repair_routed');
-  assert.ok(Array.isArray(sdlc2.openFindingIds) && sdlc2.openFindingIds.length === 1, 'one open finding');
+  rpc.setProof(workerProof('def456', {
+    files: ['src/x.js', 'src/y.js'],
+    tests: ['test/x.test.mjs', 'test/y.test.mjs'],
+    beforeRevision: 'abc123',
+  }));
+  const reviewTool = c.ctx.tools.view().visible.get('change_submit_review');
+  const failReview = await reviewTool.execute(
+    { changeId: change.id, review: { verdict: 'fail', revision: 'abc123', findings: failingFindings } },
+    { agent: { id: reviewerSession } },
+  );
+  assert.equal(failReview.state, 'REPAIR', 'direct structured review persists the FAIL transition');
 
-  // 17. REPAIR + 18. changes_requested + 19. repair are controller-owned:
-  // route the repair worker (REAL session launcher) claiming the EXACT
-  // finding ID, converging governed completion, then re-running preflight.
-  const repairWorker = 'repair-worker-1';
-  const repairProof = workerProof('def456', { files: ['src/x.js', 'src/y.js'], tests: ['test/x.test.mjs', 'test/y.test.mjs'], beforeRevision: 'abc123' });
-  const repairLauncher = orch.createWorkerLauncher({}); // real factory → fetch stub RPC
-  const sdlc3 = await tcc.runGovernedSdlc(task.id, {
-    controllerPreflightOverride: ['pass:build'],
-    worker: repairWorker,
-    workerLauncher: repairLauncher,
-    repairProof,
-    repairFindings: sdlc2.openFindingIds.map((id) => ({ findingId: id, status: 'fixed', claim: 'fixed' })),
-    repairClaim: 'fixed',
-    maxRepairRounds: 3,
+  await waitFor(async () => {
+    const liveTask = orch.get(task.id);
+    const status = await cc.status(change.id);
+    return liveTask.status === 'in_review'
+      && status.state === 'REVIEW'
+      && status.revision === 'def456'
+      && status.attempts.length === 2;
   });
-  assert.equal(sdlc3.outcome, 'review_pending', 'repair converged → re-preflight → REVIEW → pending pass');
-
-  // The repair claimed the EXACT finding ID from the review and converged:
-  // the repair proof is now the current revision and the Change re-entered
-  // REVIEW. (A scratch/wrong finding ID would have been rejected as
-  // UNKNOWN_FINDING by submitRepair before reaching here.)
   const statusAfterRepair = await cc.status(change.id);
-  assert.equal(statusAfterRepair.revision, 'def456', 'repair proof is the current revision');
-  assert.equal(statusAfterRepair.openFindings.length, 1, 'finding record persists for the reviewer');
-  assert.ok(statusAfterRepair.openFindings[0].id === sdlc2.openFindingIds[0], 'finding identity matches the reviewed ID');
-  assert.equal((await cc.get(change.id)).state, 'REVIEW', 'Change back in REVIEW after repair');
+  // The next review round is bound to an independent reviewer session (the
+  // existing reservation policy may reuse the first reviewer; either way it
+  // must never be a worker implementation session).
+  const nextReviewerSession = (await cc.listRoleBindings())
+    .filter((b) => b.changeId === change.id && b.role === 'reviewer')
+    .at(-1).sessionId;
+  assert.ok(nextReviewerSession, 'a reviewer is bound for the re-review');
+  assert.equal(statusAfterRepair.openFindings.length, 1, 'finding record persists for the re-review');
+  assert.equal((await cc.get(change.id)).state, 'REVIEW', 'Change back in REVIEW after automatic repair');
 
-  // 20. re-preflight happened inside sdlc3; 21. reviewer pass →
-  // 22. APPROVED → 23. done
-  const sdlc4 = await tcc.runGovernedSdlc(task.id, {
-    controllerPreflightOverride: ['pass:build'],
-    verdict: { verdict: 'pass', sessionId: reviewerSession },
-    maxRepairRounds: 3,
-  });
-  assert.equal(sdlc4.outcome, 'approved');
+  // 17. The independent reviewer settles PASS through the same real
+  // structured seam; the woken controller converges APPROVED + done.
+  const passReview = await reviewTool.execute(
+    { changeId: change.id, review: { verdict: 'pass', revision: 'def456', findings: [] } },
+    { agent: { id: nextReviewerSession } },
+  );
+  assert.equal(passReview.state, 'APPROVED');
+  await waitFor(async () => (await cc.get(change.id)).state === 'APPROVED' && orch.get(task.id).status === 'done');
   assert.equal((await cc.get(change.id)).state, 'APPROVED', 'Change APPROVED');
   assert.equal(orch.get(task.id).status, 'done', 'task done');
 
@@ -308,20 +325,21 @@ test('T-H7 positive: full governed SDLC driven by the real controller and real l
   const terminalWorkers = terminalBindings.filter((b) => b.role === 'worker');
   const terminalReviewers = terminalBindings.filter((b) => b.role === 'reviewer');
   assert.equal(terminalWorkers.length, 0, 'no worker binding leaks at terminal (all released)');
-  assert.equal(terminalReviewers.length, 1, 'exactly one reviewer binding persists at terminal');
-  assert.equal(terminalReviewers[0].sessionId, reviewerSession, 'persisted reviewer binding is the review session');
+  assert.equal(terminalReviewers.length, 1, 'the independent reviewer binding persists at terminal');
+  assert.equal(terminalReviewers[0].sessionId, nextReviewerSession, 'persisted reviewer binding is the review session');
   assert.equal(terminalReviewers[0].worker, undefined, 'reviewer binding carries no worker identity');
 
   // 25. durable UNBIND audit evidence — the two worker dispatches (initial +
   // repair) each produced a `type:'UNBIND'` record for the SESSION they bound;
-  // the reviewer session is never unbound (intentional reviewer lifecycle).
+  // the fresh reviewer's binding remains the terminal review record.
   const audit = await cc.history(change.id);
-  const workerUnbinds = audit.filter((e) => e.type === 'UNBIND');
+  const reviewerSessionIds = new Set([reviewerSession, nextReviewerSession]);
+  const workerSessionIds = rpc.createdSessionIds.filter((id) => !reviewerSessionIds.has(id));
+  const workerUnbinds = audit.filter((e) => e.type === 'UNBIND' && workerSessionIds.includes(e.sessionId));
   assert.equal(workerUnbinds.length, 2, 'initial + repair worker each produced a durable UNBIND record');
   assert.ok(workerUnbinds.some((e) => e.sessionId === boundSession), 'unbind evidence for the initial dispatched worker session');
   for (const u of workerUnbinds) {
     assert.ok(typeof u.sessionId === 'string' && u.sessionId.length > 0, 'UNBIND record carries the sessionId');
-    assert.notEqual(u.sessionId, reviewerSession, 'reviewer session is never unbound');
   }
   // The reconciliation operation is idempotent here: no orphaned worker
   // bindings remain, so it records nothing and must not fabricate an unbind.

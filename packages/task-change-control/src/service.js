@@ -1058,6 +1058,19 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
             }
             return { outcome: 'approved', taskId, changeId: change.id };
           }
+          // T-H11: a reviewer-submitted FAIL persisted REVIEW→REPAIR before the
+          // controller was woken (the review-settled event fires AFTER durable
+          // persistence). Settle the still-in_review task side here, symmetric
+          // with the APPROVED block above, so the change never bypasses the
+          // task-side changes_requested transition and its settlement audit.
+          if (state === 'REPAIR' && task.status === 'in_review') {
+            const settled = await settleReviewedFailure(taskId, change.id, t, c, maxRepairRounds);
+            if (settled !== null) {
+              if (settled.outcome === 'task_update_race') continue; // re-read
+              return settled; // 'escalated'
+            }
+            // task is now changes_requested — fall through to repair routing
+          }
           if (task.status === 'failed' && state === 'REPAIR' && await hasEscalationAudit(c, change.id)) {
             return { outcome: 'escalated', taskId, changeId: change.id };
           }
@@ -1790,13 +1803,32 @@ async function settleReviewedFailure(taskId, changeId, t, c, maxRepairRounds) {
  * converged — the caller loops back to PREFLIGHT.
  */
 async function routeRepairAttempt({ t, c, api, taskId, change, options }) {
-  const task = await Promise.resolve(t.get(taskId));
+  let task = await Promise.resolve(t.get(taskId));
+  if (!task) throw Object.assign(new Error(`task not found: ${taskId}`), { code: 'TASK_NOT_FOUND' });
+
+  // H11-REPAIR-STATE-GUARD-ORDER: Change Control is authoritative and must be
+  // checked before prepareRepairAttempt can mutate changes_requested → ready.
+  // The second read below closes the normal cross-store check→claim race.
+  const statusBeforePrepare = await c.status(change.id);
+  if (!statusBeforePrepare || statusBeforePrepare.state !== 'REPAIR') {
+    return {
+      stopped: true,
+      result: { outcome: 'lifecycle_mismatch', taskId, changeId: change.id, taskStatus: task.status, changeState: statusBeforePrepare?.state ?? null },
+    };
+  }
   if (task.status === 'changes_requested') {
     await api.prepareRepairAttempt(taskId); // → ready (CAS-protected)
+    task = await Promise.resolve(t.get(taskId));
   } else if (task.status !== 'ready') {
     return {
       stopped: true,
-      result: { outcome: 'lifecycle_mismatch', taskId, changeId: change.id, taskStatus: task.status, changeState: 'REPAIR' },
+      result: { outcome: 'lifecycle_mismatch', taskId, changeId: change.id, taskStatus: task.status, changeState: statusBeforePrepare.state },
+    };
+  }
+  if (!task || task.status !== 'ready') {
+    return {
+      stopped: true,
+      result: { outcome: 'lifecycle_mismatch', taskId, changeId: change.id, taskStatus: task?.status ?? null, changeState: statusBeforePrepare.state },
     };
   }
   if (typeof t.claim !== 'function' || typeof t.start !== 'function' || typeof t.release !== 'function') {
@@ -1806,35 +1838,182 @@ async function routeRepairAttempt({ t, c, api, taskId, change, options }) {
     throw Object.assign(new Error('changeControl facade does not expose submitRepair — repair routing unavailable'), { code: 'SUBMIT_REPAIR_UNAVAILABLE' });
   }
   const statusNow = await c.status(change.id);
-  const openFindings = Array.isArray(statusNow?.openFindings) ? statusNow.openFindings : [];
-  const revision = statusNow?.revision ?? null;
-  if (!options.worker || !options.workerLauncher || options.repairProof == null) {
-    // Resumable boundary: the repair stage is prepped; a re-invocation
-    // (possibly after a restart, possibly with the repair worker and its
-    // structured proof) continues.
+  // H11-REPAIR-STATE-GUARD-ORDER: re-check the authoritative Change after
+  // preparation and immediately before claim/launch. A normal READY Change
+  // swept into recovery must never consume an attempt or create a session.
+  if (!statusNow || statusNow.state !== 'REPAIR') {
     return {
       stopped: true,
-      result: {
-        outcome: 'repair_routed', taskId, changeId: change.id,
-        openFindingIds: openFindings.map((/** @type {any} */ f) => f.id),
-        revision,
-        missing: options.worker && options.workerLauncher ? 'repairProof' : 'repairWorker',
-      },
+      result: { outcome: 'lifecycle_mismatch', taskId, changeId: change.id, taskStatus: task.status, changeState: statusNow?.state ?? null },
     };
   }
-  const runId = options.worker;
-  const claim = await Promise.resolve(t.claim(taskId, runId, { lease_seconds: options.leaseSeconds ?? 600, actor: 'sdlc-controller' }));
+  const openFindings = Array.isArray(statusNow?.openFindings) ? statusNow.openFindings : [];
+  const revision = statusNow?.revision ?? null;
+  // T-H11: autonomous repair routing. When the woken controller resumes with
+  // no caller-supplied repair worker/proof, resolve the AUTHORITATIVE worker
+  // profile + model from the task through the Task Orchestrator registry /
+  // preflight, so the repair session inherits mode, agentPreset/profile, model,
+  // timeout and lease exactly as a governed dispatch would. The repair
+  // worker's structured completion envelope is surfaced from handle.wait()
+  // (the deterministic DSH tool/result.meta carrier), never fabricated. The
+  // explicit-worker options remain for the host-driven repair path.
+  let workerLauncher = options.workerLauncher;
+  // Resolve the spec only on the autonomous path (a caller-supplied launcher
+  // already carries its own spec/lease intent). A headless-profile/session
+  // profile must survive into the launch spec — never a hardcoded session.
+  let resolvedSpec = null;
+  if (!workerLauncher) {
+    if (typeof t.createWorkerLauncher !== 'function') {
+      // Stop at the resumable repair_routed boundary: no launcher means a
+      // repair worker cannot be dispatched (consistent with the old contract).
+      return {
+        stopped: true,
+        result: {
+          outcome: 'repair_routed', taskId, changeId: change.id,
+          openFindingIds: openFindings.map((/** @type {any} */ f) => f.id),
+          revision,
+          missing: 'repairWorker',
+        },
+      };
+    }
+    // Authoritative registry resolution. Fail closed BEFORE any claim when
+    // the profile is unknown, malformed, or disabled — an invalid profile
+    // must never strand or half-dispatch a repair worker.
+    const profile = task.worker_profile;
+    try {
+      resolvedSpec = typeof t.resolveWorkerSpec === 'function'
+        ? await Promise.resolve(t.resolveWorkerSpec(profile, task.worker_model))
+        : null;
+    } catch {
+      resolvedSpec = null;
+    }
+    if (!resolvedSpec || resolvedSpec.enabled === false) {
+      return {
+        stopped: true,
+        result: {
+          outcome: 'repair_profile_unavailable', taskId, changeId: change.id,
+          workerProfile: profile,
+          reason: 'worker profile unavailable or unsupported',
+        },
+      };
+    }
+    // H11-REPAIR-HEADLESS-IDENTITY: a headless-profile repair has no bound
+    // session (createBindingLauncher only binds session-mode), so governed
+    // repair completion cannot carry a durable worker session identity. Fail
+    // closed BEFORE claiming rather than persisting a Change-side transition
+    // the task side can never converge.
+    if (resolvedSpec.mode === 'headless-profile') {
+      return {
+        stopped: true,
+        result: {
+          outcome: 'repair_profile_unavailable', taskId, changeId: change.id,
+          workerProfile: profile,
+          reason: 'headless-profile repair lacks a durable bound-session identity',
+        },
+      };
+    }
+    // H11-REPAIR-PREFLIGHT-FAILOPEN: the authoritative worker preflight is a
+    // mandatory trust-boundary check. Missing, throwing, malformed, or false
+    // preflight results all fail closed before claim/launch; checker-unavailable
+    // is not silently converted into permission to dispatch.
+    if (typeof t.preflightWorker !== 'function') {
+      return {
+        stopped: true,
+        result: {
+          outcome: 'repair_preflight_unavailable', taskId, changeId: change.id,
+          workerProfile: profile, reason: 'worker preflight is unavailable',
+        },
+      };
+    }
+    let preflight;
+    try {
+      preflight = await Promise.resolve(t.preflightWorker({
+        worker_profile: profile,
+        worker_model: task.worker_model,
+        workspace: task.workspace,
+      }));
+    } catch (error) {
+      return {
+        stopped: true,
+        result: {
+          outcome: 'repair_preflight_failed', taskId, changeId: change.id,
+          workerProfile: profile,
+          reason: error instanceof Error ? error.message : String(error),
+        },
+      };
+    }
+    if (!preflight || preflight.ok !== true) {
+      const blockers = Array.isArray(preflight?.blockers) ? preflight.blockers : [];
+      return {
+        stopped: true,
+        result: {
+          outcome: 'repair_preflight_failed', taskId, changeId: change.id,
+          workerProfile: profile,
+          reason: blockers.map((/** @type {any} */ b) => b?.code ?? b?.message ?? String(b)).join(', ') || 'worker preflight did not pass',
+        },
+      };
+    }
+    if (preflight.spec !== undefined && (!preflight.spec || typeof preflight.spec !== 'object' || Array.isArray(preflight.spec))) {
+      return {
+        stopped: true,
+        result: {
+          outcome: 'repair_preflight_failed', taskId, changeId: change.id,
+          workerProfile: profile, reason: 'worker preflight returned an invalid spec',
+        },
+      };
+    }
+    if (preflight.spec) resolvedSpec = preflight.spec;
+    if (!resolvedSpec || resolvedSpec.enabled === false || resolvedSpec.name !== profile) {
+      return {
+        stopped: true,
+        result: {
+          outcome: 'repair_preflight_failed', taskId, changeId: change.id,
+          workerProfile: profile, reason: 'worker preflight spec does not match the task profile',
+        },
+      };
+    }
+    // A headless worker has no session identity for the governed completion
+    // contract. Reject it before the claim even when a preflight override tries
+    // to select one.
+    if (resolvedSpec.mode === 'headless-profile') {
+      return {
+        stopped: true,
+        result: {
+          outcome: 'repair_profile_unavailable', taskId, changeId: change.id,
+          workerProfile: profile,
+          reason: 'headless-profile repair lacks a durable bound-session identity',
+        },
+      };
+    }
+    workerLauncher = t.createWorkerLauncher({});
+  }
+  const runId = options.worker ?? `repair-${change.id}-${Date.now()}`;
+  const leaseSeconds = options.leaseSeconds ?? resolvedSpec?.leaseSeconds ?? 600;
+  const claim = await Promise.resolve(t.claim(taskId, runId, { lease_seconds: leaseSeconds, actor: 'sdlc-controller' }));
   if (!claim || claim.claimed !== true) {
     return { stopped: true, result: { outcome: 'repair_claim_failed', taskId, changeId: change.id, reason: claim?.reason } };
   }
   await Promise.resolve(t.start(taskId, runId, { actor: 'sdlc-controller' }));
   const liveTask = await Promise.resolve(t.get(taskId));
-  const governedLauncher = createBindingLauncher(options.workerLauncher, c, WORK_ITEM_SYSTEM);
+  const governedLauncher = createBindingLauncher(workerLauncher, c, WORK_ITEM_SYSTEM);
+  // The launch spec carries the resolved profile's mode/agentPreset/profile/
+  // model/timeout so a session vs headless-profile task is honored; the repair
+  // prompt is woven in only for the prompt-bearing session mode (headless
+  // profiles run their own command/profile).
+  const launchSpec = resolvedSpec
+    ? {
+        mode: resolvedSpec.mode,
+        prompt: buildRepairPrompt(taskId, change.id, revision, openFindings),
+        ...(resolvedSpec.mode === 'headless-profile'
+          ? { profile: resolvedSpec.profile, command: resolvedSpec.command, model: resolvedSpec.model, timeoutMs: resolvedSpec.timeoutMs }
+          : { agentPreset: resolvedSpec.agentPreset, model: resolvedSpec.model, timeoutMs: resolvedSpec.timeoutMs }),
+      }
+    : { mode: 'session', prompt: buildRepairPrompt(taskId, change.id, revision, openFindings) };
   let handle;
   try {
     handle = await governedLauncher.launch({
       task: liveTask,
-      spec: { mode: 'session', prompt: buildRepairPrompt(taskId, change.id, revision, openFindings) },
+      spec: launchSpec,
       worker: runId,
     });
   } catch (/** @type {any} */ error) {
@@ -1856,14 +2035,79 @@ async function routeRepairAttempt({ t, c, api, taskId, change, options }) {
   handle._governedHold?.();
   let settle;
   let submitError = null;
+  let repairProofForRecovery = null;
   try {
-    settle = await handle.wait?.();
+    // H11-REPAIR-CLAIM-LIVENESS: enforce the resolved profile's timeout (not
+    // an unbounded wait) and renew the claim lease while the worker runs, so
+    // a hung repair cannot hold a running task past its lease on our watch.
+    const timeoutMs = resolvedSpec?.timeoutMs ?? options.timeoutMs ?? null;
+    let renewTimer = null;
+    if (typeof t.renewLease === 'function') {
+      const intervalMs = Math.max(250, Math.floor(leaseSeconds * 1000 / 3));
+      renewTimer = setInterval(() => {
+        Promise.resolve(t.renewLease(taskId, runId, { lease_seconds: leaseSeconds, actor: 'sdlc-controller' })).catch(() => {});
+      }, intervalMs);
+      renewTimer.unref?.();
+    }
+    let timeoutTimer = null;
+    try {
+      const waitPromise = Promise.resolve(handle.wait?.());
+      if (timeoutMs && Number.isFinite(timeoutMs) && timeoutMs > 0) {
+        const timeoutPromise = new Promise((_, reject) => {
+          timeoutTimer = setTimeout(() => {
+            reject(Object.assign(new Error(`repair worker timed out after ${timeoutMs}ms`), { code: 'REPAIR_TIMEOUT' }));
+          }, timeoutMs);
+          timeoutTimer.unref?.();
+        });
+        settle = await Promise.race([waitPromise, timeoutPromise]);
+      } else {
+        settle = await waitPromise;
+      }
+    } catch (/** @type {any} */ error) {
+      // A timeout or launcher wait failure is an ordinary failed repair, not an
+      // uncaught controller rejection. Terminate first so the binding wrapper
+      // unbinds the session, then the common failure path releases the claim.
+      if (error?.code === 'REPAIR_TIMEOUT') {
+        try { await handle.terminate?.('SIGTERM'); } catch { /* release below */ }
+      }
+      settle = {
+        exitCode: null,
+        signal: error?.code === 'REPAIR_TIMEOUT' ? 'SIGTERM' : null,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    } finally {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      if (renewTimer) clearInterval(renewTimer);
+    }
     if (settle && settle.exitCode === 0 && !settle.error) {
       try {
-        await c.submitRepair(change.id, { findings: claims, proof: options.repairProof }, { workerId: runId });
+        // The repair proof is caller-supplied on the host-driven path, or the
+        // worker's surfaced structured completion envelope on the autonomous
+        // path (handle.wait() returns the canonical tool/result.meta fields).
+        repairProofForRecovery = options.repairProof ?? {
+          beforeRevision: settle.beforeRevision ?? revision,
+          afterRevision: settle.afterRevision ?? settle.commit_sha,
+          commit_sha: settle.commit_sha,
+          files_changed: Array.isArray(settle.files_changed) ? settle.files_changed : [],
+          tests_run: Array.isArray(settle.tests_run) ? settle.tests_run : [],
+          remaining_blockers: Array.isArray(settle.remaining_blockers) ? settle.remaining_blockers : [],
+          criteria: Array.isArray(settle.criteria) ? settle.criteria : [],
+          deviations: Array.isArray(settle.deviations) ? settle.deviations : [],
+          workerChecks: Array.isArray(settle.workerChecks) ? settle.workerChecks : [],
+          controllerPreflight: Array.isArray(settle.controllerPreflight) ? settle.controllerPreflight : [],
+          summary: settle.summary ?? '',
+        };
+        // H11-REPAIR-HEADLESS-IDENTITY: never persist a repair completion
+        // without a durable worker session identity (the binding launcher only
+        // binds session-mode). Missing sessionId → fail, not a half-committed
+        // Change-side REPAIR→PREFLIGHT with an unconverged task.
+        if (typeof handle.sessionId !== 'string' || handle.sessionId === '') {
+          throw Object.assign(new Error('repair worker completed without a bound session identity'), { code: 'SESSION_ID_MISSING' });
+        }
+        await c.submitRepair(change.id, { findings: claims, proof: repairProofForRecovery }, { workerId: runId });
         // Governed completion converges the task side (PREFLIGHT idempotent
         // fast path: the stored repair proof matches this payload).
-        await api.completeGovernedTask(taskId, { sessionId: handle.sessionId, worker: runId, proof: options.repairProof });
+        await api.completeGovernedTask(taskId, { sessionId: handle.sessionId, worker: runId, proof: repairProofForRecovery });
       } catch (/** @type {any} */ error) {
         submitError = error;
       }
@@ -1872,9 +2116,59 @@ async function routeRepairAttempt({ t, c, api, taskId, change, options }) {
     await handle._governedRelease?.();
   }
   if (submitError !== null) {
-    // A failed submission/leave would strand the task running under our
-    // claim: release it so a re-invocation can re-claim (resumable), then
-    // surface the domain error.
+    // Change Control and Task Orchestrator are separate durable stores. If the
+    // repair proof reached PREFLIGHT before governed task completion failed,
+    // do not release the task to ready (which would strand PREFLIGHT outside
+    // the normal recovery path). Reconcile the task into in_review so the
+    // controller can continue from the persisted proof. Acceptance-criteria
+    // drift is not safely replayable, so fail that task closed instead.
+    let afterSubmit = null;
+    try { afterSubmit = repairProofForRecovery ? await c.status(change.id) : null; } catch { afterSubmit = null; }
+    if (afterSubmit?.state === 'PREFLIGHT' && repairProofForRecovery) {
+      const currentTask = await Promise.resolve(t.get(taskId));
+      if (currentTask?.status === 'in_review') return { stopped: false };
+      if (currentTask && (currentTask.status === 'claimed' || currentTask.status === 'running') && currentTask.claimed_by === runId) {
+        const expected = {
+          status: currentTask.status,
+          claimed_by: runId,
+          lease_expires_at: currentTask.lease_expires_at,
+        };
+        if (submitError?.code === 'CRITERIA_MISMATCH') {
+          const failed = t.updateIf(taskId, expected, {
+            status: 'failed',
+            result_summary: 'repair completion rejected after acceptance criteria changed',
+          });
+          if (failed) {
+            await Promise.resolve(c.appendAudit({
+              kind: 'review_orchestration', changeId: change.id,
+              action: 'repair_partial_failed_closed', detail: submitError.message,
+            })).catch(() => {});
+            return {
+              stopped: true,
+              result: { outcome: 'repair_failed', taskId, changeId: change.id, code: submitError.code, detail: submitError.message },
+            };
+          }
+        } else {
+          const recovered = t.updateIf(taskId, expected, {
+            status: 'in_review',
+            commit_sha: repairProofForRecovery.commit_sha,
+            files_changed: repairProofForRecovery.files_changed,
+            tests_run: repairProofForRecovery.tests_run,
+            remaining_blockers: repairProofForRecovery.remaining_blockers,
+            result_summary: repairProofForRecovery.summary ?? 'repair proof recovered for review',
+          });
+          if (recovered) {
+            await Promise.resolve(c.appendAudit({
+              kind: 'review_orchestration', changeId: change.id,
+              action: 'repair_partial_recovered', detail: submitError.message,
+            })).catch(() => {});
+            return { stopped: false };
+          }
+        }
+      }
+    }
+    // A failed submission/leave before Change-side persistence: release the
+    // claim so a later event or restart can re-claim the REPAIR stage.
     await Promise.resolve(t.release(taskId, runId, { actor: 'sdlc-controller' })).catch(() => {});
     throw submitError;
   }
