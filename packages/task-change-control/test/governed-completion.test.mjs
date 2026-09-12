@@ -359,6 +359,112 @@ test('T-H10: replay payload with duplicate criterion fails closed', async (t) =>
   );
 });
 
+test('T-H10: replay payload differing in summary fails closed (exact stored-proof equality)', async (t) => {
+  const { ctx, taskStore, dir } = await compose(t);
+  const { task, runId } = await runningGovernedTask(ctx, taskStore, dir);
+  const proof = {
+    beforeRevision: 'a', afterRevision: 'x',
+    commit_sha: 'a', files_changed: ['f'], tests_run: ['t'], remaining_blockers: [],
+    criteria: [{ id: 'ship', satisfied: true }], deviations: [], workerChecks: ['w'], controllerPreflight: ['cp'], summary: 's',
+  };
+  await ctx.taskChangeControl.completeGovernedTask(task.id, { sessionId: 'sess-worker-1', worker: runId, proof });
+  assert.equal((await taskStore.get(task.id)).status, 'in_review');
+  await assert.rejects(
+    ctx.taskChangeControl.completeGovernedTask(task.id, { sessionId: 'sess-worker-1', worker: runId, proof: { ...proof, summary: 'DIFFERENT' } }),
+    (e) => e?.code === 'PROOF_MISMATCH',
+  );
+});
+
+test('T-H10: replay payload differing in beforeRevision fails closed (exact stored-proof equality)', async (t) => {
+  const { ctx, taskStore, dir } = await compose(t);
+  const { task, runId } = await runningGovernedTask(ctx, taskStore, dir);
+  const proof = {
+    beforeRevision: 'a', afterRevision: 'x',
+    commit_sha: 'a', files_changed: ['f'], tests_run: ['t'], remaining_blockers: [],
+    criteria: [{ id: 'ship', satisfied: true }], deviations: [], workerChecks: ['w'], controllerPreflight: ['cp'], summary: 's',
+  };
+  await ctx.taskChangeControl.completeGovernedTask(task.id, { sessionId: 'sess-worker-1', worker: runId, proof });
+  await assert.rejects(
+    ctx.taskChangeControl.completeGovernedTask(task.id, { sessionId: 'sess-worker-1', worker: runId, proof: { ...proof, beforeRevision: 'DIFFERENT' } }),
+    (e) => e?.code === 'PROOF_MISMATCH',
+  );
+});
+
+test('T-H10: replay payload with reordered criteria fails closed (exact order)', async (t) => {
+  const { ctx, taskStore, dir } = await compose(t);
+  const task = await taskStore.create({
+    title: 'g', description: 'd', status: 'ready', workspace: dir,
+    worker_profile: 'worker', acceptance_criteria: ['a', 'b'],
+  });
+  const { change } = await ctx.taskChangeControl.bootstrapTask(task.id);
+  const plan = await ctx.changeControl.submitPlan(change.id, { steps: ['s'] });
+  await ctx.changeControl.acceptPlan(change.id, plan.id, { authorized: true, actor: 'host' });
+  await ctx.changeControl.transition(change.id, 'IMPLEMENTING', {});
+  const claim = await taskStore.claim(task.id, 'w:reo', { lease_seconds: 300 });
+  await taskStore.start(task.id, 'w:reo', {});
+  await ctx.changeControl.bindRole(change.id, 'sess-reo', 'worker', { worker: 'w:reo' });
+  const proof = {
+    beforeRevision: 'a', afterRevision: 'x',
+    commit_sha: 'abc', files_changed: ['x'], tests_run: ['t'], remaining_blockers: [],
+    criteria: [{ id: 'a', satisfied: true }, { id: 'b', satisfied: true }],
+    deviations: [], workerChecks: [], controllerPreflight: [], summary: 's',
+  };
+  await ctx.taskChangeControl.completeGovernedTask(task.id, { sessionId: 'sess-reo', worker: 'w:reo', proof });
+  assert.equal((await taskStore.get(task.id)).status, 'in_review');
+  // Same two criteria, same coverage, but reordered → must not match stored proof.
+  await assert.rejects(
+    ctx.taskChangeControl.completeGovernedTask(task.id, { sessionId: 'sess-reo', worker: 'w:reo', proof: { ...proof, criteria: [{ id: 'b', satisfied: true }, { id: 'a', satisfied: true }] } }),
+    (e) => e?.code === 'PROOF_MISMATCH',
+  );
+});
+
+test('T-H10: replay payload with extra criterion key fails closed (allowed keys)', async (t) => {
+  const { ctx, taskStore, dir } = await compose(t);
+  const { task, runId } = await runningGovernedTask(ctx, taskStore, dir);
+  const proof = {
+    beforeRevision: 'a', afterRevision: 'x',
+    commit_sha: 'a', files_changed: ['f'], tests_run: ['t'], remaining_blockers: [],
+    criteria: [{ id: 'ship', satisfied: true }], deviations: [], workerChecks: ['w'], controllerPreflight: ['cp'], summary: 's',
+  };
+  await ctx.taskChangeControl.completeGovernedTask(task.id, { sessionId: 'sess-worker-1', worker: runId, proof });
+  assert.equal((await taskStore.get(task.id)).status, 'in_review');
+  await assert.rejects(
+    ctx.taskChangeControl.completeGovernedTask(task.id, { sessionId: 'sess-worker-1', worker: runId, proof: { ...proof, criteria: [{ id: 'ship', satisfied: true, evidence: 'trust me' }] } }),
+    (e) => e && (e.code === 'INVALID_PROOF' || e.code === 'PROOF_MISMATCH'),
+  );
+});
+
+test('T-H10: canonical criteria reorder after completion fails closed (fresh read order)', async (t) => {
+  const { ctx, taskStore, dir } = await compose(t);
+  const task = await taskStore.create({
+    title: 'g', description: 'd', status: 'ready', workspace: dir,
+    worker_profile: 'worker', acceptance_criteria: ['a', 'b'],
+  });
+  const { change } = await ctx.taskChangeControl.bootstrapTask(task.id);
+  const plan = await ctx.changeControl.submitPlan(change.id, { steps: ['s'] });
+  await ctx.changeControl.acceptPlan(change.id, plan.id, { authorized: true, actor: 'host' });
+  await ctx.changeControl.transition(change.id, 'IMPLEMENTING', {});
+  const claim = await taskStore.claim(task.id, 'w:ord', { lease_seconds: 300 });
+  await taskStore.start(task.id, 'w:ord', {});
+  await ctx.changeControl.bindRole(change.id, 'sess-ord', 'worker', { worker: 'w:ord' });
+  const proof = {
+    beforeRevision: 'a', afterRevision: 'x',
+    commit_sha: 'abc', files_changed: ['x'], tests_run: ['t'], remaining_blockers: [],
+    criteria: [{ id: 'a', satisfied: true }, { id: 'b', satisfied: true }],
+    deviations: [], workerChecks: [], controllerPreflight: [], summary: 's',
+  };
+  await ctx.taskChangeControl.completeGovernedTask(task.id, { sessionId: 'sess-ord', worker: 'w:ord', proof });
+  assert.equal((await taskStore.get(task.id)).status, 'in_review');
+
+  // Reorder the CANONICAL criteria (same set, different order) — the fresh
+  // post-await re-read must detect the order drift and fail closed.
+  await taskStore.update(task.id, { acceptance_criteria: ['b', 'a'] });
+  await assert.rejects(
+    ctx.taskChangeControl.completeGovernedTask(task.id, { sessionId: 'sess-ord', worker: 'w:ord', proof }),
+    (e) => e?.code === 'CRITERIA_MISMATCH',
+  );
+});
+
 test('governed dispatcher success routes through completeGovernedTask: proof → PREFLIGHT → task in_review', async (t) => {
   // This is the RED→GREEN regression for T-H2: before the completionHook seam,
   // createGovernedDispatcher dispatched governed tasks through raw store.complete,

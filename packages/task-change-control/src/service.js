@@ -52,6 +52,14 @@ function validateProofCriteria(acceptedCriteria, criteria) {
     if (!crit || typeof crit !== 'object' || Array.isArray(crit)) {
       throw Object.assign(new Error('Each criterion must be an object'), { code: 'INVALID_PROOF' });
     }
+    // H9 {id, satisfied} allows no other keys — an extra field (e.g. a freeform
+    // `evidence` key) is rejected so a criterion's satisfaction can never be
+    // laundered through an undocumented side channel.
+    for (const key of Object.keys(crit)) {
+      if (key !== 'id' && key !== 'satisfied') {
+        throw Object.assign(new Error(`Criterion has unexpected field: ${key}`), { code: 'INVALID_PROOF' });
+      }
+    }
     if (typeof crit.id !== 'string' || crit.id.trim() === '') {
       throw Object.assign(new Error('Criterion id must be a non-empty string'), { code: 'INVALID_PROOF' });
     }
@@ -79,6 +87,51 @@ function validateProofCriteria(acceptedCriteria, criteria) {
       );
     }
   }
+}
+
+/**
+ * The worker-owned proof fields the governed-completion contract defines.
+ * Exact stored-proof replay equality is judged over ONLY these fields (the
+ * stored proof may additionally carry an injected sessionId, which is not part
+ * of the worker's payload and must not force a spurious replay mismatch).
+ */
+const PROOF_CONTRACT_FIELDS = [
+  'beforeRevision', 'afterRevision', 'commit_sha',
+  'files_changed', 'tests_run', 'remaining_blockers',
+  'criteria', 'deviations', 'workerChecks', 'controllerPreflight',
+  'summary',
+];
+
+/**
+ * Deep-compare one proof field for exact replay equality. Arrays/objects are
+ * compared by canonical JSON; scalars by ===. Criteria order, values, and keys
+ * are therefore compared exactly (array order is preserved by JSON.stringify).
+ * @param {any} a
+ * @param {any} b
+ */
+function proofFieldEqual(a, b) {
+  if (Array.isArray(a) || Array.isArray(b)) {
+    return JSON.stringify(a) === JSON.stringify(b);
+  }
+  if (a !== null && b !== null && typeof a === 'object' && typeof b === 'object') {
+    return JSON.stringify(a) === JSON.stringify(b);
+  }
+  return a === b;
+}
+
+/**
+ * True when the replay payload exactly matches the stored proof on every
+ * worker-owned contract field. Any difference (summary, revisions, deviations,
+ * worker checks, criteria order/id/satisfied/keys, …) is a PROOF_MISMATCH.
+ * @param {object|null} stored
+ * @param {object} proof
+ */
+function proofsEqualExactly(stored, proof) {
+  if (stored == null) return false;
+  for (const field of PROOF_CONTRACT_FIELDS) {
+    if (!proofFieldEqual(stored[field], proof[field])) return false;
+  }
+  return true;
 }
 
 /**
@@ -439,34 +492,45 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
           if (existingLink) {
             const existing = await c.get(existingLink.id);
             if (existing.state === 'PREFLIGHT') {
-              // The completion already converged. Verify the stored proof
-              // matches THIS caller's payload on the integration fields —
-              // identical ok, different → PROOF_MISMATCH (retry after a
-              // legit repair retry should agree with the stored proof).
+              // The completion already converged. Before returning ok, re-read the
+              // CANONICAL task acceptance criteria AFTER the Change awaits
+              // (findByWorkItem/get/status) — never the stale task snapshot read
+              // at method entry — so a criteria mutation landing during any await
+              // is observed and fails closed.
               const s = await c.status(existingLink.id).catch(() => null);
               const stored = s && s.proof ? s.proof : null;
-              const equal = stored
-                && stored.commit_sha === proof.commit_sha
-                && JSON.stringify(stored.files_changed) === JSON.stringify(proof.files_changed)
-                && JSON.stringify(stored.tests_run) === JSON.stringify(proof.tests_run)
-                && JSON.stringify(stored.remaining_blockers) === JSON.stringify(proof.remaining_blockers);
-              if (!equal) {
+              const freshTask = await Promise.resolve(taskOrchestrator.get(taskId));
+              if (!freshTask) {
+                throw Object.assign(new Error(`task missing at proof time`), { code: 'TASK_NOT_FOUND' });
+              }
+              const canonical = Array.isArray(freshTask.acceptance_criteria) ? freshTask.acceptance_criteria : [];
+              // 1. Authoritative criteria validation of the replay payload against
+              // the fresh canonical set: shape/coverage/duplicate/unknown/missing/
+              // satisfied:true/allowed-keys (the same checks ChangeStore.submitProof
+              // applies). Malformed/false/duplicate payloads fail closed here with
+              // their authoritative codes.
+              validateProofCriteria(canonical, proof.criteria);
+              // 2. Exact stored-proof equality: the caller's replay payload must
+              // match the immutable stored proof on every worker-owned contract
+              // field (revisions, integration fields, summary, deviations, worker
+              // checks, and criteria — including order). Any difference → PROOF_MISMATCH.
+              if (!proofsEqualExactly(stored, proof)) {
                 throw Object.assign(
-                  new Error(`stored Change proof does not match the completion payload`),
+                  new Error(`stored Change proof does not exactly match the completion payload`),
                   { code: 'PROOF_MISMATCH', changeId: existingLink.id },
                 );
               }
-              // T-H10: re-read the CANONICAL task acceptance criteria even on the
-              // already-converged replay path, and validate the replay payload's
-              // criteria with the SAME authoritative shape/coverage/duplicate/
-              // unknown/missing/satisfied checks ChangeStore.submitProof applies.
-              // If the task's criteria changed after the worker completed, or the
-              // replay payload is malformed/false/duplicate, fail closed rather
-              // than returning ok against stale or fabricated evidence.
-              validateProofCriteria(
-                Array.isArray(task.acceptance_criteria) ? task.acceptance_criteria : [],
-                proof.criteria,
-              );
+              // 3. REPLAY-003: the freshly-read canonical criteria must also equal
+              // the criteria the stored proof was accepted against (exact canonical
+              // ORDER and IDs) — a criteria reorder/change during the replay race
+              // must not masquerade as a converged completion.
+              const storedCriterionIds = (Array.isArray(stored.criteria) ? stored.criteria : []).map((/** @type {any} */ entry) => entry?.id);
+              if (!proofFieldEqual(canonical.map(String), storedCriterionIds)) {
+                throw Object.assign(
+                  new Error(`task acceptance criteria changed during completion`),
+                  { code: 'CRITERIA_MISMATCH', task: canonical.map(String) },
+                );
+              }
               return { ok: true, taskId, changeId: existingLink.id };
             }
           }
