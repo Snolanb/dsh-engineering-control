@@ -141,6 +141,13 @@ async function compose(t) {
         timeoutMs: 5000, leaseSeconds: 300,
       },
     },
+    preflightOptions: {
+      presetExists: new Set(['worker']),
+      llm: {
+        listProviders() { return [{ id: 'ollama' }]; },
+        async listModels(provider) { return provider === 'ollama' ? [{ id: 'm' }] : []; },
+      },
+    },
   });
   await ctx.plugin(changeControlPlugin, { storePath: changesJsonPath });
   await ctx.plugin(integrationPlugin);
@@ -173,6 +180,13 @@ async function reopen(t, paths) {
         mode: 'session', profile: 'wp', agentPreset: 'worker',
         provider: 'ollama', model: 'm', workspacePolicy: 'any',
         timeoutMs: 5000, leaseSeconds: 300,
+      },
+    },
+    preflightOptions: {
+      presetExists: new Set(['worker']),
+      llm: {
+        listProviders() { return [{ id: 'ollama' }]; },
+        async listModels(provider) { return provider === 'ollama' ? [{ id: 'm' }] : []; },
       },
     },
   });

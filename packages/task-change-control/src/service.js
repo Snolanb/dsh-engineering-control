@@ -1803,13 +1803,32 @@ async function settleReviewedFailure(taskId, changeId, t, c, maxRepairRounds) {
  * converged — the caller loops back to PREFLIGHT.
  */
 async function routeRepairAttempt({ t, c, api, taskId, change, options }) {
-  const task = await Promise.resolve(t.get(taskId));
+  let task = await Promise.resolve(t.get(taskId));
+  if (!task) throw Object.assign(new Error(`task not found: ${taskId}`), { code: 'TASK_NOT_FOUND' });
+
+  // H11-REPAIR-STATE-GUARD-ORDER: Change Control is authoritative and must be
+  // checked before prepareRepairAttempt can mutate changes_requested → ready.
+  // The second read below closes the normal cross-store check→claim race.
+  const statusBeforePrepare = await c.status(change.id);
+  if (!statusBeforePrepare || statusBeforePrepare.state !== 'REPAIR') {
+    return {
+      stopped: true,
+      result: { outcome: 'lifecycle_mismatch', taskId, changeId: change.id, taskStatus: task.status, changeState: statusBeforePrepare?.state ?? null },
+    };
+  }
   if (task.status === 'changes_requested') {
     await api.prepareRepairAttempt(taskId); // → ready (CAS-protected)
+    task = await Promise.resolve(t.get(taskId));
   } else if (task.status !== 'ready') {
     return {
       stopped: true,
-      result: { outcome: 'lifecycle_mismatch', taskId, changeId: change.id, taskStatus: task.status, changeState: 'REPAIR' },
+      result: { outcome: 'lifecycle_mismatch', taskId, changeId: change.id, taskStatus: task.status, changeState: statusBeforePrepare.state },
+    };
+  }
+  if (!task || task.status !== 'ready') {
+    return {
+      stopped: true,
+      result: { outcome: 'lifecycle_mismatch', taskId, changeId: change.id, taskStatus: task?.status ?? null, changeState: statusBeforePrepare.state },
     };
   }
   if (typeof t.claim !== 'function' || typeof t.start !== 'function' || typeof t.release !== 'function') {
@@ -1819,10 +1838,9 @@ async function routeRepairAttempt({ t, c, api, taskId, change, options }) {
     throw Object.assign(new Error('changeControl facade does not expose submitRepair — repair routing unavailable'), { code: 'SUBMIT_REPAIR_UNAVAILABLE' });
   }
   const statusNow = await c.status(change.id);
-  // T-H11 (H11-RECOVERY-STATE-GUARD): the authoritative Change must be in
-  // REPAIR before any task mutation/claim/launch. A stale snapshot or a
-  // non-REPAIR Change (e.g. a normal READY task swept in by the recovery scan)
-  // must never launch a repair worker or consume an attempt.
+  // H11-REPAIR-STATE-GUARD-ORDER: re-check the authoritative Change after
+  // preparation and immediately before claim/launch. A normal READY Change
+  // swept into recovery must never consume an attempt or create a session.
   if (!statusNow || statusNow.state !== 'REPAIR') {
     return {
       stopped: true,
@@ -1894,53 +1912,77 @@ async function routeRepairAttempt({ t, c, api, taskId, change, options }) {
         },
       };
     }
-    // H11-REPAIR-PREFLIGHT-BYPASS: run the authoritative worker preflight for
-    // the task profile/model/workspace and require an ok result before any
-    // claim. A returned ok:false with a hard blocker (workspace policy,
-    // provider/model availability, preset/launcher resource) fails closed.
-    if (typeof t.preflightWorker === 'function') {
-      let preflight = null;
-      try {
-        preflight = await Promise.resolve(t.preflightWorker({
-          worker_profile: profile,
-          worker_model: task.worker_model,
-          workspace: task.workspace,
-        }));
-      } catch {
-          // The host cannot run preflight at all (e.g. no LLM catalog injected).
-          // We still fail closed on every check the registry itself can express
-          // (unknown/disabled/headless above), and below on a non-`any` workspace
-          // policy we cannot verify without preflight. The model/preset/launcher
-          // dimensions the registry cannot express are only enforceable where an
-          // LLM catalog exists (real hosts), where preflight runs and fails closed.
-        preflight = null;
-      }
-      if (preflight && preflight.ok === true) {
-        resolvedSpec = preflight.spec ?? resolvedSpec;
-      } else if (preflight && preflight.ok === false) {
-        const blockers = Array.isArray(preflight.blockers) ? preflight.blockers : [];
-        const hard = blockers.filter((/** @type {any} */ b) => !/CHECK_UNAVAILABLE$/.test(b?.code ?? '') && !/MODEL_(CATALOG|PROVIDER_LIST|LIST|RESOLUTION)/.test(b?.code ?? ''));
-        if (hard.length > 0) {
-          return {
-            stopped: true,
-            result: {
-              outcome: 'repair_preflight_failed', taskId, changeId: change.id,
-              workerProfile: profile,
-              reason: hard.map((/** @type {any} */ b) => b?.code ?? b?.message ?? String(b)).join(', '),
-            },
-          };
-        }
-        // Only "host lacks a checker/catalog" soft blockers: keep the spec.
-      }
-    }
-    // A declared restricted workspace policy (non-`any`) has roots that must be
-    // verified before dispatch; when the authoritative preflight did not run
-    // (unavailable/soft-skipped), fail closed rather than bypass a restriction.
-    const policy = resolvedSpec?.workspacePolicy ?? { type: 'any' };
-    if (policy.type !== 'any' && typeof task.workspace !== 'string') {
+    // H11-REPAIR-PREFLIGHT-FAILOPEN: the authoritative worker preflight is a
+    // mandatory trust-boundary check. Missing, throwing, malformed, or false
+    // preflight results all fail closed before claim/launch; checker-unavailable
+    // is not silently converted into permission to dispatch.
+    if (typeof t.preflightWorker !== 'function') {
       return {
         stopped: true,
-        result: { outcome: 'repair_profile_unavailable', taskId, changeId: change.id, workerProfile: profile, reason: 'task workspace required by worker policy' },
+        result: {
+          outcome: 'repair_preflight_unavailable', taskId, changeId: change.id,
+          workerProfile: profile, reason: 'worker preflight is unavailable',
+        },
+      };
+    }
+    let preflight;
+    try {
+      preflight = await Promise.resolve(t.preflightWorker({
+        worker_profile: profile,
+        worker_model: task.worker_model,
+        workspace: task.workspace,
+      }));
+    } catch (error) {
+      return {
+        stopped: true,
+        result: {
+          outcome: 'repair_preflight_failed', taskId, changeId: change.id,
+          workerProfile: profile,
+          reason: error instanceof Error ? error.message : String(error),
+        },
+      };
+    }
+    if (!preflight || preflight.ok !== true) {
+      const blockers = Array.isArray(preflight?.blockers) ? preflight.blockers : [];
+      return {
+        stopped: true,
+        result: {
+          outcome: 'repair_preflight_failed', taskId, changeId: change.id,
+          workerProfile: profile,
+          reason: blockers.map((/** @type {any} */ b) => b?.code ?? b?.message ?? String(b)).join(', ') || 'worker preflight did not pass',
+        },
+      };
+    }
+    if (preflight.spec !== undefined && (!preflight.spec || typeof preflight.spec !== 'object' || Array.isArray(preflight.spec))) {
+      return {
+        stopped: true,
+        result: {
+          outcome: 'repair_preflight_failed', taskId, changeId: change.id,
+          workerProfile: profile, reason: 'worker preflight returned an invalid spec',
+        },
+      };
+    }
+    if (preflight.spec) resolvedSpec = preflight.spec;
+    if (!resolvedSpec || resolvedSpec.enabled === false || resolvedSpec.name !== profile) {
+      return {
+        stopped: true,
+        result: {
+          outcome: 'repair_preflight_failed', taskId, changeId: change.id,
+          workerProfile: profile, reason: 'worker preflight spec does not match the task profile',
+        },
+      };
+    }
+    // A headless worker has no session identity for the governed completion
+    // contract. Reject it before the claim even when a preflight override tries
+    // to select one.
+    if (resolvedSpec.mode === 'headless-profile') {
+      return {
+        stopped: true,
+        result: {
+          outcome: 'repair_profile_unavailable', taskId, changeId: change.id,
+          workerProfile: profile,
+          reason: 'headless-profile repair lacks a durable bound-session identity',
+        },
       };
     }
     workerLauncher = t.createWorkerLauncher({});
@@ -1993,6 +2035,7 @@ async function routeRepairAttempt({ t, c, api, taskId, change, options }) {
   handle._governedHold?.();
   let settle;
   let submitError = null;
+  let repairProofForRecovery = null;
   try {
     // H11-REPAIR-CLAIM-LIVENESS: enforce the resolved profile's timeout (not
     // an unbounded wait) and renew the claim lease while the worker runs, so
@@ -2006,20 +2049,34 @@ async function routeRepairAttempt({ t, c, api, taskId, change, options }) {
       }, intervalMs);
       renewTimer.unref?.();
     }
+    let timeoutTimer = null;
     try {
       const waitPromise = Promise.resolve(handle.wait?.());
       if (timeoutMs && Number.isFinite(timeoutMs) && timeoutMs > 0) {
         const timeoutPromise = new Promise((_, reject) => {
-          const timer = setTimeout(() => {
+          timeoutTimer = setTimeout(() => {
             reject(Object.assign(new Error(`repair worker timed out after ${timeoutMs}ms`), { code: 'REPAIR_TIMEOUT' }));
           }, timeoutMs);
-          timer.unref?.();
+          timeoutTimer.unref?.();
         });
         settle = await Promise.race([waitPromise, timeoutPromise]);
       } else {
         settle = await waitPromise;
       }
+    } catch (/** @type {any} */ error) {
+      // A timeout or launcher wait failure is an ordinary failed repair, not an
+      // uncaught controller rejection. Terminate first so the binding wrapper
+      // unbinds the session, then the common failure path releases the claim.
+      if (error?.code === 'REPAIR_TIMEOUT') {
+        try { await handle.terminate?.('SIGTERM'); } catch { /* release below */ }
+      }
+      settle = {
+        exitCode: null,
+        signal: error?.code === 'REPAIR_TIMEOUT' ? 'SIGTERM' : null,
+        error: error instanceof Error ? error.message : String(error),
+      };
     } finally {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
       if (renewTimer) clearInterval(renewTimer);
     }
     if (settle && settle.exitCode === 0 && !settle.error) {
@@ -2027,7 +2084,7 @@ async function routeRepairAttempt({ t, c, api, taskId, change, options }) {
         // The repair proof is caller-supplied on the host-driven path, or the
         // worker's surfaced structured completion envelope on the autonomous
         // path (handle.wait() returns the canonical tool/result.meta fields).
-        const repairProof = options.repairProof ?? {
+        repairProofForRecovery = options.repairProof ?? {
           beforeRevision: settle.beforeRevision ?? revision,
           afterRevision: settle.afterRevision ?? settle.commit_sha,
           commit_sha: settle.commit_sha,
@@ -2047,10 +2104,10 @@ async function routeRepairAttempt({ t, c, api, taskId, change, options }) {
         if (typeof handle.sessionId !== 'string' || handle.sessionId === '') {
           throw Object.assign(new Error('repair worker completed without a bound session identity'), { code: 'SESSION_ID_MISSING' });
         }
-        await c.submitRepair(change.id, { findings: claims, proof: repairProof }, { workerId: runId });
+        await c.submitRepair(change.id, { findings: claims, proof: repairProofForRecovery }, { workerId: runId });
         // Governed completion converges the task side (PREFLIGHT idempotent
         // fast path: the stored repair proof matches this payload).
-        await api.completeGovernedTask(taskId, { sessionId: handle.sessionId, worker: runId, proof: repairProof });
+        await api.completeGovernedTask(taskId, { sessionId: handle.sessionId, worker: runId, proof: repairProofForRecovery });
       } catch (/** @type {any} */ error) {
         submitError = error;
       }
@@ -2059,9 +2116,59 @@ async function routeRepairAttempt({ t, c, api, taskId, change, options }) {
     await handle._governedRelease?.();
   }
   if (submitError !== null) {
-    // A failed submission/leave would strand the task running under our
-    // claim: release it so a re-invocation can re-claim (resumable), then
-    // surface the domain error.
+    // Change Control and Task Orchestrator are separate durable stores. If the
+    // repair proof reached PREFLIGHT before governed task completion failed,
+    // do not release the task to ready (which would strand PREFLIGHT outside
+    // the normal recovery path). Reconcile the task into in_review so the
+    // controller can continue from the persisted proof. Acceptance-criteria
+    // drift is not safely replayable, so fail that task closed instead.
+    let afterSubmit = null;
+    try { afterSubmit = repairProofForRecovery ? await c.status(change.id) : null; } catch { afterSubmit = null; }
+    if (afterSubmit?.state === 'PREFLIGHT' && repairProofForRecovery) {
+      const currentTask = await Promise.resolve(t.get(taskId));
+      if (currentTask?.status === 'in_review') return { stopped: false };
+      if (currentTask && (currentTask.status === 'claimed' || currentTask.status === 'running') && currentTask.claimed_by === runId) {
+        const expected = {
+          status: currentTask.status,
+          claimed_by: runId,
+          lease_expires_at: currentTask.lease_expires_at,
+        };
+        if (submitError?.code === 'CRITERIA_MISMATCH') {
+          const failed = t.updateIf(taskId, expected, {
+            status: 'failed',
+            result_summary: 'repair completion rejected after acceptance criteria changed',
+          });
+          if (failed) {
+            await Promise.resolve(c.appendAudit({
+              kind: 'review_orchestration', changeId: change.id,
+              action: 'repair_partial_failed_closed', detail: submitError.message,
+            })).catch(() => {});
+            return {
+              stopped: true,
+              result: { outcome: 'repair_failed', taskId, changeId: change.id, code: submitError.code, detail: submitError.message },
+            };
+          }
+        } else {
+          const recovered = t.updateIf(taskId, expected, {
+            status: 'in_review',
+            commit_sha: repairProofForRecovery.commit_sha,
+            files_changed: repairProofForRecovery.files_changed,
+            tests_run: repairProofForRecovery.tests_run,
+            remaining_blockers: repairProofForRecovery.remaining_blockers,
+            result_summary: repairProofForRecovery.summary ?? 'repair proof recovered for review',
+          });
+          if (recovered) {
+            await Promise.resolve(c.appendAudit({
+              kind: 'review_orchestration', changeId: change.id,
+              action: 'repair_partial_recovered', detail: submitError.message,
+            })).catch(() => {});
+            return { stopped: false };
+          }
+        }
+      }
+    }
+    // A failed submission/leave before Change-side persistence: release the
+    // claim so a later event or restart can re-claim the REPAIR stage.
     await Promise.resolve(t.release(taskId, runId, { actor: 'sdlc-controller' })).catch(() => {});
     throw submitError;
   }

@@ -19,10 +19,12 @@ export function apply(ctx, config = {}) {
     maxAttemptsDefault: config.maxAttemptsDefault,
   })
   const workerRegistry = new WorkerSpecRegistry(config.workerSpecs ?? {})
+  const preflightDefaults = config.preflightOptions ?? {}
   const preflight = (request = {}, options = {}) => preflightWorker(workerRegistry, request, {
+    ...preflightDefaults,
     ...options,
-    llm: options.llm ?? ctx.llm,
-    workspaceRoots: options.workspaceRoots ?? config.workspaceRoots,
+    llm: options.llm ?? preflightDefaults.llm ?? ctx.llm,
+    workspaceRoots: options.workspaceRoots ?? preflightDefaults.workspaceRoots ?? config.workspaceRoots,
   })
   const api = Object.freeze({
     version: 2,

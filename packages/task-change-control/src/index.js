@@ -144,64 +144,172 @@ export default {
         if (payload && typeof payload.changeId === 'string') converge(payload.changeId);
       });
 
-      // Startup/restart recovery. SNAPSHOT every candidate task ID first (a
-      // stable collection before any mutation), then CAS-reconcile each
-      // against its authoritative linked Change state — so a converging
-      // mutation can never skip or double-process a batch. Per-task failure is
-      // isolated (cannot strand or duplicate: t.claim/updateIf are the single
-      // writers).
+      // Startup/restart recovery. Snapshot every relevant task ID before any
+      // recovery mutation. This is intentionally one stable candidate set:
+      // paging a result set while the controller changes its rows would skip
+      // tasks after the first page. Each candidate is then re-read and CAS
+      // reconciled against the authoritative Change state.
       const pageSize = 100;
-      /** @param {object} opts taskOrchestrator list options (statuses|in_review|expired_claims) */
+      const recoveryTimers = new Map();
+      /** @param {object} opts taskOrchestrator list options */
       const collectIds = async (opts) => {
-        const ids = /** @type {string[]} */ ([]);
+        const ids = new Set();
         for (let offset = 0; ; offset += pageSize) {
           let page = [];
-          try { page = (await orch.list({ ...opts, limit: pageSize, offset })) ?? []; } catch { break; }
-          for (const task of page) ids.push(task.id);
+          try { page = (await Promise.resolve(orch.list({ ...opts, limit: pageSize, offset }))) ?? []; } catch { break; }
+          for (const task of page) if (typeof task?.id === 'string') ids.add(task.id);
           if (page.length < pageSize) break;
         }
-        return ids;
+        return [...ids];
       };
-      // Fire-and-forget recovery; the fiber's teardown only unsubscribes the listener.
-      (async () => {
-        // 1. in_review → ONLY Change APPROVED (PASS) or REPAIR (FAIL) persisted.
-        const inReview = await collectIds({ in_review: true });
-        for (const id of inReview) {
-          const all = await cc.listByWorkItem(WORK_ITEM_SYSTEM, id).catch(() => []);
-          const change = (Array.isArray(all) ? all : []).at(-1);
-          if (change && (change.state === 'APPROVED' || change.state === 'REPAIR')) await resumeTask(id);
-        }
-        // 2. FAIL settled to changes_requested / prepared to ready → ONLY Change REPAIR.
-        const repairStage = await collectIds({ statuses: ['changes_requested', 'ready'] });
-        for (const id of repairStage) {
-          const all = await cc.listByWorkItem(WORK_ITEM_SYSTEM, id).catch(() => []);
-          const change = (Array.isArray(all) ? all : []).at(-1);
-          if (change && change.state === 'REPAIR') await resumeTask(id);
-        }
-        // 3. Expired repair claims (claimed/running whose lease has lapsed) →
-        //    ONLY Change REPAIR: CAS-reset to ready so the controller re-claims,
-        //    never re-runs a dead lease. A live repair renews its lease (see
-        //    routeRepairAttempt), so only a crashed/abandoned attempt's lease
-        //    lapses and is reconciled here; active leases are left untouched.
-        const claimTasks = await collectIds({ expired_claims: true });
-        for (const id of claimTasks) {
-          const all = await cc.listByWorkItem(WORK_ITEM_SYSTEM, id).catch(() => []);
-          const change = (Array.isArray(all) ? all : []).at(-1);
-          if (change && change.state === 'REPAIR') {
-            const claimed = await orch.get(id).catch(() => null);
-            if (claimed && (claimed.status === 'claimed' || claimed.status === 'running')) {
-              // Only release OUR observed expired lease (CAS on claimed_by+status+lease).
-              try {
-                orch.updateIf(id, { status: claimed.status, claimed_by: claimed.claimed_by, lease_expires_at: claimed.lease_expires_at }, { status: 'ready' });
-              } catch { /* still-owned by a live owner → leave untouched */ }
-            }
-            await resumeTask(id);
+      /** @param {string} id @returns {Promise<any>} */
+      const taskFor = (id) => {
+        try { return Promise.resolve(orch.get(id)); } catch (error) { return Promise.reject(error); }
+      };
+      /** @param {string} id @returns {Promise<any|null>} */
+      const latestChangeFor = async (id) => {
+        try {
+          const all = await Promise.resolve(cc.listByWorkItem(WORK_ITEM_SYSTEM, id));
+          return (Array.isArray(all) ? all : []).at(-1) ?? null;
+        } catch { return null; }
+      };
+      /** @param {string} changeId @param {string} action @param {string} detail */
+      const auditRecovery = async (changeId, action, detail) => {
+        try {
+          await Promise.resolve(cc.appendAudit({ kind: 'review_orchestration', changeId, action, detail }));
+        } catch { /* recovery evidence is best-effort, state writes remain CAS */ }
+      };
+      /** @param {any} task */
+      const releaseExpired = (task) => {
+        if (!task || (task.status !== 'claimed' && task.status !== 'running')) return false;
+        if (Number(task.lease_expires_at ?? 0) > Date.now()) return false;
+        try {
+          const released = orch.updateIf(
+            task.id,
+            { status: task.status, claimed_by: task.claimed_by, lease_expires_at: task.lease_expires_at },
+            { status: 'ready' },
+          );
+          return Boolean(released);
+        } catch { return false; }
+      };
+      /** @param {any} task @param {string} changeId */
+      const scheduleLeaseRecovery = (task, changeId) => {
+        if (!task || (task.status !== 'claimed' && task.status !== 'running')) return;
+        if (recoveryTimers.has(task.id)) return;
+        const expiresAt = Number(task.lease_expires_at);
+        const delay = Number.isFinite(expiresAt) ? Math.max(0, expiresAt - Date.now() + 1) : 0;
+        const timer = /** @type {any} */ (setTimeout(async () => {
+          recoveryTimers.delete(task.id);
+          let current;
+          try { current = await taskFor(task.id); } catch { return; }
+          if (!current || (current.status !== 'claimed' && current.status !== 'running')) return;
+          if (Number(current.lease_expires_at ?? 0) > Date.now()) {
+            scheduleLeaseRecovery(current, changeId);
+            return;
           }
+          releaseExpired(current);
+          try { await reconcileCandidate(task.id); } catch { /* next wake or restart retries */ }
+        }, delay));
+        timer.unref?.();
+        recoveryTimers.set(task.id, timer);
+      };
+      /** @param {any} task @param {any} change @param {any} status */
+      const recoverPartialRepair = async (task, change, status) => {
+        const proof = status?.proof;
+        const patch = proof && typeof proof === 'object'
+          ? {
+              status: 'in_review',
+              commit_sha: proof.commit_sha,
+              files_changed: Array.isArray(proof.files_changed) ? proof.files_changed : [],
+              tests_run: Array.isArray(proof.tests_run) ? proof.tests_run : [],
+              remaining_blockers: Array.isArray(proof.remaining_blockers) ? proof.remaining_blockers : [],
+              result_summary: proof.summary ?? 'recovered repair proof for review',
+            }
+          : null;
+        if (task.status === 'in_review') {
+          await resumeTask(task.id);
+          return;
+        }
+        if (task.status === 'claimed' || task.status === 'running') {
+          if (Number(task.lease_expires_at ?? 0) > Date.now()) {
+            scheduleLeaseRecovery(task, change.id);
+            return;
+          }
+          if (patch) {
+            try {
+              const recovered = orch.updateIf(task.id, {
+                status: task.status,
+                claimed_by: task.claimed_by,
+                lease_expires_at: task.lease_expires_at,
+              }, patch);
+              if (recovered) {
+                await auditRecovery(change.id, 'repair_partial_recovered', 'recovered persisted repair proof after task-side crash');
+                await resumeTask(task.id);
+                return;
+              }
+            } catch { /* fall through to an explicit failed-closed audit */ }
+          }
+        }
+        if (task.status === 'ready' || task.status === 'claimed' || task.status === 'running') {
+          // A legacy partial commit may already have been released to ready.
+          // There is no legal ready→in_review transition without a task claim;
+          // fail it closed rather than silently reusing a proof against an
+          // unknown task-side lease/criteria snapshot.
+          try {
+            const failed = orch.updateIf(task.id, { status: task.status }, {
+              status: 'failed',
+              result_summary: 'repair proof persisted but governed task completion was not recoverable',
+            });
+            if (failed) await auditRecovery(change.id, 'repair_partial_failed_closed', 'persisted PREFLIGHT repair proof had no safe task-side recovery');
+          } catch { await auditRecovery(change.id, 'repair_partial_recovery_failed', 'task-side recovery mutation was rejected'); }
+        }
+      };
+      /** @param {string} id */
+      async function reconcileCandidate(id) {
+        /** @type {any} */
+        let task;
+        try { task = await taskFor(id); } catch { return; }
+        if (!task) return;
+        const change = await latestChangeFor(id);
+        if (!change) return;
+        if (change.state === 'APPROVED') {
+          if (task.status === 'in_review') await resumeTask(id);
+          return;
+        }
+        if (change.state === 'REPAIR') {
+          if (task.status === 'claimed' || task.status === 'running') {
+            if (Number(task.lease_expires_at ?? 0) <= Date.now()) {
+              releaseExpired(task);
+              task = await taskFor(id).catch(() => task);
+            } else {
+              scheduleLeaseRecovery(task, change.id);
+              return;
+            }
+          }
+          if (task.status === 'in_review' || task.status === 'changes_requested' || task.status === 'ready') await resumeTask(id);
+          return;
+        }
+        if (change.state === 'PREFLIGHT') {
+          let status = null;
+          try { status = await Promise.resolve(cc.status(change.id)); } catch { return; }
+          const attempts = Array.isArray(status?.attempts) ? status.attempts : [];
+          if (attempts.at(-1)?.status === 'repair_submitted') await recoverPartialRepair(task, change, status);
+        }
+      }
+
+      // Fire-and-forget recovery; every candidate is isolated so one malformed
+      // task or synchronous facade error cannot abort the remaining scan.
+      (async () => {
+        const candidateIds = await collectIds({ statuses: ['in_review', 'changes_requested', 'ready', 'claimed', 'running'] });
+        for (const id of candidateIds) {
+          try { await reconcileCandidate(id); } catch { /* next candidate owns its retry */ }
         }
       })();
 
       return () => {
         if (typeof disposed === 'function') disposed();
+        for (const timer of recoveryTimers.values()) clearTimeout(timer);
+        recoveryTimers.clear();
       };
     });
   },
