@@ -289,6 +289,14 @@ export default {
           if (task.status === 'in_review' || task.status === 'changes_requested' || task.status === 'ready') await resumeTask(id);
           return;
         }
+        if (change.state === 'REVIEW') {
+          // T-H12 round-5 (F1): an unsettled review across a controller
+          // restart must resume — re-reading durable state reattaches turn
+          // observation to the round's persisted session (never completing
+          // the round from binding alone).
+          if (task.status === 'in_review') await resumeTask(id);
+          return;
+        }
         if (change.state === 'PREFLIGHT') {
           let status = null;
           try { status = await Promise.resolve(cc.status(change.id)); } catch { return; }
@@ -308,6 +316,9 @@ export default {
 
       return () => {
         if (typeof disposed === 'function') disposed();
+        // T-H12 round-5 (F1): a disposing controller stops recovering the
+        // reviewer turns it observed — the fresh (restarted) host owns them.
+        try { service.stopReviewerObservation?.(); } catch { /* best-effort */ }
         for (const timer of recoveryTimers.values()) clearTimeout(timer);
         recoveryTimers.clear();
       };

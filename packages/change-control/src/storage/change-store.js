@@ -270,6 +270,39 @@ function deepFreeze(value) {
   return value;
 }
 
+/**
+ * T-H12 round-4 — review-settlement guard registry (mirrors the in-memory
+ * governance-provider WeakMap pattern in ../service/governance-provider.js).
+ *
+ * The governed task↔change integration installs ONE guard per store. The
+ * guard decides, from the durable review-round record, whether the submitting
+ * session is entitled to settle the Change's CURRENT revision — a prior
+ * round's still-bound reviewer session never settles a new revision.
+ * Standalone (non-governed) Change Control never registers a guard, so its
+ * submitReview behavior is byte-identical to before.
+ *
+ * @type {WeakMap<object, (args: { changeId: string, sessionId: string }) => Promise<void>>}
+ */
+const reviewSettlementGuards = new WeakMap();
+
+/**
+ * @param {object} store a ChangeStore instance
+ * @param {(args: { changeId: string, sessionId: string }) => Promise<void>} guard
+ *   throws (e.g. STALE_ROUND_SESSION) to reject the settlement BEFORE any mutation
+ */
+export function registerReviewSettlementGuard(store, guard) {
+  if (!store || typeof guard !== 'function') {
+    throw Object.assign(new Error('a review settlement guard must be a function'), { code: 'INVALID_REVIEW_GUARD' });
+  }
+  reviewSettlementGuards.set(store, guard);
+  return { unregister: () => reviewSettlementGuards.delete(store) };
+}
+
+/** @param {object} store @returns {Function | null} */
+export function getReviewSettlementGuard(store) {
+  return reviewSettlementGuards.get(store) ?? null;
+}
+
 export class ChangeStore {
   #file;
   #changes;
@@ -2069,6 +2102,18 @@ export class ChangeStore {
    * Transitions change based on verdict AND blocking severity.
    */
   async submitReview(changeId, review, opts = {}) {
+    // T-H12 round-4: round-bound settlement. When the governed integration
+    // installed a settlement guard on this store, the durable current-round
+    // record decides whether THIS session may settle THIS revision — a prior
+    // round's still-bound reviewer can never approve/reject a new round.
+    // Runs BEFORE the store's (non-reentrant) write lock: the guard reads
+    // through the facade, and every later state/revision check inside the
+    // lock re-validates atomically, so a race can only fail closed. No guard
+    // (standalone use) keeps legacy role/revision checks as the complete gate.
+    const settlementGuard = getReviewSettlementGuard(this);
+    if (settlementGuard && typeof opts.sessionId === 'string' && opts.sessionId !== '') {
+      await settlementGuard({ changeId, sessionId: opts.sessionId });
+    }
     const release = await acquireLock(this.#file);
     try {
       await this.#refreshChange(changeId);

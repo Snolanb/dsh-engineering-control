@@ -27,7 +27,8 @@ import { ToolRuntime } from '@deepseek-ai/dsh-tools';
 import * as taskOrchestratorPlugin from 'dsh-task-orchestrator';
 import changeControlPlugin from 'dsh-change-control';
 import integrationPlugin from '../src/index.js';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { observeReviewerTurn } from '../src/service.js';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -37,6 +38,7 @@ const REVIEW_SETTLED_EVENT = 'change-control/review-settled';
 // createWorkerLauncher/createReviewerLauncher poll via globalThis.fetch).
 function createSessionRpc(proof) {
   const sessions = new Map();
+  const killed = new Set();
   let counter = 0;
   const createdSessionIds = [];
   const respond = (value) => ({
@@ -61,21 +63,64 @@ function createSessionRpc(proof) {
     const sessionId = body.payload?.sessionId;
     if (method === 'session.create') {
       const sid = `sess-${++counter}`;
-      sessions.set(sid, { historyCalls: 0 });
+      sessions.set(sid, { historyCalls: 0, preset: body.payload?.agentPreset ?? null, prompt: null, ended: null });
       createdSessionIds.push(sid);
       return respond({ sessionId: sid });
     }
-    if (method === 'session.selectModel' || method === 'session.prompt' || method === 'session.cancel') return respond({});
+    if (method === 'session.selectModel' || method === 'session.cancel') return respond({});
+    if (method === 'session.prompt') {
+      const s = sessions.get(sessionId);
+      if (s) s.prompt = body.payload?.content?.[0]?.text ?? '';
+      return respond({});
+    }
     if (method === 'session.history') {
+      // T-H12 round-5: a killed session's history RPC ERRORS — the existing-
+      // session waiter rejects, proving the turn dead fail-closed.
+      if (killed.has(sessionId)) {
+        return {
+          ok: false, status: 500,
+          json: async () => ({ result: { ok: false, error: { message: 'session unreachable', code: 'SESSION_UNKNOWN' } } }),
+        };
+      }
       const s = sessions.get(sessionId) ?? { historyCalls: 0 };
       s.historyCalls += 1;
       sessions.set(sessionId, s);
+      // T-H12 round-4 fixture fidelity: a reviewer turn stays LIVE (no
+      // terminal event) until the test ends it — the production observer
+      // treats only a resolved wait() as a dead turn.
+      if (s.preset === 'reviewer') {
+        const promptEvents = s.prompt
+          ? [{ seq: 1, type: 'user/message', data: { message: { content: [{ type: 'text', text: s.prompt }] } } }]
+          : [];
+        const terminal = s.ended ? [{ seq: 3, type: 'turn/end', data: { reason: s.ended } }] : [];
+        return respond({ events: [...promptEvents, ...terminal] });
+      }
       if (s.historyCalls === 1) return respond({ events: [] });
       return respond({ events: completedEvents() });
     }
     return respond({});
   };
-  return { fetchImpl, createdSessionIds };
+  return {
+    fetchImpl,
+    createdSessionIds,
+    // End a session's turn with the given turn/end reason kind.
+    endSession: (sessionId, reason = { kind: 'completed' }) => {
+      const s = sessions.get(sessionId);
+      if (s) s.ended = reason;
+    },
+    // T-H12 round-5: the host-side death of a session (gone/unreachable).
+    killSession: (sessionId) => {
+      sessions.delete(sessionId);
+      killed.add(sessionId);
+    },
+    // T-H12 round-5: another host's reviewer session (its turn already
+    // prompted) — the cross-process adoption target.
+    createExternalReviewer: (promptText) => {
+      const sid = `sess-ext-${++counter}`;
+      sessions.set(sid, { historyCalls: 0, preset: 'reviewer', prompt: promptText, ended: null });
+      return sid;
+    },
+  };
 }
 
 function workerProof() {
@@ -341,14 +386,19 @@ test('T-H11: duplicate FAIL wake-ups settle and route the repair exactly once', 
   assert.equal(status.openFindings.length, 1, 'no duplicated findings');
 });
 
-test('T-H11: reviewer session that exits without a structured review stays fail-closed', async (t) => {
+test('T-H11: reviewer session that exits without a structured review stays fail-closed and recovers exactly once', async (t) => {
   const c = await compose(t);
-  const { task, change, orch, cc } = await governedReviewPending(c);
+  const { task, change, orch, cc, reviewerSession } = await governedReviewPending(c);
 
   // The reviewer session terminates (deterministic host serves turn/end) but
-  // never calls change_submit_review. Wait long enough for any wake path that
-  // wrongly infers a verdict from process exit.
-  await new Promise((resolve) => setTimeout(resolve, 300));
+  // never calls change_submit_review. The production observer must keep the
+  // round fail-closed while recovering it with exactly one fresh request.
+  c.rpc.endSession(reviewerSession, { kind: 'error', error: { message: 'reviewer gone' } });
+  await waitFor(async () => {
+    const reviewers = (await cc.listRoleBindings())
+      .filter((b) => b.changeId === change.id && b.role === 'reviewer');
+    return reviewers.length === 1 && reviewers[0].sessionId !== reviewerSession;
+  }, 8000);
 
   assert.equal(orch.get(task.id).status, 'in_review', 'no PASS inferred from reviewer exit');
   assert.equal((await cc.get(change.id)).state, 'REVIEW');
@@ -356,6 +406,16 @@ test('T-H11: reviewer session that exits without a structured review stays fail-
   assert.ok(
     !history.some((e) => e.kind === 'review_orchestration' && e.action === 'review_pass_converged'),
     'no convergence audit without a structured review',
+  );
+  assert.equal(
+    history.filter((e) => e.kind === 'review_orchestration' && e.action === 'reviewer_turn_ended_no_verdict').length,
+    1,
+    'the dead turn is audited exactly once',
+  );
+  assert.equal(
+    history.filter((e) => e.kind === 'review_orchestration' && e.action === 'review_round_requested').length,
+    2,
+    'the dead round is re-requested exactly once, never a burst',
   );
 });
 
@@ -469,4 +529,197 @@ test('T-H11: restart recovers a persisted FAIL and resumes repair routing', asyn
   });
   const status = await restarted.cc.status(change.id);
   assert.equal(status.openFindings.length, 1, 'finding survives into recovery');
+});
+
+test('T-H12 round-5: controller restart reattaches reviewer-turn observation — live turn no churn, dead turn recovered exactly once', async (t) => {
+  const c = await compose(t);
+  const paths = { taskDbPath: c.taskDbPath, changesJsonPath: c.changesJsonPath };
+  const { task, change, reviewerSession } = await governedReviewPending(c);
+
+  // Simulate the original controller process crashing: its in-memory launch
+  // observer dies with it (a real restart leaves only the fresh host to
+  // reattach observation). stopReviewerObservation is the controller-teardown
+  // seam that neutralizes every observation the launching process owned.
+  c.ctx.get('taskChangeControl').stopReviewerObservation();
+
+  // Restart over the same durable files while the reviewer turn is LIVE.
+  // Startup reconciliation reattaches observation with ZERO churn: no new
+  // session, no duplicate request audit, no advancement (never infer PASS).
+  const restarted = await reopen(t, paths);
+  const sessionCount = c.rpc.createdSessionIds.length;
+  await new Promise((resolve) => setTimeout(resolve, 900));
+  assert.equal(c.rpc.createdSessionIds.length, sessionCount, 'no duplicate reviewer session after restart');
+  assert.equal(restarted.orch.get(task.id).status, 'in_review');
+  assert.equal((await restarted.cc.get(change.id)).state, 'REVIEW');
+  {
+    const history = await restarted.cc.history(change.id);
+    assert.equal(
+      history.filter((e) => e.kind === 'review_orchestration' && e.action === 'review_round_requested').length,
+      1, 'no duplicate explicit request audit after restart',
+    );
+  }
+
+  // The reviewer turn THEN dies without a verdict. The reattached production
+  // observation (host session history, not binding/liveness) recovers it
+  // fail-closed: expire only this round + exactly one fresh explicit request.
+  c.rpc.endSession(reviewerSession, { kind: 'error', error: { message: 'reviewer gone after restart' } });
+  await waitFor(async () => {
+    const reviewers = (await restarted.cc.listRoleBindings())
+      .filter((b) => b.changeId === change.id && b.role === 'reviewer');
+    return reviewers.length === 1 && reviewers[0].sessionId !== reviewerSession;
+  }, 15000);
+  assert.equal(restarted.orch.get(task.id).status, 'in_review', 'no PASS inferred from a dead turn');
+  const history = await restarted.cc.history(change.id);
+  assert.equal(
+    history.filter((e) => e.kind === 'review_orchestration' && e.action === 'reviewer_turn_ended_no_verdict').length,
+    1, 'the dead turn is audited exactly once',
+  );
+  assert.equal(
+    history.filter((e) => e.kind === 'review_orchestration' && e.action === 'review_round_requested').length,
+    2, 'initial request + exactly one recovery request',
+  );
+
+  // The recovered CURRENT round still settles normally with a real verdict.
+  const newReviewer = (await restarted.cc.listRoleBindings())
+    .filter((b) => b.changeId === change.id && b.role === 'reviewer')[0].sessionId;
+  const tool = restarted.ctx.tools.view().visible.get('change_submit_review');
+  const settle = await tool.execute(
+    { changeId: change.id, review: { verdict: 'pass', revision: 'abc123', findings: [] } },
+    { agent: { id: newReviewer } },
+  );
+  assert.equal(settle.state, 'APPROVED');
+  await waitFor(() => restarted.orch.get(task.id).status === 'done', 15000);
+  assert.equal((await restarted.cc.get(change.id)).state, 'APPROVED');
+});
+
+test('T-H12 round-5: cross-process adoption reattaches an existing-session observer; a rejected waiter expires only that round and recovers exactly once', async (t) => {
+  const c = await compose(t);
+  const { task, change, cc, orch, reviewerSession } = await governedReviewPending(c);
+
+  // Another host's reviewer launch for THIS round crashed AFTER its request
+  // was sent but BEFORE binding: the durable claim record (the cross-process
+  // surface) names its session and request identity.
+  const externalSession = c.rpc.createExternalReviewer('peer reviewer prompt [review-request req-cross]');
+  const claimFile = join(c.dir, '.dsh-governance', 'reviewer-claims', `reviewer-claim-${change.id}-abc123`);
+  writeFileSync(claimFile, JSON.stringify({
+    claimant: 'dead-host:1', sessionId: externalSession, requestId: 'req-cross',
+    sentAt: Date.now() - 11 * 60 * 1000, revision: 'abc123',
+    updatedAt: Date.now() - 2 * 10 * 60 * 1000,
+  }));
+
+  // This host's wake converges by ADOPTING the recorded sent session — no
+  // new launch, no re-prompt — and (round-5) reattaches observation to the
+  // real session lifecycle instead of treating the binding as completion.
+  const before = c.rpc.createdSessionIds.length;
+  const wake = await c.ctx.get('taskChangeControl').runGovernedSdlc(task.id, {});
+  assert.equal(wake.outcome, 'review_pending');
+  assert.equal(wake.sessionId, externalSession, 'the recorded sent session is adopted, not re-launched');
+  assert.equal(c.rpc.createdSessionIds.length, before, 'adoption never launches a reviewer');
+  const adopted = (await cc.listRoleBindings())
+    .filter((b) => b.changeId === change.id && b.role === 'reviewer');
+  assert.ok(adopted.some((b) => b.sessionId === externalSession), 'adopted session becomes the round reviewer');
+
+  // The adopted session becomes unreachable (host-side death): the reattached
+  // existing-session waiter REJECTS. That rejection is a dead turn — never
+  // swallowed into a permanent review_pending.
+  c.rpc.killSession(externalSession);
+  await waitFor(async () => {
+    const reviewers = (await cc.listRoleBindings())
+      .filter((b) => b.changeId === change.id && b.role === 'reviewer');
+    return reviewers.some((b) => b.sessionId !== externalSession && b.sessionId !== reviewerSession);
+  }, 15000);
+  assert.equal(orch.get(task.id).status, 'in_review');
+  assert.equal((await cc.get(change.id)).state, 'REVIEW', 'no PASS inferred from a rejected waiter');
+  const history = await cc.history(change.id);
+  const ended = history.filter((e) => e.kind === 'review_orchestration'
+    && e.action === 'reviewer_turn_ended_no_verdict' && e.sessionId === externalSession);
+  assert.equal(ended.length, 1, 'the rejected turn is audited exactly once');
+  assert.match(String(ended[0].error ?? ''), /unreachable/, 'the waiter rejection is the audited failure evidence');
+  assert.equal(c.rpc.createdSessionIds.length, before + 1, 'exactly one recovery launch — never a burst');
+
+  // The recovered current-round session settles the review for real.
+  const recovered = (await cc.listRoleBindings())
+    .filter((b) => b.changeId === change.id && b.role === 'reviewer')
+    .find((b) => b.sessionId !== externalSession && b.sessionId !== reviewerSession);
+  const tool = c.ctx.tools.view().visible.get('change_submit_review');
+  const settle = await tool.execute(
+    { changeId: change.id, review: { verdict: 'pass', revision: 'abc123', findings: [] } },
+    { agent: { id: recovered.sessionId } },
+  );
+  assert.equal(settle.state, 'APPROVED');
+  await waitFor(() => orch.get(task.id).status === 'done', 15000);
+  assert.equal((await cc.get(change.id)).state, 'APPROVED');
+});
+
+test('T-H12 round-6: mid-flight teardown after reviewer wait settles performs no post-stop recovery mutation', async (t) => {
+  // Deterministic reproduction of the R5-F1 race at the observation seam: the
+  // reviewer turn ends (wait() resolves) and recovery enters its awaited reads.
+  // Teardown (`stop`) fires while recovery is suspended at its first awaited
+  // read (`c.get`) — strictly after wait() settled, before any expire/unbind/
+  // audit/relaunch mutation. The stopped observer must then perform NO durable
+  // mutation: fail-closed, no PASS inferred, exactly-once recovery preserved.
+  const dir = mkdtempSync(join(tmpdir(), 'h11-r6-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const change = { id: 'c1' };
+  const task = { workspace: dir };
+  const revision = 'abc123';
+  const sessionId = 'sess-r1';
+
+  // A real durable claim record so a non-stopped recovery would genuinely
+  // expire + unbind + audit + relaunch — every mutation the stop suppresses.
+  mkdirSync(join(dir, '.dsh-governance', 'reviewer-claims'), { recursive: true });
+  const claimFile = join(dir, '.dsh-governance', 'reviewer-claims', `reviewer-claim-c1-${revision}`);
+  writeFileSync(claimFile, JSON.stringify({ claimant: 'host:1', sessionId, updatedAt: Date.now() }));
+
+  // Instrumented facade: count every mutation-relevant call; gate c.get so the
+  // recovery suspends deterministically at its first awaited read.
+  const calls = { get: 0, status: 0, unbind: 0, audit: 0 };
+  let resolveGet = null;
+  let markGetEntered = null;
+  const getEntered = new Promise((r) => { markGetEntered = r; });
+  const getGate = new Promise((r) => { resolveGet = r; });
+  const c = {
+    async get(id) {
+      if (id === change.id) {
+        calls.get += 1;
+        markGetEntered();
+        await getGate;                       // suspend recovery mid-read
+      }
+      return { id: change.id, state: 'REVIEW' };
+    },
+    async status() { calls.status += 1; return { revision }; },
+    async unbindRole() { calls.unbind += 1; },
+    async appendAudit() { calls.audit += 1; },
+  };
+  let relaunched = 0;
+  const rebuildReview = async () => { relaunched += 1; };
+
+  const handle = {
+    wait: () => new Promise((resolve) => { setTimeout(() => resolve({ exitCode: 1 }), 0); }),
+  };
+
+  const stop = observeReviewerTurn({ handle, c, change, task, revision, sessionId, rebuildReview });
+  assert.strictEqual(typeof stop, 'function', 'an observation stop is returned');
+
+  // wait() resolves; recovery enters c.get and suspends on the gate.
+  await getEntered;
+
+  // Teardown lands after wait() settled but before the first mutation.
+  stop();
+
+  // Release the suspended read and let any (now-illegal) recovery drain.
+  resolveGet();
+  await new Promise((resolve) => setTimeout(resolve, 200));
+
+  assert.equal(calls.get, 1, 'the recovery read once and nothing more after stop');
+  assert.equal(calls.status, 0, 'no status read (no revision/expire path) after stop');
+  assert.equal(calls.unbind, 0, 'no binding removal after stop');
+  assert.equal(calls.audit, 0, 'no dead-turn audit after stop');
+  assert.equal(relaunched, 0, 'no reviewer relaunch after stop');
+
+  // The durable claim is untouched: the round is not expired, so a later wake
+  // can still recover exactly once through the normal (non-stopped) path.
+  const claim = JSON.parse(readFileSync(claimFile, 'utf8'));
+  assert.equal(claim.sessionId, sessionId, 'round claim not expired/cleared after stop');
 });

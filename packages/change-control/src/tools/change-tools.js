@@ -1,7 +1,7 @@
 // @ts-nocheck
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import { ChangeService, AuthorizationError } from '../change-control.js';
-import { ChangeStore } from '../storage/change-store.js';
+import { ChangeStore, registerReviewSettlementGuard } from '../storage/change-store.js';
 import { createChangeControlService } from '../service/change-control-service.js';
 import { TRANSITIONS, ChangeDomainError, RISK_LEVELS } from '../domain/change.js';
 
@@ -251,6 +251,20 @@ export async function registerChangeTools(ctx, config) {
   // external packages integrate via ctx.changeControl only.
   const service = createChangeControlService(store);
   ctx.provide('changeControl', service);
+  // T-H12 round-4: when the governed task↔change integration provides a
+  // review-settlement guard (durable current-round session check), install it
+  // on THIS store for that service's lifetime — applying to every submitReview
+  // surface (model tool, host command, controller). Standalone compositions
+  // never register one, so their submitReview semantics are unchanged. The
+  // inject fiber re-runs/disposes with the taskChangeControl service itself.
+  if (ctx && typeof ctx.inject === 'function') {
+    ctx.inject(['taskChangeControl'], (c) => {
+      const tcc = c.get('taskChangeControl');
+      if (!tcc || typeof tcc.reviewSettlementGuard !== 'function') return undefined;
+      const { unregister } = registerReviewSettlementGuard(store, (args) => tcc.reviewSettlementGuard(args));
+      return () => unregister();
+    });
+  }
   const tools = createChangeTools(service, ctx);
   const registry = ctx.tools;
   if (!registry?.register) throw new Error('tools.register not available');
