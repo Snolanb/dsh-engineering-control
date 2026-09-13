@@ -12,6 +12,7 @@ import { validatePairing } from './lifecycle.js';
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
+import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 
 /** The task-orchestrator identity on the Change-side workItem. */
@@ -831,16 +832,24 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         const sessionId = await withReviewerReservation(`${change.id}:${revision}`, async () => {
           return reserveReviewerLaunch({
             c, change, task, revision, round,
-            launch: async ({ file, identity }) => {
+            launch: async ({ file, identity, requestId }) => {
               let launched;
               try {
                 launched = await launchReviewerForTask(requireTask, requireChange, requireTaskId, taskId, {
                   revision,
+                  requestId,
                   // Durable record of the launched session before the binding —
                   // the crash-recovery (adopt) record for a successor claim.
-                  // Carries the full T-H12 round attribution.
+                  // Carries the full T-H12 round attribution; sentAt +
+                  // requestId atomically mark THIS request as sent (T-H12
+                  // round-3): a restart seeing this record adopts the session
+                  // and never re-sends the request.
                   recordSession: async (launchSessionId) => {
-                    await writeClaimRecord(file, { claimant: identity, sessionId: launchSessionId, ...round, updatedAt: Date.now() });
+                    await writeClaimRecord(file, {
+                      claimant: identity, sessionId: launchSessionId,
+                      requestId: requestId ?? null, sentAt: Date.now(),
+                      ...round, updatedAt: Date.now(),
+                    });
                   },
                   discardSession: async () => {
                     // Our launch is dead (terminated on failure): expire the
@@ -862,11 +871,14 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
                 throw error;
               }
               // T-H12: durable audit of this round's ONE explicit reviewer
-              // request (launch = the single production prompt).
+              // request (launch = the single production prompt), carrying
+              // the same durable request identity the claim record persisted
+              // before the send (T-H12 round-3).
               await c.appendAudit({
                 kind: 'review_orchestration', changeId: change.id,
                 action: 'review_round_requested',
                 sessionId: launched.sessionId, revision,
+                ...(requestId ? { requestId } : {}),
                 ...(round.attemptId !== null ? { attemptId: round.attemptId } : {}),
                 ...(round.proofCommit !== null ? { proofCommit: round.proofCommit } : {}),
                 findingIds: round.findingIds,
@@ -947,6 +959,26 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
           const latestRevision = status?.revision ?? null;
           if (latestRevision === null) {
             throw Object.assign(new Error('no revision recorded yet'), { code: 'STALE_REVISION' });
+          }
+          // T-H12 round-3: settlement is bound to the CURRENT round — the
+          // verdict must come from the reviewer session named by the durable
+          // round record for the Change's current revision. Any other session
+          // (e.g. a prior round's still-bound reviewer) can never settle this
+          // round. When no round record exists (a reviewer bound outside the
+          // governed round flow) the legacy binding checks above stand alone.
+          const roundReviewer = await roundReviewerSession(c, change, task);
+          if (roundReviewer && options.sessionId !== roundReviewer.sessionId) {
+            await c.appendAudit({
+              kind: 'review_orchestration', changeId: change.id,
+              action: 'review_outcome_wrong_round_session',
+              sessionId: options.sessionId,
+              expectedSessionId: roundReviewer.sessionId,
+              revision: latestRevision,
+            });
+            throw Object.assign(
+              new Error(`session ${options.sessionId} is not the current review round's reviewer`),
+              { code: 'STALE_ROUND_SESSION' },
+            );
           }
         }
 
@@ -1061,6 +1093,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
      * @param {{ maxRepairRounds?: number,
      *   controllerPreflightOverride?: string[],
      *   verdict?: { verdict: 'pass'|'fail', findings?: object[], sessionId?: string },
+     *   reviewerTurn?: (sessionId: string) => ('alive'|'exited'|'failed'|Promise<'alive'|'exited'|'failed'>),
      *   worker?: string,
      *   workerLauncher?: object,
      *   repairProof?: object,
@@ -1174,6 +1207,27 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
               // durable round record satisfies this round — a prior round's
               // still-bound session never does.
               let reviewer = await roundReviewerSession(c, change, task);
+              // T-H12 round-3: a reviewer turn PROVEN ended (exit / prompt
+              // failure observed asynchronously) without settling this round
+              // never blocks it: expire ONLY this round's claim/binding
+              // (fail-closed — never infer a PASS), then fall through to the
+              // recoverable fresh-request path below. The live re-read keeps
+              // a concurrently-arriving verdict authoritative.
+              if (reviewer && typeof options.reviewerTurn === 'function') {
+                const turn = await Promise.resolve(options.reviewerTurn(reviewer.sessionId)).catch(() => null);
+                if (turn === 'exited' || turn === 'failed') {
+                  const liveAtCheck = await c.get(change.id);
+                  if (liveAtCheck.state === 'REVIEW'
+                    && await expireReviewerRound(c, change, task, reviewer.sessionId)) {
+                    await c.appendAudit({
+                      kind: 'review_orchestration', changeId: change.id,
+                      action: 'reviewer_turn_ended_no_verdict',
+                      sessionId: reviewer.sessionId, turn,
+                    });
+                    reviewer = null; // exactly one fresh explicit request below
+                  }
+                }
+              }
               if (!reviewer) {
                 // This round's request is missing (crash between transition
                 // and launch/bind, or the Change advanced to a new revision
@@ -1669,7 +1723,7 @@ function sleep(ms) {
  *   c: any, change: any, task: any,
  *   revision: string,
  *   round?: { revision: string, attemptId?: string|null, proofCommit?: string|null, findingIds?: string[] },
- *   launch: (holder: { file: string, identity: string }) => Promise<string>,
+ *   launch: (holder: { file: string, identity: string, requestId: string }) => Promise<string>,
  * }} deps
  * @returns {Promise<string>} the reviewer session id to use
  */
@@ -1750,6 +1804,7 @@ async function reserveReviewerLaunch({ c, change, task, revision, round, launch 
       await sleep(REVIEWER_CLAIM_POLL_MS);
     }
     let created = false;
+    let createdRequestId = null;
     let adopted;
     try {
       // Re-validate UNDER the lock: the claim may have changed since we read.
@@ -1760,14 +1815,22 @@ async function reserveReviewerLaunch({ c, change, task, revision, round, launch 
         ? Date.now() - Number(r.value.updatedAt || 0) > REVIEWER_CLAIM_LEASE_MS
         : false;
       if (r.value?.sessionId && typeof r.value.sessionId === 'string' && rStale) {
-        // A crashed owner recorded a session: reconcile it instead of launching.
+        // A crashed owner recorded a session (a SENT request): reconcile it
+        // instead of launching — sent requests are never duplicated (T-H12
+        // round-3). The send marker survives the owner: `{...record}` keeps
+        // requestId/sentAt so adopters see the same request identity.
         adopted = await adopt(r.value.sessionId, r.value.claimant);
       } else if (!(r.exists && !r.incomplete && !rStale)) {
         // Absent, stale-empty, or dead-incomplete: (re)create the claim in
-        // place with the round attribution (T-H12). Safe under the lock —
-        // we are the sole creator right now.
+        // place with the round attribution (T-H12) AND a fresh durable
+        // request identity persisted BEFORE the request is sent (T-H12
+        // round-3). A stale UNSENT record (requestId set, sentAt null) is
+        // recovered exactly once — this creation — never re-sent under the
+        // crashed owner's identity.
+        createdRequestId = randomUUID();
         await writeClaimRecord(file, {
-          claimant: identity, sessionId: null,
+          claimant: identity, sessionId: null, sentAt: null,
+          requestId: createdRequestId,
           revision: round?.revision ?? revision,
           attemptId: round?.attemptId ?? null,
           proofCommit: round?.proofCommit ?? null,
@@ -1782,7 +1845,7 @@ async function reserveReviewerLaunch({ c, change, task, revision, round, launch 
       await releaseReclaimLock(lockFile, identity);
     }
     if (adopted !== undefined) return adopted;
-    if (created) return await launch({ file, identity });
+    if (created) return await launch({ file, identity, requestId: createdRequestId });
     continue;
   }
 }
@@ -1833,6 +1896,39 @@ async function roundReviewerSession(c, change, task) {
   if (!sessionId) return null;
   const binding = await c.getBinding(change.id, sessionId).catch(() => null);
   return binding && binding.role === 'reviewer' ? { sessionId } : null;
+}
+
+/**
+ * T-H12 round-3 — atomically invalidate ONLY the current round's durable
+ * claim when its reviewer turn is proven ended without a verdict: the claim
+ * record (keyed Change+current revision) is rewritten in place with the
+ * session cleared and an already-expired timestamp, then that session's
+ * reviewer binding is removed. Other rounds' records/sessions are untouched,
+ * and nothing settles — the round stays fail-closed awaiting a fresh,
+ * recoverable explicit request.
+ * Returns true when this round's record was expired.
+ * @param {ChangeControlApi} c
+ * @param {any} change
+ * @param {any} task
+ * @param {string} sessionId
+ */
+async function expireReviewerRound(c, change, task, sessionId) {
+  const status = await c.status(change.id).catch(() => null);
+  const revision = status?.revision ?? null;
+  if (typeof revision !== 'string' || revision === '') return false;
+  const file = reviewerClaimFile(change, task, revision);
+  const { value: record } = await readClaimRecord(file);
+  if (!record || record.sessionId !== sessionId) return false;
+  // Atomic rewrite (tmp+rename): claim and its send marker cleared together,
+  // so a concurrent reader never sees a half-invalidated round.
+  await writeClaimRecord(file, {
+    ...record,
+    sessionId: null,
+    sentAt: null,
+    updatedAt: Date.now() - 2 * REVIEWER_CLAIM_LEASE_MS,
+  });
+  await c.unbindRole(change.id, sessionId, { actor: 'review-orchestration' }).catch(() => {});
+  return true;
 }
 
 /**
@@ -2307,6 +2403,7 @@ function buildRepairPrompt(taskId, changeId, revision, openFindings) {
  * @param {(taskId: any) => void} requireTaskId
  * @param {string} taskId
  * @param {{ spec?: object, launcherOptions?: object, revision?: string,
+ *   requestId?: string,
  *   recordSession?: (sessionId: string) => Promise<void>,
  *   discardSession?: () => Promise<void> }} [options]
  *
@@ -2352,7 +2449,14 @@ Review the governed Change ${change.id} against its Plan and project task accept
           })()
         : {}),
     };
-    const handle = await launcher.launch({ task, spec });
+    // T-H12 round-3: the durable request identity persisted before the send
+    // is handed to the launcher verbatim, so the sent request and its
+    // durable record share one identity across crash windows.
+    const launchInput = /** @type {any} */ ({ task, spec });
+    if (typeof options.requestId === 'string' && options.requestId !== '') {
+      launchInput.requestId = options.requestId;
+    }
+    const handle = await launcher.launch(launchInput);
     if (typeof handle?.sessionId !== 'string' || handle.sessionId === '') {
       if (typeof handle?.terminate === 'function') {
         try { await handle.terminate(); } catch { /* best-effort */ }

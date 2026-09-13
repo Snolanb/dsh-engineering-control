@@ -410,6 +410,191 @@ test('T-H12: failed reviewer prompt claim is recoverable without a lease wait', 
   assert.equal(requests[0].sessionId, 'sess-review-retry-2', 'request names the retry reviewer session');
 });
 
+test('T-H12 round-3: a prior round\'s reviewer session can never settle the current round', async (t) => {
+  const { ctx, taskStore, dir, reviewerLaunches } = await compose(t);
+  const { task, change } = await governedReadyTask(ctx, taskStore, dir);
+  await dispatchGovernedSuccess(ctx, taskStore, dir, change);
+
+  // Round A (revision a1, REVIEWER_SESSION) fails; the repair advances the
+  // Change to revision a2 with its OWN round-B reviewer session.
+  const r1 = await ctx.taskChangeControl.runGovernedSdlc(task.id, {
+    verdict: { verdict: 'fail', findings: [finding('p1')] },
+    worker: 'w-repair-rs', workerLauncher: repairLauncher('sess-repair-rs'),
+    repairProof: repairProof('a1', 'a2', 'c2'), maxRepairRounds: 2,
+  });
+  assert.equal(r1.outcome, 'review_pending');
+  assert.equal(reviewerLaunches(), 2, 'round B launched its own reviewer');
+
+  // Negative case 1 — the controller must REJECT a verdict naming round A's
+  // session: it cannot settle round B.
+  await assert.rejects(
+    ctx.taskChangeControl.runGovernedSdlc(task.id, {
+      verdict: { verdict: 'pass', sessionId: REVIEWER_SESSION },
+    }),
+    (error) => error?.code === 'STALE_ROUND_SESSION',
+    'round-A session must not settle round B',
+  );
+  // Direct settlement path rejects identically.
+  await assert.rejects(
+    ctx.taskChangeControl.applyReviewOutcome(task.id, { sessionId: REVIEWER_SESSION, verdict: 'pass' }),
+    (error) => error?.code === 'STALE_ROUND_SESSION',
+    'applyReviewOutcome rejects the stale round session',
+  );
+  // Nothing settled: Change stays in REVIEW, task stays in_review.
+  assert.equal((await ctx.changeControl.get(change.id)).state, 'REVIEW');
+  assert.equal((await taskStore.get(task.id)).status, 'in_review');
+  const audits = await ctx.changeControl.history(change.id);
+  assert.ok(audits.some((e) => e.kind === 'review_orchestration'
+    && e.action === 'review_outcome_wrong_round_session'
+    && e.sessionId === REVIEWER_SESSION),
+    'the rejected cross-round settlement is audited with the offending session');
+  assert.ok(!audits.some((e) => e.action === 'review_pass_approved'),
+    'no settlement was applied');
+
+  // The genuine round-B reviewer session settles.
+  const r2 = await ctx.taskChangeControl.runGovernedSdlc(task.id, {
+    verdict: { verdict: 'pass', sessionId: `${REVIEWER_SESSION}-2` },
+  });
+  assert.equal(r2.outcome, 'approved');
+  assert.equal((await ctx.changeControl.get(change.id)).state, 'APPROVED');
+  assert.equal((await taskStore.get(task.id)).status, 'done');
+});
+
+test('T-H12 round-3: proven reviewer exit/failure without a verdict expires only that round and issues exactly one fresh request (fail-closed)', async (t) => {
+  const dead = new Map(); // sessionId -> 'exited' | 'failed'
+  const { ctx, taskStore, dir, reviewerLaunches } = await compose(t);
+  const { task, change } = await governedReadyTask(ctx, taskStore, dir);
+  await dispatchGovernedSuccess(ctx, taskStore, dir, change);
+  const reviewerTurn = (sessionId) => dead.get(sessionId) ?? 'alive';
+
+  // (a) Asynchronous reviewer EXIT without a verdict: only round a1's
+  // claim/binding is invalidated; exactly one recoverable fresh request.
+  dead.set(REVIEWER_SESSION, 'exited');
+  const r1 = await ctx.taskChangeControl.runGovernedSdlc(task.id, { reviewerTurn });
+  assert.equal(r1.outcome, 'review_pending', 'a fresh round request was issued; no verdict is inferred');
+  assert.equal(r1.sessionId, `${REVIEWER_SESSION}-2`);
+  assert.equal(reviewerLaunches(), 2, 'exactly one fresh request for the exited round');
+  let reviewers = (await ctx.changeControl.listRoleBindings())
+    .filter((b) => b.changeId === change.id && b.role === 'reviewer');
+  assert.deepEqual(reviewers.map((b) => b.sessionId), [`${REVIEWER_SESSION}-2`],
+    'only the dead session\'s binding is invalidated — no leak of round A');
+  // Fail-closed: the Change never ADVANCES without a real verdict.
+  assert.equal((await ctx.changeControl.get(change.id)).state, 'REVIEW');
+  assert.equal((await taskStore.get(task.id)).status, 'in_review');
+
+  // (b) Asynchronous prompt/turn FAILURE (distinct from a clean exit): same
+  // recoverable path, again exactly once.
+  dead.set(`${REVIEWER_SESSION}-2`, 'failed');
+  const r2 = await ctx.taskChangeControl.runGovernedSdlc(task.id, { reviewerTurn });
+  assert.equal(r2.outcome, 'review_pending');
+  assert.equal(r2.sessionId, `${REVIEWER_SESSION}-3`);
+  assert.equal(reviewerLaunches(), 3, 'one fresh request per proven-dead turn, never a burst');
+
+  // (c) A live reviewer: no churn — no launch, no expiry audit.
+  const r3 = await ctx.taskChangeControl.runGovernedSdlc(task.id, { reviewerTurn });
+  assert.equal(r3.outcome, 'review_pending');
+  assert.equal(r3.sessionId, `${REVIEWER_SESSION}-3`);
+  assert.equal(reviewerLaunches(), 3, 'healthy reviewer is never re-requested');
+
+  const audits = await ctx.changeControl.history(change.id);
+  const ended = audits.filter((e) => e.kind === 'review_orchestration' && e.action === 'reviewer_turn_ended_no_verdict');
+  assert.deepEqual(ended.map((e) => e.turn), ['exited', 'failed'],
+    'both proven-dead turns are audited with their observed terminal state');
+  const requests = audits.filter((e) => e.kind === 'review_orchestration' && e.action === 'review_round_requested');
+  assert.equal(requests.length, 3, 'one explicit request per round turn — initial + two recoveries');
+  reviewers = (await ctx.changeControl.listRoleBindings())
+    .filter((b) => b.changeId === change.id && b.role === 'reviewer');
+  assert.deepEqual(reviewers.map((b) => b.sessionId), [`${REVIEWER_SESSION}-3`]);
+
+  // The recovered round still settles normally with a real verdict.
+  const r4 = await ctx.taskChangeControl.runGovernedSdlc(task.id, {
+    verdict: { verdict: 'pass' }, reviewerTurn,
+  });
+  assert.equal(r4.outcome, 'approved');
+  assert.equal((await taskStore.get(task.id)).status, 'done');
+});
+
+test('T-H12 round-3: crash before the request is sent recovers the unsent request exactly once', async (t) => {
+  const { ctx, taskStore, dir, reviewerLaunches } = await compose(t);
+  const { task, change } = await governedReadyTask(ctx, taskStore, dir);
+  await dispatchGovernedSuccess(ctx, taskStore, dir, change, { preflight: ['FAIL: build'] });
+  assert.equal((await ctx.changeControl.get(change.id)).state, 'PREFLIGHT');
+
+  // Crash window BEFORE request creation: the dead owner's durable record
+  // holds a request identity but was never sent (no session, no sentAt).
+  const file = reviewerClaimFileFor(task, change, 'a1');
+  await mkdir(dirname(file), { recursive: true });
+  await writeFile(file, JSON.stringify({
+    claimant: 'dead-host:1', requestId: 'req-unsent-1',
+    sessionId: null, sentAt: null, revision: 'a1',
+    updatedAt: Date.now() - 2 * 10 * 60 * 1000,
+  }));
+
+  const rv = await ctx.taskChangeControl.runGovernedReview(task.id, { controllerPreflightOverride: ['pass:build'] });
+  assert.equal(rv.outcome, 'review_started');
+  assert.equal(reviewerLaunches(), 1, 'the unsent request is recovered exactly once');
+
+  // The recovered request runs under a FRESH durable identity (the crashed
+  // owner's identity is never reused), atomically marked sent with the
+  // recorded session.
+  const record = JSON.parse(readFileSync(file, 'utf8'));
+  assert.equal(record.sessionId, REVIEWER_SESSION);
+  assert.equal(typeof record.sentAt, 'number', 'send is durably marked');
+  assert.equal(typeof record.requestId, 'string');
+  assert.notEqual(record.requestId, 'req-unsent-1', 'recovery mints a new request identity');
+
+  // Restart AFTER recovery (re-invocation): converge with zero new launches
+  // and zero duplicate request audits.
+  const rv2 = await ctx.taskChangeControl.runGovernedReview(task.id, { controllerPreflightOverride: ['pass:build'] });
+  assert.equal(rv2.sessionId, REVIEWER_SESSION);
+  assert.equal(reviewerLaunches(), 1, 'no duplicate request after recovery');
+  const requests = (await ctx.changeControl.history(change.id))
+    .filter((e) => e.kind === 'review_orchestration' && e.action === 'review_round_requested');
+  assert.equal(requests.length, 1, 'exactly one audited request for the recovered round');
+  assert.equal(requests[0].requestId, record.requestId, 'audit carries the durable request identity');
+});
+
+test('T-H12 round-3: crash after the request was sent suppresses duplicates — the recorded session is adopted, never re-requested', async (t) => {
+  const { ctx, taskStore, dir, reviewerLaunches } = await compose(t);
+  const { task, change } = await governedReadyTask(ctx, taskStore, dir);
+  await dispatchGovernedSuccess(ctx, taskStore, dir, change, { preflight: ['FAIL: build'] });
+  assert.equal((await ctx.changeControl.get(change.id)).state, 'PREFLIGHT');
+
+  // Crash window AFTER request creation: the dead owner's record marks the
+  // request SENT (session recorded + sentAt) before it bound.
+  const file = reviewerClaimFileFor(task, change, 'a1');
+  await mkdir(dirname(file), { recursive: true });
+  await writeFile(file, JSON.stringify({
+    claimant: 'dead-host:1', requestId: 'req-sent-1',
+    sessionId: 'sess-sent-unbound', sentAt: Date.now() - 11 * 60 * 1000,
+    revision: 'a1', updatedAt: Date.now() - 2 * 10 * 60 * 1000,
+  }));
+
+  const rv = await ctx.taskChangeControl.runGovernedReview(task.id, { controllerPreflightOverride: ['pass:build'] });
+  assert.equal(rv.outcome, 'review_started');
+  assert.equal(rv.sessionId, 'sess-sent-unbound', 'the recorded sent session is adopted');
+  assert.equal(reviewerLaunches(), 0, 'a sent request is never re-sent');
+  const reviewers = (await ctx.changeControl.listRoleBindings())
+    .filter((b) => b.changeId === change.id && b.role === 'reviewer');
+  assert.deepEqual(reviewers.map((b) => b.sessionId), ['sess-sent-unbound'],
+    'the adopted session becomes the round\'s reviewer binding');
+
+  // Restart again: the confirmed binding converges — still zero launches,
+  // and this host added NO duplicate request audit (the send belongs to the
+  // crashed owner; adoption is recorded separately).
+  const rv2 = await ctx.taskChangeControl.runGovernedReview(task.id, { controllerPreflightOverride: ['pass:build'] });
+  assert.equal(rv2.sessionId, 'sess-sent-unbound');
+  assert.equal(reviewerLaunches(), 0);
+  const audits = await ctx.changeControl.history(change.id);
+  assert.equal(
+    audits.filter((e) => e.kind === 'review_orchestration' && e.action === 'review_round_requested').length,
+    0,
+    'no duplicate explicit request is audited for an adopted sent request',
+  );
+  assert.ok(audits.some((e) => e.kind === 'review_orchestration' && e.action === 'reviewer_claim_adopted'
+    && e.sessionId === 'sess-sent-unbound'), 'the adoption (not a request) is what was audited');
+});
+
 test('T-H5: trigger degrades fail-soft when the reviewer launcher is unavailable (completion still converges)', async (t) => {
   const { ctx, taskStore, dir } = await compose(t, { withReviewerLauncher: false });
   const { task, change } = await governedReadyTask(ctx, taskStore, dir);
