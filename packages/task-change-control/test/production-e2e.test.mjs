@@ -47,6 +47,7 @@ function createSessionRpc() {
   let counter = 0;
   let proof = null;
   const createdSessionIds = [];
+  const promptLog = [];
   const respond = (value) => ({
     ok: true,
     status: 200,
@@ -77,24 +78,62 @@ function createSessionRpc() {
 
     if (method === 'session.create') {
       const sid = `sess-${++counter}`;
-      sessions.set(sid, { historyCalls: 0 });
+      sessions.set(sid, { historyCalls: 0, preset: payload.agentPreset ?? null, prompt: null, ended: null });
       createdSessionIds.push(sid);
       return respond({ sessionId: sid });
     }
     if (method === 'session.selectModel') return respond({});
-    if (method === 'session.prompt') return respond({});
-    if (method === 'session.cancel') return respond({});
+    if (method === 'session.prompt') {
+      // The delivered prompt is part of the session's history (a real host
+      // records the user message) — this is what the round-4 probe reads.
+      const s = sessions.get(sessionId);
+      if (s) {
+        s.prompt = payload.content?.[0]?.text ?? '';
+        promptLog.push({ sessionId, prompt: s.prompt });
+      }
+      return respond({});
+    }
+    if (method === 'session.cancel') {
+      const s = sessions.get(sessionId);
+      if (s) s.ended = s.ended ?? { kind: 'cancelled' };
+      return respond({});
+    }
     if (method === 'session.history') {
       const s = sessions.get(sessionId) ?? { historyCalls: 0 };
       s.historyCalls += 1;
       sessions.set(sessionId, s);
+      const promptEvents = s.prompt
+        ? [{ seq: 1, type: 'user/message', data: { message: { content: [{ type: 'text', text: s.prompt }] } } }]
+        : [];
+      // T-H12 round-4 fixture fidelity: a REAL reviewer turn stays live until
+      // the test ends it (its verdict is submitted DURING the turn); history
+      // shows the delivered prompt but no terminal event. Workers keep the
+      // legacy immediate-completion shape.
+      if (s.preset === 'reviewer') {
+        const terminal = s.ended
+          ? [{ seq: 3, type: 'turn/end', data: { reason: s.ended } }]
+          : [];
+        return respond({ events: [...promptEvents, ...terminal] });
+      }
       if (s.historyCalls === 1) return respond({ events: [] }); // baseline
       return respond({ events: completedEvents() });
     }
     return respond({});
   };
 
-  return { fetchImpl, setProof: (value) => { proof = value; }, createdSessionIds };
+  return {
+    fetchImpl,
+    setProof: (value) => { proof = value; },
+    createdSessionIds,
+    promptLog,
+    // T-H12 round-4: end a session's turn with the given reason kind
+    // ('error' ⇒ launcher wait() resolves exit≠0), modelling a real
+    // reviewer exit/failure after its prompt was delivered.
+    endSession: (sessionId, kind = 'completed') => {
+      const s = sessions.get(sessionId);
+      if (s) s.ended = { kind };
+    },
+  };
 }
 
 // ─── Composition helpers ──────────────────────────────────────────────────
@@ -295,17 +334,19 @@ test('T-H7 positive: full governed SDLC driven by the real controller and real l
       && status.attempts.length === 2;
   });
   const statusAfterRepair = await cc.status(change.id);
-  // The next review round is bound to an independent reviewer session (the
-  // existing reservation policy may reuse the first reviewer; either way it
-  // must never be a worker implementation session).
+  // T-H12: the re-review is bound to a NEW independent reviewer session —
+  // each new REVIEW revision gets exactly one explicit reviewer request; the
+  // prior round's session/binding never satisfies it. Either way it must
+  // never be a worker implementation session.
   const nextReviewerSession = (await cc.listRoleBindings())
     .filter((b) => b.changeId === change.id && b.role === 'reviewer')
     .at(-1).sessionId;
   assert.ok(nextReviewerSession, 'a reviewer is bound for the re-review');
+  assert.notEqual(nextReviewerSession, reviewerSession, 'the new revision\'s reviewer session is fresh (T-H12)');
   assert.equal(statusAfterRepair.openFindings.length, 1, 'finding record persists for the re-review');
   assert.equal((await cc.get(change.id)).state, 'REVIEW', 'Change back in REVIEW after automatic repair');
 
-  // 17. The independent reviewer settles PASS through the same real
+   // 17. The independent reviewer settles PASS through the same real
   // structured seam; the woken controller converges APPROVED + done.
   const passReview = await reviewTool.execute(
     { changeId: change.id, review: { verdict: 'pass', revision: 'def456', findings: [] } },
@@ -318,22 +359,33 @@ test('T-H7 positive: full governed SDLC driven by the real controller and real l
 
   // 24. terminal binding outcomes — the WORKER bindings are transient and
   // already released by the dispatcher/governor (audited UNBIND); the REVIEWER
-  // binding intentionally persisists as the durable review record and is NOT
-  // part of reconciliation. Capture both outcomes and the durable UNBIND
-  // audit evidence BEFORE reopening the stores.
+  // bindings intentionally persist as the durable review records — TWO of
+  // them (T-H12: one per reviewed revision, rounds abc123 then def456) — and
+  // are NOT part of reconciliation. Capture both outcomes and the durable
+  // UNBIND audit evidence BEFORE reopening the stores.
   const terminalBindings = (await cc.listRoleBindings()).filter((b) => b.changeId === change.id);
   const terminalWorkers = terminalBindings.filter((b) => b.role === 'worker');
   const terminalReviewers = terminalBindings.filter((b) => b.role === 'reviewer');
   assert.equal(terminalWorkers.length, 0, 'no worker binding leaks at terminal (all released)');
-  assert.equal(terminalReviewers.length, 1, 'the independent reviewer binding persists at terminal');
-  assert.equal(terminalReviewers[0].sessionId, nextReviewerSession, 'persisted reviewer binding is the review session');
-  assert.equal(terminalReviewers[0].worker, undefined, 'reviewer binding carries no worker identity');
+  assert.equal(terminalReviewers.length, 2, 'one reviewer binding per reviewed revision persists at terminal');
+  assert.deepEqual(
+    terminalReviewers.map((b) => b.sessionId),
+    [reviewerSession, nextReviewerSession],
+    'persisted reviewer bindings are round 1 then round 2 review sessions',
+  );
+  for (const b of terminalReviewers) {
+    assert.equal(b.worker, undefined, 'reviewer binding carries no worker identity');
+  }
 
   // 25. durable UNBIND audit evidence — the two worker dispatches (initial +
   // repair) each produced a `type:'UNBIND'` record for the SESSION they bound;
   // the fresh reviewer's binding remains the terminal review record.
   const audit = await cc.history(change.id);
-  const reviewerSessionIds = new Set([reviewerSession, nextReviewerSession]);
+  const reviewerRequests = audit.filter((e) => e.kind === 'review_orchestration' && e.action === 'review_round_requested');
+   assert.equal(reviewerRequests.length, 2, 'exactly one durable reviewer request per reviewed revision');
+   assert.deepEqual(reviewerRequests.map((e) => e.revision), ['abc123', 'def456'], 'review request audit follows proof revisions');
+   assert.deepEqual(reviewerRequests.map((e) => e.sessionId), [reviewerSession, nextReviewerSession], 'review request audit is attributable to each bound session');
+   const reviewerSessionIds = new Set([reviewerSession, nextReviewerSession]);
   const workerSessionIds = rpc.createdSessionIds.filter((id) => !reviewerSessionIds.has(id));
   const workerUnbinds = audit.filter((e) => e.type === 'UNBIND' && workerSessionIds.includes(e.sessionId));
   assert.equal(workerUnbinds.length, 2, 'initial + repair worker each produced a durable UNBIND record');
@@ -400,6 +452,82 @@ test('T-H7 positive: full governed SDLC driven by the real controller and real l
     terminalBindings.slice().sort((a, b) => a.sessionId.localeCompare(b.sessionId)),
     'terminal binding outcome (reviewer persists, no worker leak) survives restart',
   );
+});
+
+// ─── T-H12 round-4 — production reviewer-turn exit recovery (real launcher) ──
+
+test('T-H12 round-4: a real launched reviewer turn that ends without a verdict expires only its round and issues exactly one fresh explicit request', async (t) => {
+  const c = await compose(t);
+  const orch = c.task();
+  const tcc = c.taskChangeControl();
+  const cc = c.changeControl();
+
+  const task = orch.create({
+    title: 'reviewer-exit', description: 'reviewer dies before any structured verdict',
+    status: 'ready', workspace: c.dir, worker_profile: 'worker', acceptance_criteria: ['ship'],
+  });
+  const { change } = await tcc.bootstrapTask(task.id);
+  const plan = await cc.submitPlan(change.id, { steps: ['implement'] });
+  await cc.acceptPlan(change.id, plan.id, { authorized: true, actor: 'host' });
+
+  c.rpc.setProof(workerProof('abc123'));
+  const dispatcher = tcc.createGovernedDispatcher({
+    preflight: async () => ({ ok: true, spec: { mode: 'session', profile: 'wp', agentPreset: 'worker', provider: 'ollama', model: 'm', workspacePolicy: 'any', timeoutMs: 5000, leaseSeconds: 300, name: 'worker' } }),
+  });
+  const dispatched = await dispatcher.dispatchOnce({ workerProfile: 'worker' });
+  assert.equal(dispatched.task.sdlc.outcome, 'review_pending');
+  const reviewerA = dispatched.task.sdlc.sessionId;
+  assert.equal((await cc.get(change.id)).state, 'REVIEW');
+  const requestA = c.rpc.promptLog.find((p) => p.sessionId === reviewerA);
+  assert.ok(requestA, 'the production reviewer prompt was delivered');
+  assert.match(requestA.prompt, /\[review-request ([0-9a-f-]{36})\]/, 'the prompt carries the durable request identity');
+  const requestIdA = requestA.prompt.match(/\[review-request ([0-9a-f-]{36})\]/)[1];
+
+  // The reviewer's turn FAILS (process/turn exit ≠ completed) with NO
+  // structured review. The production observer — not a test callback —
+  // expires only this round and recovers with exactly one fresh request.
+  c.rpc.endSession(reviewerA, { kind: 'error', error: { message: 'boom' } });
+
+  let reviewerB = null;
+  await waitFor(async () => {
+    const reviewers = (await cc.listRoleBindings())
+      .filter((b) => b.changeId === change.id && b.role === 'reviewer');
+    if (reviewers.length !== 1 || reviewers[0].sessionId === reviewerA) return false;
+    reviewerB = reviewers[0].sessionId;
+    return true;
+  }, 8000);
+  assert.ok(reviewerB, 'exactly one fresh reviewer was requested and bound');
+
+  // Fail-closed: nothing settled; the Change stays REVIEW, the task in_review.
+  assert.equal((await cc.get(change.id)).state, 'REVIEW');
+  assert.equal(orch.get(task.id).status, 'in_review');
+
+  // Exactly one recovery request, with its OWN durable request identity.
+  const requestB = c.rpc.promptLog.find((p) => p.sessionId === reviewerB);
+  assert.ok(requestB, 'the recovery request reached the new reviewer session');
+  const requestIdB = requestB.prompt.match(/\[review-request ([0-9a-f-]{36})\]/)[1];
+  assert.notEqual(requestIdB, requestIdA, 'the recovery mints a fresh request identity');
+  const audits = await cc.history(change.id);
+  assert.deepEqual(
+    audits.filter((e) => e.kind === 'review_orchestration' && e.action === 'reviewer_turn_ended_no_verdict')
+      .map((e) => ({ sessionId: e.sessionId, exitCode: e.exitCode })),
+    [{ sessionId: reviewerA, exitCode: 1 }],
+    'the dead turn is audited exactly once with its failure exit',
+  );
+  assert.equal(
+    audits.filter((e) => e.kind === 'review_orchestration' && e.action === 'review_round_requested').length,
+    2,
+    'exactly one request per live round — the dead round is never re-requested',
+  );
+
+  // The replacement round settles through the real tool seam and converges.
+  const reviewTool = c.ctx.tools.view().visible.get('change_submit_review');
+  const settle = await reviewTool.execute(
+    { changeId: change.id, review: { verdict: 'pass', revision: 'abc123', findings: [] } },
+    { agent: { id: reviewerB } },
+  );
+  assert.equal(settle.state, 'APPROVED');
+  await waitFor(async () => orch.get(task.id).status === 'done', 5000);
 });
 
 // ─── Test 2 — governed dispatch + completion hook wired & fails closed ────

@@ -641,17 +641,26 @@ function sessionTerminal(events, afterSeq) {
 }
 
 function sleep(milliseconds) {
-  return new Promise(resolve => setTimeout(resolve, milliseconds))
+  return new Promise(resolve => {
+    // Unref'd: a still-polling wait() (e.g. a live reviewer turn observed by
+    // the governed controller) must never keep the host process alive.
+    const timer = setTimeout(resolve, milliseconds)
+    timer.unref?.()
+  })
 }
 
 export function createSessionLauncher({ rpc = createSessionRpcClient(), pollIntervalMs = 250, historyMaxMessages = 500 } = {}) {
   if (!rpc || typeof rpc.call !== 'function') throw new TypeError('a session RPC client is required')
   return {
-    async launch({ task, spec, runId }) {
+    async launch({ task, spec, runId, requestId, recordCreated, recordSent }) {
       if (spec.mode !== 'session') throw new WorkerDispatchError('worker spec does not support the session launcher', 'UNSUPPORTED_WORKER_MODE', { mode: spec.mode })
       const created = await rpc.call('session.create', { cwd: task.workspace, agentPreset: spec.agentPreset })
       const sessionId = created?.sessionId
       if (typeof sessionId !== 'string' || sessionId === '') throw new WorkerDispatchError('session.create returned no session id', 'SESSION_ID_MISSING')
+      // T-H12 round-4: the pre-send durable record. Persisting the session +
+      // request identity at THIS boundary is what lets a crashed owner be
+      // reconciled instead of blindly re-requested (see probeRequest below).
+      if (typeof recordCreated === 'function') await recordCreated({ sessionId, requestId })
       let baselineSeq = -1
       try {
         if (spec.model) {
@@ -661,10 +670,14 @@ export function createSessionLauncher({ rpc = createSessionRpcClient(), pollInte
         }
         const before = sessionEvents(await rpc.call('session.history', { sessionId, maxMessages: historyMaxMessages }))
         baselineSeq = before.reduce((max, event) => Math.max(max, Number.isSafeInteger(event.seq) ? event.seq : max), -1)
+        const basePrompt = typeof spec.prompt === 'string' && spec.prompt !== '' ? spec.prompt : buildTaskPrompt(task, spec, runId)
+        // The durable request identity is embedded in the prompt so a host
+        // history probe can prove whether THIS request was ever delivered.
+        const text = typeof requestId === 'string' && requestId !== '' ? `${basePrompt}\n\n[review-request ${requestId}]` : basePrompt
         await rpc.call('session.prompt', {
           sessionId,
           mode: 'queue',
-          content: [{ type: 'text', text: typeof spec.prompt === 'string' && spec.prompt !== '' ? spec.prompt : buildTaskPrompt(task, spec, runId) }],
+          content: [{ type: 'text', text }],
         })
       } catch (setupError) {
         // Never strand a live session half-configured: cancel it so it does
@@ -672,6 +685,11 @@ export function createSessionLauncher({ rpc = createSessionRpcClient(), pollInte
         try { await rpc.call('session.cancel', { sessionId }); } catch { /* best-effort */ }
         throw setupError
       }
+      // T-H12 round-4: the accepted-send marker. session.prompt resolved, so
+      // the request is durably live in the host; persist that fact BEFORE the
+      // caller proceeds, closing the crash-after-acceptance window a successor
+      // would otherwise mistake for "unsent" and re-request.
+      if (typeof recordSent === 'function') await recordSent({ sessionId, requestId })
       let waitPromise
       const wait = () => {
         if (!waitPromise) {
@@ -730,6 +748,70 @@ export function createSessionLauncher({ rpc = createSessionRpcClient(), pollInte
           try { await rpc.call('session.cancel', { sessionId }); return true } catch { return false }
         },
       }
+    },
+    /**
+     * T-H12 round-5 — reattach turn observation to an EXISTING session a
+     * prior process/launch already owns (controller restart or cross-process
+     * adoption). Same host-history feed as launch's wait(): resolves once the
+     * turn reaches turn/end at or after the request carrying `requestId`;
+     * REJECTS when the host proves the session unreachable (the governed
+     * observer treats that rejection as a dead turn, fail-closed). A live
+     * turn keeps polling the unref'd loop — no churn, and observation alone
+     * never counts as completion.
+     */
+    observeSession(sessionId, requestId) {
+      if (typeof sessionId !== 'string' || sessionId === '') {
+        throw new WorkerDispatchError('observeSession requires a session id', 'SESSION_ID_MISSING')
+      }
+      let waitPromise
+      let stopped = false
+      const wait = () => {
+        if (!waitPromise) {
+          waitPromise = (async () => {
+            while (!stopped) {
+              const events = sessionEvents(await rpc.call('session.history', { sessionId, maxMessages: historyMaxMessages }))
+              let baseline = 0
+              if (typeof requestId === 'string' && requestId !== '') {
+                for (const event of events) {
+                  if (JSON.stringify(event).includes(requestId)) {
+                    baseline = Math.max(baseline, Number.isSafeInteger(event?.seq) ? event.seq : baseline)
+                  }
+                }
+              }
+              const terminal = sessionTerminal(events, baseline)
+              if (terminal) {
+                const kind = terminal.data?.reason?.kind
+                return { exitCode: kind === 'completed' ? 0 : 1, signal: null, sessionId }
+              }
+              await sleep(pollIntervalMs)
+            }
+          })()
+        }
+        return waitPromise
+      }
+      return {
+        sessionId,
+        wait,
+        // This stops only the reattached history observer; it must never
+        // cancel the independently-owned reviewer session.
+        async terminate() { stopped = true; return true },
+      }
+    },
+    /**
+     * T-H12 round-4 — authoritative request-liveness reconciliation. Proves,
+     * from the host's own session history, whether the request carrying
+     * `requestId` (embedded in the prompt by launch) was ever DELIVERED to
+     * `sessionId`. Returns 'sent' | 'unsent' ('sent' only on positive proof).
+     * A session the host no longer knows (restart/death) yields an error or
+     * an empty history: its queued request died with it — 'unsent', so
+     * exactly one fresh request is the safe recovery.
+     */
+    async probeRequest(sessionId, requestId) {
+      if (typeof sessionId !== 'string' || sessionId === '') return 'unsent'
+      if (typeof requestId !== 'string' || requestId === '') return 'unsent'
+      const events = await rpc.call('session.history', { sessionId, maxMessages: historyMaxMessages })
+        .catch(() => ({ events: [] }))
+      return JSON.stringify(sessionEvents(events)).includes(requestId) ? 'sent' : 'unsent'
     },
   }
 }

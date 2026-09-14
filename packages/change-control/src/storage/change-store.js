@@ -270,6 +270,39 @@ function deepFreeze(value) {
   return value;
 }
 
+/**
+ * T-H12 round-4 — review-settlement guard registry (mirrors the in-memory
+ * governance-provider WeakMap pattern in ../service/governance-provider.js).
+ *
+ * The governed task↔change integration installs ONE guard per store. The
+ * guard decides, from the durable review-round record, whether the submitting
+ * session is entitled to settle the Change's CURRENT revision — a prior
+ * round's still-bound reviewer session never settles a new revision.
+ * Standalone (non-governed) Change Control never registers a guard, so its
+ * submitReview behavior is byte-identical to before.
+ *
+ * @type {WeakMap<object, (args: { changeId: string, sessionId: string, locked?: boolean, lockedChange?: object, currentRevision?: string|null, lockedBindings?: object[] }) => Promise<void>>}
+ */
+const reviewSettlementGuards = new WeakMap();
+
+/**
+ * @param {object} store a ChangeStore instance
+ * @param {(args: { changeId: string, sessionId: string }) => Promise<void>} guard
+ *   throws (e.g. STALE_ROUND_SESSION) to reject the settlement BEFORE any mutation
+ */
+export function registerReviewSettlementGuard(store, guard) {
+  if (!store || typeof guard !== 'function') {
+    throw Object.assign(new Error('a review settlement guard must be a function'), { code: 'INVALID_REVIEW_GUARD' });
+  }
+  reviewSettlementGuards.set(store, guard);
+  return { unregister: () => reviewSettlementGuards.delete(store) };
+}
+
+/** @param {object} store @returns {Function | null} */
+export function getReviewSettlementGuard(store) {
+  return reviewSettlementGuards.get(store) ?? null;
+}
+
 export class ChangeStore {
   #file;
   #changes;
@@ -2069,11 +2102,48 @@ export class ChangeStore {
    * Transitions change based on verdict AND blocking severity.
    */
   async submitReview(changeId, review, opts = {}) {
+    // T-H12 round-4: round-bound settlement. When the governed integration
+    // installed a settlement guard on this store, the durable current-round
+    // record decides whether THIS session may settle THIS revision — a prior
+    // round's still-bound reviewer can never approve/reject a new round.
+    // Runs BEFORE the store's (non-reentrant) write lock: the guard reads
+    // through the facade, and every later state/revision check inside the
+    // lock re-validates atomically, so a race can only fail closed. No guard
+    // (standalone use) keeps legacy role/revision checks as the complete gate.
+    const settlementGuard = getReviewSettlementGuard(this);
+    if (settlementGuard && typeof opts.sessionId === 'string' && opts.sessionId !== '') {
+      await settlementGuard({ changeId, sessionId: opts.sessionId });
+    }
     const release = await acquireLock(this.#file);
     try {
       await this.#refreshChange(changeId);
       const c = this.#changes.get(changeId);
       if (!c) throw Object.assign(new Error(`Change ${changeId} not found`), { code: 'NOT_FOUND' });
+
+      // Re-run governed settlement authorization while this store's write lock
+      // holds the fresh Change, attempts, and bindings snapshot. The pre-lock
+      // guard is only an early rejection; it can never authorize a race.
+      const lockedSessionId = opts.sessionId;
+      const settlementGuard = getReviewSettlementGuard(this);
+      if (settlementGuard && typeof lockedSessionId === 'string' && lockedSessionId !== '') {
+        const currentAttempts = this.#attempts.get(changeId) ?? [];
+        try {
+          await settlementGuard({
+            changeId, sessionId: lockedSessionId, locked: true,
+            lockedChange: freezeChange(c),
+            currentRevision: currentAttempts.at(-1)?.revision ?? null,
+            lockedBindings: structuredClone(this.#bindings.get(changeId) ?? []),
+          });
+        } catch (error) {
+          const audit = error?.reviewSettlementAudit;
+          if (audit) {
+            await reseedFromDisk(this.#file);
+            this.#audit.push({ ...audit, eventId: nextEventId() });
+            await this.#persist();
+          }
+          throw error;
+        }
+      }
 
       // Validate change is in REVIEW state
       if (c.state !== 'REVIEW') {

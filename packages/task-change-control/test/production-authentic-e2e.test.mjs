@@ -31,7 +31,6 @@ const sessions = new Map();
 const hostEvents = [];
 let sessionNumber = 0;
 let workerNumber = 0;
-let reviewerNumber = 0;
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const workerTool = createTaskTools({}).find((tool) => tool.name === WORKER_COMPLETION_TOOL);
 if (!workerTool) throw new Error('production worker_complete tool is unavailable');
@@ -61,6 +60,15 @@ async function readJson(req) {
   for await (const chunk of req) chunks.push(chunk);
   return JSON.parse(Buffer.concat(chunks).toString() || '{}');
 }
+async function requestReview(session, prompt) {
+  const response = await fetch(bridgeUrl, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ method: 'reviewer.request', payload: { sessionId: session.id, prompt } }),
+  });
+  const envelope = await response.json();
+  if (!envelope?.result?.ok) throw new Error(envelope?.result?.error?.message ?? 'review request bridge failed');
+  return envelope.result.value;
+}
 async function callReview(session, payload) {
   const response = await fetch(bridgeUrl, {
     method: 'POST', headers: { 'content-type': 'application/json' },
@@ -82,25 +90,19 @@ async function runSession(session) {
     append(session, 'tool/result', { message: { content: [{ type: 'tool-result', toolCallId: callId, isError: false }] }, meta });
     hostEvents.push({ name: WORKER_COMPLETION_TOOL, sessionId: session.id, commit_sha: meta.commit_sha });
   } else {
-    const changeId = session.prompt.match(/Change ([A-Za-z0-9-]+)/)?.[1];
-    const firstReviewer = reviewerNumber++ === 0;
-    const reviews = firstReviewer
-      ? [
-          { verdict: 'fail', revision: 'abc123', findings: [{ severity: 'critical', category: 'authentic-e2e', location: 'src/x.js', problem: 'missing guard', requiredOutcome: 'fix and re-test' }] },
-          { verdict: 'pass', revision: 'def456', findings: [] },
-        ]
-      : [{ verdict: 'pass', revision: 'def456', findings: [] }];
-    for (const review of reviews) {
-      // The existing production reservation reuses a live reviewer binding
-      // across repair rounds; this session therefore submits the re-review in
-      // a later turn after the repair worker has completed.
-      if (review.verdict === 'pass') await wait(180);
-      const value = await callReview(session, { changeId, review });
-      const callId = 'change-submit-review-' + session.id + '-' + review.verdict;
-      append(session, 'tool/call', { callId, name: 'change_submit_review', arguments: JSON.stringify({ changeId, review }) });
-      append(session, 'tool/result', { message: { content: [{ type: 'tool-result', toolCallId: callId, isError: false }] }, value });
-      hostEvents.push({ name: 'change_submit_review', sessionId: session.id, verdict: review.verdict, changeId });
+    // A reviewer submits one verdict only after the parent host records the
+    // production request for this session. The response is derived from the
+    // persisted revision observed at request time, never from a future round.
+    const requested = await requestReview(session, session.prompt);
+    const { changeId, revision, review } = requested ?? {};
+    if (typeof changeId !== 'string' || typeof revision !== 'string' || !review || review.revision !== revision) {
+      throw new Error('review request did not return the current revision-bound verdict');
     }
+    const value = await callReview(session, { changeId, review });
+    const callId = 'change-submit-review-' + session.id + '-' + review.verdict;
+    append(session, 'tool/call', { callId, name: 'change_submit_review', arguments: JSON.stringify({ changeId, review }) });
+    append(session, 'tool/result', { message: { content: [{ type: 'tool-result', toolCallId: callId, isError: false }] }, value });
+    hostEvents.push({ name: 'change_submit_review', sessionId: session.id, verdict: review.verdict, revision, changeId });
   }
   append(session, 'assistant/message', { message: { content: [{ type: 'text', text: 'session tool completed' }] } });
   append(session, 'turn/end', { reason: { kind: 'completed' } });
@@ -121,6 +123,7 @@ async function invoke(message) {
     const session = sessions.get(payload.sessionId);
     if (!session) throw new Error('unknown session');
     session.prompt = payload.content?.[0]?.text ?? '';
+    hostEvents.push({ name: 'session.prompt', sessionId: session.id, agentPreset: session.agentPreset, prompt: session.prompt });
     void runSession(session).catch((error) => {
       append(session, 'turn/end', { reason: { kind: 'error', error: { message: String(error) } } });
     });
@@ -157,13 +160,25 @@ function listen(server) {
 
 async function startReviewBridge(t) {
   let executeReview = null;
+  let executeRequest = null;
   const calls = [];
   const results = [];
+  const requests = [];
+  const requestResults = [];
   const server = createServer(async (req, res) => {
     try {
       const chunks = [];
       for await (const chunk of req) chunks.push(chunk);
       const message = JSON.parse(Buffer.concat(chunks).toString() || '{}');
+      if (message.method === 'reviewer.request') {
+        if (typeof executeRequest !== 'function') throw new Error('review request bridge is not ready');
+        requests.push(message.payload);
+        const value = await executeRequest(message.payload);
+        requestResults.push(value);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ result: { ok: true, value } }));
+        return;
+      }
       if (message.method !== 'change_submit_review' || typeof executeReview !== 'function') throw new Error('review bridge is not ready');
       calls.push(message.payload);
       const value = await executeReview(message.payload);
@@ -181,7 +196,10 @@ async function startReviewBridge(t) {
     url: `http://127.0.0.1:${port}`,
     calls,
     results,
+    requests,
+    requestResults,
     setExecutor(fn) { executeReview = fn; },
+    setRequestExecutor(fn) { executeRequest = fn; },
   };
 }
 
@@ -270,6 +288,17 @@ test('authentic production E2E executes worker_complete and change_submit_review
     assert.equal(outcome.isError, false, JSON.stringify(outcome));
     return outcome;
   });
+  bridge.setRequestExecutor(async ({ sessionId, prompt }) => {
+    const changeId = prompt.match(/Change ([A-Za-z0-9-]+)/)?.[1];
+    assert.ok(changeId, 'review request names its governed Change');
+    const status = await cc.status(changeId);
+    const revision = status.revision;
+    const firstRound = status.attempts.length === 1;
+    const review = firstRound
+      ? { verdict: 'fail', revision, findings: [{ severity: 'critical', category: 'authentic-e2e', location: 'src/x.js', problem: 'missing guard', requiredOutcome: 'fix and re-test' }] }
+      : { verdict: 'pass', revision, findings: [] };
+    return { sessionId, changeId, revision, review };
+  });
 
   const task = orch.create({
     title: 'authentic governed e2e', description: 'execute real session-host tool calls',
@@ -284,6 +313,16 @@ test('authentic production E2E executes worker_complete and change_submit_review
   assert.equal(dispatched.dispatched, true, JSON.stringify(dispatched));
   assert.equal(dispatched.status, 'in_review', JSON.stringify(dispatched));
 
+  // Every new persisted REVIEW revision must produce a new production prompt
+  // before its child session is allowed to submit a verdict. The current
+  // implementation reuses the first binding after FAIL, so this RED wait
+  // times out on main instead of accepting a pre-programmed PASS.
+  try {
+    await waitFor(() => bridge.requestResults.length === 2);
+  } catch {
+    assert.fail(`expected two revision-bound reviewer requests, observed ${bridge.requestResults.length}: ${JSON.stringify(bridge.requestResults)}`);
+  }
+
   await waitFor(async () => {
     const current = orch.get(task.id);
     const state = await cc.get(change.id);
@@ -291,10 +330,18 @@ test('authentic production E2E executes worker_complete and change_submit_review
   });
   const hostEvents = await createSessionRpcClient({ baseUrl: host.baseUrl }).call('host.events');
   const workerCalls = hostEvents.events.filter((event) => event.name === 'worker_complete');
+  const promptEvents = hostEvents.events.filter((event) => event.name === 'session.prompt' && event.agentPreset === 'reviewer');
   const reviewCalls = hostEvents.events.filter((event) => event.name === 'change_submit_review');
+  assert.equal(promptEvents.length, 2, 'production sends one reviewer session.prompt per REVIEW revision');
   assert.equal(workerCalls.length, 2, 'initial worker and repair worker executed worker_complete');
   assert.equal(reviewCalls.length, 2, 'FAIL and PASS were submitted through change_submit_review');
   assert.deepEqual(reviewCalls.map((event) => event.verdict), ['fail', 'pass']);
+  assert.equal(bridge.requests.length, 2, 'one production reviewer request per REVIEW revision');
+  assert.ok(bridge.requests.every((request) => typeof request.sessionId === 'string' && request.sessionId.length > 0), 'each request is attributable to its reviewer session');
+  assert.ok(bridge.requests.every((request) => typeof request.prompt === 'string' && request.prompt.length > 0), 'requests carry the production prompt');
+  const requestedRevisions = bridge.requestResults.map((request) => request.revision);
+  assert.equal(new Set(requestedRevisions).size, 2, 'requests are bound to distinct current revisions');
+  assert.deepEqual(reviewCalls.map((event) => event.revision), requestedRevisions, 'each verdict uses the revision observed for its request');
   assert.equal(bridge.calls.length, 2, 'the child session invoked the parent host review tool bridge twice');
   assert.equal(bridge.results.length, 2, 'the parent ToolRuntime returned both review outcomes');
   assert(bridge.results.every((outcome) => outcome.isError === false), JSON.stringify(bridge.results));

@@ -12,6 +12,7 @@ import { validatePairing } from './lifecycle.js';
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
+import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 
 /** The task-orchestrator identity on the Change-side workItem. */
@@ -152,6 +153,12 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
     }
     return taskId;
   };
+
+  // T-H12 round-5 (F1): live reviewer-turn observations owned by THIS service
+  // instance (fresh-launch and reattached). Disposing the controller must
+  // neutralize every one so a disposed host never recovers a turn the fresh
+  // (restarted) host now owns — exactly-once across a real restart.
+  const activeObservationStops = new Set();
 
   const api = {
     /**
@@ -748,28 +755,59 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
      *   launch never wedges the Change in REVIEW.
      *
      * @param {string} taskId
-     * @param {{ preflight?: (proof: any) => boolean, controllerPreflightOverride?: string[] }} [options]
+     * @param {{ preflight?: (proof: any) => boolean, controllerPreflightOverride?: string[], isStopped?: () => boolean }} [options]
      * @returns {Promise<{ outcome: 'review_started' | 'preflight_failed', sessionId?: string, changeId?: string }>}
      */
     runGovernedReview(taskId, options = {}) {
+      const isStopped = typeof options.isStopped === 'function' ? options.isStopped : null;
+      const ensureActive = () => {
+        if (isStopped?.()) {
+          throw Object.assign(new Error('review observer stopped'), { code: 'REVIEW_OBSERVER_STOPPED' });
+        }
+      };
       const t = requireTask();
       const c = requireChange();
       requireTaskId(taskId);
       return (async () => {
+        ensureActive();
         const task = await Promise.resolve(t.get(taskId));
+        ensureActive();
         if (!task) throw Object.assign(new Error(`task not found: ${taskId}`), { code: 'TASK_NOT_FOUND' });
         if (task.status !== 'in_review') {
           throw Object.assign(new Error(`expected task status in_review (got ${task.status})`), { code: 'INVALID_TASK_STATE' });
         }
         const change = await c.findByWorkItem(WORK_ITEM_SYSTEM, taskId);
+        ensureActive();
         if (!change) throw Object.assign(new Error(`no Change linked to task ${taskId}`), { code: 'CHANGE_NOT_FOUND' });
         if (!['PREFLIGHT', 'REVIEW'].includes(change.state)) {
           throw Object.assign(new Error(`expected Change PREFLIGHT or REVIEW (got ${change.state})`), { code: 'INVALID_CHANGE_STATE' });
         }
+        // T-H12: this review round is keyed by the Change's CURRENT
+        // implementation revision. A reviewer round without a revision could
+        // never accept a verdict (stale-revision rejection), so fail closed
+        // here instead.
+        const statusNow = await c.status(change.id);
+        ensureActive();
+        const revision = statusNow?.revision ?? null;
+        if (typeof revision !== 'string' || revision.trim() === '') {
+          throw Object.assign(
+            new Error(`cannot start a review round for Change ${change.id} without an implementation revision`),
+            { code: 'REVIEW_ROUND_REVISION_UNAVAILABLE', changeId: change.id },
+          );
+        }
+        // The round's durable attribution: originating proof/attempt plus the
+        // prior round's still-open finding IDs where available.
+        const round = {
+          revision,
+          attemptId: Array.isArray(statusNow?.attempts) ? (statusNow.attempts.at(-1)?.attemptId ?? null) : null,
+          proofCommit: statusNow?.proof?.commit_sha ?? null,
+          findingIds: (Array.isArray(statusNow?.openFindings) ? statusNow.openFindings : [])
+            .map((/** @type {any} */ f) => f?.id)
+            .filter((/** @type {any} */ id) => typeof id === 'string'),
+        };
         if (change.state === 'PREFLIGHT') {
           // Run the REAL store-level preflight: staleness vs currentRevision,
           // protected paths, and requiredChecks are all evaluated there.
-          const statusNow = await c.status(change.id);
           const proof = statusNow?.proof ?? null;
           const checkResults = (options.controllerPreflightOverride ?? proof?.controllerPreflight ?? []).map((/** @type {string} */ entry) => parseControllerPreflightEntry(entry));
           let preflightPassed;
@@ -779,6 +817,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
               changedFiles: Array.isArray(proof?.files_changed) ? proof.files_changed : [],
               checkResults,
             });
+            ensureActive();
             preflightPassed = true;
           } catch (/** @type {any} */ err) {
             if (err?.code === 'NO_POLICY') {
@@ -793,45 +832,133 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
             }
           }
           if (!preflightPassed) {
-            await c.appendAudit({ kind: 'review_orchestration', changeId: change.id, action: 'preflight_failed' });
+            ensureActive();
+             await c.appendAudit({ kind: 'review_orchestration', changeId: change.id, action: 'preflight_failed' });
+             ensureActive();
             return { outcome: 'preflight_failed' };
           }
-          await c.appendAudit({ kind: 'review_orchestration', changeId: change.id, action: 'preflight_passed' });
+          ensureActive();
+           await c.appendAudit({ kind: 'review_orchestration', changeId: change.id, action: 'preflight_passed' });
+           ensureActive();
         }
-        // T-H5 PR1-02 + PR2-01: serialize check→launch→bind for ONE Change.
-        // The in-process tail lock is the fast local serializer; the durable
-        // cross-process claim (reserveReviewerLaunch) guarantees no two host
-        // processes launch a second reviewer, adopts a crashed owner's
-        // recorded session instead of re-launching it, and converges on the
-        // confirmed binding as the terminal record.
-        const sessionId = await withReviewerReservation(change.id, async () => {
+        // T-H5 PR1-02 + PR2-01: serialize check→launch→bind for ONE round.
+        // The in-process tail lock is the fast local serializer (keyed by
+        // Change+revision, T-H12: duplicate/concurrent wakes of the SAME
+        // revision converge; a NEW revision never serializes against a stale
+        // lock from a prior round); the durable cross-process claim
+        // (reserveReviewerLaunch) guarantees no two host processes launch a
+        // second reviewer for the round, adopts a crashed owner's recorded
+        // session instead of re-launching it, and converges on the confirmed
+        // round binding as the terminal record.
+        // T-H12 round-5 (F1): only a FRESH launch attaches its observer
+        // inline below; a reservation that converged on an EXISTING round
+        // session (restart wake, confirmed binding, cross-process adoption)
+        // reattaches observation right after the reservation resolves.
+        let launchedHere = false;
+        let launchedHandle = null;
+        const sessionId = await withReviewerReservation(`${change.id}:${revision}`, async () => {
           return reserveReviewerLaunch({
-            c, change, task,
-            launch: async ({ file, identity }) => {
-              const launched = await launchReviewerForTask(requireTask, requireChange, requireTaskId, taskId, {
-                // Durable record of the launched session before the binding —
-                // the crash-recovery (adopt) record for a successor claim.
-                recordSession: async (launchSessionId) => {
-                  await writeClaimRecord(file, { claimant: identity, sessionId: launchSessionId, updatedAt: Date.now() });
-                },
-                discardSession: async () => {
-                  // Our launch is dead (terminated on failure): expire the
-                  // claim so a successor takes over with a fresh launch
-                  // instead of adopting a terminated session.
-                  await writeClaimRecord(file, { claimant: identity, sessionId: null, updatedAt: Date.now() - 2 * REVIEWER_CLAIM_LEASE_MS })
-                    .catch(() => {});
-                },
+            isStopped,
+            c, change, task, revision, round,
+            // T-H12 round-4: authoritative request-liveness reconciliation for
+            // an ambiguous durable record (session pre-send record present,
+            // send marker absent): the REAL launcher's probe proves from host
+            // session history whether THIS requestId was ever delivered. A
+            // launcher without a probe reports 'unknown' — never duplicated,
+            // just bounded-waited.
+            probeRequest: (() => {
+              let probeLauncher = null;
+              try {
+                probeLauncher = /** @type {any} */ (requireTask()).createReviewerLauncher?.(options.launcherOptions ?? {});
+              } catch { probeLauncher = null; }
+              return typeof probeLauncher?.probeRequest === 'function'
+                ? (probeSessionId, probeRequestId) => probeLauncher.probeRequest(probeSessionId, probeRequestId)
+                : undefined; // no probe surface: ambiguous records adopt as before
+            })(),
+            launch: async ({ file, identity, requestId }) => {
+              let launched;
+              try {
+                launched = await launchReviewerForTask(requireTask, requireChange, requireTaskId, taskId, {
+                  isStopped,
+                  revision,
+                  requestId,
+                  // T-H12 round-4 pre-send marker: session.create accepted →
+                  // persist sessionId + requestId with NO sent marker yet.
+                  // (The REAL launcher invokes this at the true boundary, so
+                  // the window between acceptance and this write is closed.)
+                  recordCreated: async (createdSessionId) => {
+                    await writeClaimRecord(file, {
+                      claimant: identity, sessionId: createdSessionId,
+                      requestId: requestId ?? null, sentAt: null,
+                      ...round, updatedAt: Date.now(),
+                    });
+                  },
+                  // Durable record of the launched session before the binding —
+                  // the crash-recovery (adopt) record for a successor claim.
+                  // Carries the full T-H12 round attribution; sentAt +
+                  // requestId atomically mark THIS request as sent (T-H12
+                  // round-3): a restart seeing this record adopts the session
+                  // and never re-sends the request.
+                  recordSession: async (launchSessionId) => {
+                    await writeClaimRecord(file, {
+                      claimant: identity, sessionId: launchSessionId,
+                      requestId: requestId ?? null, sentAt: Date.now(),
+                      ...round, updatedAt: Date.now(),
+                    });
+                  },
+                  discardSession: async () => {
+                    // Our launch is dead (terminated on failure): expire the
+                    // claim so a successor takes over with a fresh launch
+                    // instead of adopting a terminated session.
+                    await writeClaimRecord(file, { claimant: identity, sessionId: null, ...round, updatedAt: Date.now() - 2 * REVIEWER_CLAIM_LEASE_MS })
+                      .catch(() => {});
+                  },
+                });
+              } catch (error) {
+                if (isStopped?.()) throw error;
+                // A launcher/session.prompt failure occurs before a reviewer
+                // request exists. Expire this round's empty claim so the next
+                // governed wake can recover immediately without a 10-minute
+                // stale-claim wait or duplicate live session.
+                await writeClaimRecord(file, {
+                  claimant: identity, sessionId: null, ...round,
+                  updatedAt: Date.now() - 2 * REVIEWER_CLAIM_LEASE_MS,
+                }).catch(() => {});
+                throw error;
+              }
+              ensureActive();
+              // T-H12: durable audit of this round's ONE explicit reviewer
+              // request (launch = the single production prompt), carrying
+              // the same durable request identity the claim record persisted
+              // before the send (T-H12 round-3).
+              await c.appendAudit({
+                kind: 'review_orchestration', changeId: change.id,
+                action: 'review_round_requested',
+                sessionId: launched.sessionId, revision,
+                ...(requestId ? { requestId } : {}),
+                ...(round.attemptId !== null ? { attemptId: round.attemptId } : {}),
+                ...(round.proofCommit !== null ? { proofCommit: round.proofCommit } : {}),
+                findingIds: round.findingIds,
               });
+              // Keep the real launch handle until PREFLIGHT→REVIEW below.
+              // In the NO_POLICY fallback a terminal history observed before
+              // that transition would otherwise see PREFLIGHT and be lost.
+              launchedHandle = launched.handle;
+              launchedHere = true;
               return launched.sessionId;
             },
           });
         });
+        ensureActive();
         // A successful store runPreflight is authoritative for the state
         // move: under a real preflight policy the store itself performed
         // PREFLIGHT→REVIEW. Re-read the live state and transition ONLY in
-        // the NO_POLICY fallback, where the store did not move it — exactly
-        // one PREFLIGHT→REVIEW transition, never a double move.
+        // the NO_POLICY fallback, where the store did not move it. Crucially,
+        // attach turn observation only AFTER this transition: an immediately
+        // terminal real session must recover its REVIEW round, never observe
+        // PREFLIGHT and disappear before the state move.
         const liveAfterPreflight = await c.get(change.id);
+        ensureActive();
         if (liveAfterPreflight.state === 'PREFLIGHT') {
           await c.transition(change.id, 'REVIEW', { actor: 'review-orchestration' }).catch((err) => {
             if (err?.name !== 'ChangeDomainError') throw err;
@@ -840,7 +967,26 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
             // so the stage already converged; its launch is bound under the
             // same claim we just released.
           });
+          ensureActive();
         }
+        let stopObserve = null;
+        if (launchedHere) {
+          stopObserve = observeReviewerTurn({
+            handle: launchedHandle, c, change, task, revision, sessionId,
+            rebuildReview: (stopped) => api.runGovernedReview(taskId, { isStopped: stopped }),
+          });
+        } else {
+          stopObserve = await reattachReviewerTurnObservation({
+            api, requireTask, requireChange, taskId, change, task, revision, sessionId, isStopped,
+          }).catch(() => false);
+        }
+        // A stop may race either real `observeSession` or observer creation.
+        // Neutralize the returned observation instead of leaving it untracked.
+        if (isStopped?.()) {
+          try { stopObserve?.(); } catch { /* best-effort */ }
+          return { outcome: 'review_started', sessionId, changeId: change.id };
+        }
+        if (typeof stopObserve === 'function') activeObservationStops.add(stopObserve);
         return { outcome: 'review_started', sessionId, changeId: change.id };
       })();
     },
@@ -898,6 +1044,26 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
           const latestRevision = status?.revision ?? null;
           if (latestRevision === null) {
             throw Object.assign(new Error('no revision recorded yet'), { code: 'STALE_REVISION' });
+          }
+          // T-H12 round-3: settlement is bound to the CURRENT round — the
+          // verdict must come from the reviewer session named by the durable
+          // round record for the Change's current revision. Any other session
+          // (e.g. a prior round's still-bound reviewer) can never settle this
+          // round. When no round record exists (a reviewer bound outside the
+          // governed round flow) the legacy binding checks above stand alone.
+          const roundReviewer = await roundReviewerSession(c, change, task);
+          if (roundReviewer && options.sessionId !== roundReviewer.sessionId) {
+            await c.appendAudit({
+              kind: 'review_orchestration', changeId: change.id,
+              action: 'review_outcome_wrong_round_session',
+              sessionId: options.sessionId,
+              expectedSessionId: roundReviewer.sessionId,
+              revision: latestRevision,
+            });
+            throw Object.assign(
+              new Error(`session ${options.sessionId} is not the current review round's reviewer`),
+              { code: 'STALE_ROUND_SESSION' },
+            );
           }
         }
 
@@ -981,6 +1147,62 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
     },
 
     /**
+     * T-H12 round-4 — review-settlement guard installed on the ChangeStore by
+     * the change-control tool wiring. The canonical change_submit_review seam
+     * (and every other submitReview surface) consults this BEFORE any state
+     * mutation: a reviewer session may settle a Change's CURRENT revision only
+     * when it is the session named by that revision's durable round record.
+     * A prior round's still-bound reviewer is rejected fail-closed
+     * (STALE_ROUND_SESSION + audit); Changes not linked to a governed task
+     * (standalone Change Control) and rounds without a durable round record
+     * keep the legacy behavior untouched.
+     *
+     * @param {{ changeId: string, sessionId: string }} args
+     * @returns {Promise<void>} resolves when the settlement is authorized
+     */
+    async reviewSettlementGuard({ changeId, sessionId, lockedChange = null, currentRevision = null, lockedBindings = null, locked = false } = {}) {
+      const c = requireChange();
+      const change = lockedChange ?? await c.get(changeId).catch(() => null);
+      if (!change?.workItem || change.workItem.system !== WORK_ITEM_SYSTEM) return;
+      if (change.state !== 'REVIEW') return;
+      let task = null;
+      try {
+        const t = requireTask();
+        task = await Promise.resolve(t.get(change.workItem.id)).catch(() => null);
+      } catch { task = null; }
+      if (!task) {
+        throw Object.assign(new Error(`governed review round unavailable for Change ${changeId}`), { code: 'STALE_ROUND_SESSION' });
+      }
+      const revision = currentRevision ?? (await c.status(changeId).catch(() => null))?.revision ?? null;
+      const round = await roundReviewerSessionForRevision(c, change, task, revision, lockedBindings).catch(() => null);
+      const audit = {
+        kind: 'review_orchestration', changeId,
+        action: round ? 'review_submit_wrong_round_session' : 'review_submit_missing_round',
+        sessionId,
+        ...(round?.sessionId ? { expectedSessionId: round.sessionId } : {}),
+        revision,
+      };
+      if (!round || round.sessionId !== sessionId) {
+        if (locked) {
+          throw Object.assign(
+            new Error(round ? `session ${sessionId} is not the current review round's reviewer` : `no durable review round for Change ${changeId}`),
+            { code: 'STALE_ROUND_SESSION', reviewSettlementAudit: audit },
+          );
+        }
+        await c.appendAudit(audit).catch(() => {});
+        throw Object.assign(
+          new Error(round ? `session ${sessionId} is not the current review round's reviewer` : `no durable review round for Change ${changeId}`),
+          { code: 'STALE_ROUND_SESSION' },
+        );
+      }
+      if (!locked) return;
+      // A lock-context guard has already validated the durable round and binding.
+      return;
+
+
+    },
+
+    /**
      * T-H5 — the production governed SDLC controller.
      *
      * One explicit controller-owned lifecycle over the existing governed
@@ -1017,7 +1239,8 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
      *   repairProof?: object,
      *   repairFindings?: object[],
      *   repairClaim?: string,
-     *   leaseSeconds?: number }} [options]
+     *   leaseSeconds?: number,
+     *   isStopped?: () => boolean }} [options]
      * @returns {Promise<{ outcome: string, [key: string]: any }>}
      */
     runGovernedSdlc(taskId, options = {}) {
@@ -1025,6 +1248,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
       const c = requireChange();
       requireTaskId(taskId);
       const maxRepairRounds = options.maxRepairRounds ?? 3;
+      const isStopped = typeof options.isStopped === 'function' ? options.isStopped : undefined;
       // The verdict is one-shot per call: a repair loop that re-enters the
       // REVIEW stage must never re-settle the same verdict.
       let verdict = options.verdict && (options.verdict.verdict === 'pass' || options.verdict.verdict === 'fail')
@@ -1032,6 +1256,12 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         : null;
       return (async () => {
         let iterations = 0;
+        // T-H12 round-5 (F1): sessions whose launch path already attached turn
+        // observation in THIS SDLC invocation. A fresh launch observes its own
+        // handle inline, so the immediately-following REVIEW iteration must not
+        // reattach a second observer (live-turn churn / duplicate recovery) —
+        // only a later independent wake (restart / cross-process) reattaches.
+        const observedLaunchSessionIds = new Set();
         while (true) {
           if (++iterations > maxRepairRounds * 3 + 8) {
             return { outcome: 'stuck', taskId, detail: 'controller loop exceeded its round bound' };
@@ -1086,9 +1316,14 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
             }
             // Deterministic preflight + reviewer launch/bind (reviewer
             // sessions never touch task claim/lease).
-            const rv = await api.runGovernedReview(taskId, { controllerPreflightOverride: options.controllerPreflightOverride });
+            const rv = await api.runGovernedReview(taskId, { controllerPreflightOverride: options.controllerPreflightOverride, isStopped });
             if (rv.outcome === 'preflight_failed') {
               return { outcome: 'preflight_failed', taskId, changeId: change.id };
+            }
+            // The launch path just attached turn observation to this session's
+            // own handle; the next REVIEW iteration must not reattach.
+            if (rv.outcome === 'review_started' && typeof rv.sessionId === 'string') {
+              observedLaunchSessionIds.add(rv.sessionId);
             }
             continue; // Change is now REVIEW with a reviewer bound
           }
@@ -1120,17 +1355,42 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
               }
               // fall through: task is now changes_requested — route repair
             } else {
-              // Still REVIEW: the verdict must arrive as data.
-              let reviewer = await currentReviewerBinding(c, change.id);
+              // Still REVIEW: the verdict must arrive as data. T-H12: only
+              // a reviewer session attributed to the CURRENT revision's
+              // durable round record satisfies this round — a prior round's
+              // still-bound session never does.
+              let reviewer = await roundReviewerSession(c, change, task);
+              // T-H12 round-4: a reviewer turn PROVEN ended without settling
+              // its round is handled by the production turn observer
+              // (observeReviewerTurn, wired to the real launcher handle at
+              // request time) — it expires only that round and issues one
+              // fresh request. This wake path just re-reads durable state.
               if (!reviewer) {
-                // Reviewer session lost (crash between transition and
-                // bind/launch): resume the stage, which launches a fresh
-                // reviewer without re-running preflight.
-                const rv = await api.runGovernedReview(taskId, { controllerPreflightOverride: options.controllerPreflightOverride });
+                // This round's request is missing (crash between transition
+                // and launch/bind, or the Change advanced to a new revision
+                // while only a prior round's reviewer was bound): issue
+                // exactly one new explicit review round without re-running
+                // preflight.
+                const rv = await api.runGovernedReview(taskId, { controllerPreflightOverride: options.controllerPreflightOverride, isStopped });
                 if (rv.outcome === 'preflight_failed') {
                   return { outcome: 'preflight_failed', taskId, changeId: change.id };
                 }
-                reviewer = (await currentReviewerBinding(c, change.id)) ?? { sessionId: rv.sessionId };
+                reviewer = (await roundReviewerSession(c, change, task)) ?? { sessionId: rv.sessionId };
+              } else {
+                // T-H12 round-5 (F1): this wake found the round's confirmed
+                // session through durable state alone (controller restart or
+                // cross-process wake) — reattach production observation to
+                // the REAL session lifecycle so a dead/unreachable turn is
+                // recovered instead of the round hanging in review_pending.
+                // Skip when the launch path already attached observation to
+                // this session in the SAME invocation (no second observer).
+                if (!observedLaunchSessionIds.has(reviewer.sessionId)) {
+                  const stopObserve = await reattachReviewerTurnObservation({
+                    api, requireTask, requireChange, taskId, change, task,
+                    sessionId: reviewer.sessionId, isStopped,
+                  }).catch(() => false);
+                  if (typeof stopObserve === 'function') activeObservationStops.add(stopObserve);
+                }
               }
               if (!verdict) {
                 return { outcome: 'review_pending', taskId, changeId: change.id, sessionId: reviewer.sessionId };
@@ -1327,6 +1587,17 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
     isAvailable() {
       return Boolean(taskOrchestrator() && changeControl());
     },
+
+    /**
+     * T-H12 round-5 (F1) — neutralize every live reviewer-turn observation
+     * owned by this service instance. Called on controller disposal so a
+     * disposing host stops recovering turns the fresh (restarted/adopting)
+     * host now owns. Idempotent; observation already stopped is a no-op.
+     */
+    stopReviewerObservation() {
+      for (const stop of activeObservationStops) { try { stop(); } catch { /* best-effort */ } }
+      activeObservationStops.clear();
+    },
   };
   return Object.freeze(api);
 }
@@ -1413,10 +1684,13 @@ function withReviewerReservation(changeId, fn) {
  * produce two holders — so no duplicate launches.
  *
  * Claim-file layout: `<task.workspace>/.dsh-governance/reviewer-claims/
- * reviewer-claim-<changeId>`. The shared task workspace is the stable anchor
- * every host process owning the task sees; hosts without a workspace fall
- * back to the shared host tmpdir (wiped on host reboot, where all sessions
- * are dead anyway and a fresh launch is the correct convergence).
+ * reviewer-claim-<changeId>-<encoded revision>` (T-H12: one round record per
+ * Change+revision, carrying the round's session, revision, originating
+ * proof attempt, and prior open finding IDs). The shared task workspace is
+ * the stable anchor every host process owning the task sees; hosts without
+ * a workspace fall back to the shared host tmpdir (wiped on host reboot,
+ * where all sessions are dead anyway and a fresh launch is the correct
+ * convergence).
  */
 
 /**
@@ -1434,15 +1708,23 @@ const REVIEWER_CLAIM_POLL_MS = 50;
 const REVIEWER_CLAIM_WAIT_MS = REVIEWER_CLAIM_LEASE_MS + 60_000;
 
 /**
+ * T-H12: one durable review-round record per (Change, revision). The
+ * revision is path-encoded so a replaced implementation can never reuse the
+ * prior round's claim/session/binding — every new REVIEW revision requires
+ * its own explicit reviewer request.
  * @param {any} change
  * @param {any} task
+ * @param {string} [revision]
  * @returns {string}
  */
-function reviewerClaimFile(change, task) {
+function reviewerClaimFile(change, task, revision) {
   const base = typeof task?.workspace === 'string' && task.workspace.trim() !== ''
     ? task.workspace
     : tmpdir();
-  return join(base, '.dsh-governance', 'reviewer-claims', `reviewer-claim-${String(change.id)}`);
+  const round = revision === undefined || revision === null
+    ? ''
+    : `-${encodeURIComponent(String(revision))}`;
+  return join(base, '.dsh-governance', 'reviewer-claims', `reviewer-claim-${String(change.id)}${round}`);
 }
 
 /** @returns {string} the host-process identity written into claim records. */
@@ -1589,39 +1871,68 @@ function sleep(ms) {
 }
 
 /**
- * The claim protocol (see module notes). Never launches a reviewer while a
- * durable claim exists: reuses a confirmed binding, adopts a recorded
- * (launched-but-unbound) session, waits for a live owner, or takes over a
- * stale claim — then hands off to `launch`, which records its session
- * durably before binding.
+ * The claim protocol (see module notes), T-H12 revision-keyed. Never launches
+ * a reviewer while THIS round's durable record is live: reuses the round's
+ * confirmed binding, adopts the round's recorded (launched-but-unbound)
+ * session, waits for a live owner, or takes over a stale claim — then hands
+ * off to `launch`, which records its session durably before binding.
+ *
+ * T-H12 attribution rule: a reviewer binding satisfies the round ONLY when
+ * the round's own durable record (keyed Change+revision) names its session.
+ * A prior round's binding — still live or not — never substitutes for the
+ * new revision's explicit request.
  *
  * @param {{
  *   c: any, change: any, task: any,
- *   launch: (holder: { file: string, identity: string }) => Promise<string>,
+ *   revision: string,
+ *   round?: { revision: string, attemptId?: string|null, proofCommit?: string|null, findingIds?: string[] },
+ *   launch: (holder: { file: string, identity: string, requestId: string }) => Promise<string>,
+ *   probeRequest?: (sessionId: string, requestId: string | null) => Promise<'sent'|'unsent'|'unknown'>,
+ *   isStopped?: () => boolean,
  * }} deps
  * @returns {Promise<string>} the reviewer session id to use
  */
-async function reserveReviewerLaunch({ c, change, task, launch }) {
-  const file = reviewerClaimFile(change, task);
+async function reserveReviewerLaunch({ c, change, task, revision, round, launch, probeRequest, isStopped }) {
+  const ensureActive = () => {
+    if (isStopped?.()) {
+      throw Object.assign(new Error('review observer stopped'), { code: 'REVIEW_OBSERVER_STOPPED' });
+    }
+  };
+  ensureActive();
+  const file = reviewerClaimFile(change, task, revision);
   const lockFile = reclaimLockFile(file);
   const identity = claimIdentity();
   const deadline = Date.now() + REVIEWER_CLAIM_WAIT_MS;
-  const confirmedBinding = () => c.listRoleBindings()
-    .then((bindings) => bindings.find((b) => b.changeId === change.id && b.role === 'reviewer'));
-  const adopt = (sessionId, claimant) => c.bindRole(change.id, sessionId, 'reviewer')
-    .catch((err) => { if (err?.code === 'ALREADY_BOUND') return null; throw err; })
-    .then(() => c.appendAudit({
+  // The round's request is satisfied iff the durable round record names the
+  // session AND its reviewer binding is persisted (both durable).
+  const confirmedRoundBinding = async (record) => {
+    const sessionId = record && typeof record.sessionId === 'string' ? record.sessionId : null;
+    if (!sessionId) return null;
+    const binding = await c.getBinding(change.id, sessionId).catch(() => null);
+    return binding && binding.role === 'reviewer' ? sessionId : null;
+  };
+  const adopt = async (sessionId, claimant) => {
+    ensureActive();
+    await c.bindRole(change.id, sessionId, 'reviewer')
+      .catch((err) => { if (err?.code === 'ALREADY_BOUND') return null; throw err; });
+    ensureActive();
+    await c.appendAudit({
       kind: 'review_orchestration', changeId: change.id, action: 'reviewer_claim_adopted',
       sessionId, claimant: claimant ?? null,
-    }))
-    .then(() => sessionId);
+    });
+    ensureActive();
+    return sessionId;
+  };
   for (;;) {
-    // 1. Confirmed reviewer binding: durable and visible across processes —
-    //    reuse it, never launch.
-    const bound = await confirmedBinding();
-    if (bound) return bound.sessionId;
-
+    ensureActive();
     const { exists, incomplete, value: record } = await readClaimRecord(file);
+    ensureActive();
+    // 1. This round's confirmed binding: durable and visible across
+    //    processes — reuse it, never re-request.
+    const bound = await confirmedRoundBinding(record);
+    ensureActive();
+    if (bound) return bound;
+
     const stale = !incomplete && exists
       ? Date.now() - Number(record.updatedAt || 0) > REVIEWER_CLAIM_LEASE_MS
       : false;
@@ -1638,9 +1949,21 @@ async function reserveReviewerLaunch({ c, change, task, launch }) {
         await sleep(REVIEWER_CLAIM_POLL_MS);
         continue;
       }
-      // Stale owner: bind the recorded session (a concurrent adopter may
-      // have beaten us — ALREADY_BOUND is successful convergence).
-      return await adopt(record.sessionId, record.claimant);
+      // T-H12 round-4: a stale record with a session but NO send marker is
+      // ambiguous (crash after session.create / after prompt acceptance /
+      // response lost). Re-requesting here could duplicate a LIVE request;
+      // re-binding could adopt a session that never received it. Resolve
+      // authoritatively through the launcher probe UNDER the reclaim lock;
+      // only when the probe cannot say (absent, or a confirmed send) fall
+      // back to the legacy adoption.
+      if (record.sentAt == null && typeof probeRequest === 'function') {
+        // fall through to the serialized section below
+      } else {
+        // Stale owner: bind the recorded session (a concurrent adopter may
+        // have beaten us — ALREADY_BOUND is successful convergence).
+        ensureActive();
+        return await adopt(record.sessionId, record.claimant);
+      }
     }
 
     // 3. Fresh claim with no session: its owner is mid-launch — wait for
@@ -1664,30 +1987,100 @@ async function reserveReviewerLaunch({ c, change, task, launch }) {
     //    its lock is still in the slot before the critical section (T-H5
     //    PR2-03) — a lost lock means backing off, never launching.
     for (;;) {
+      ensureActive();
       if (await acquireReclaimLock(lockFile, identity)
-        && await verifyReclaimLockHeld(lockFile, identity)) break;
+        && await verifyReclaimLockHeld(lockFile, identity)) {
+        ensureActive();
+        break;
+      }
+      ensureActive();
       if (Date.now() > deadline) {
         throw Object.assign(new Error('reviewer claim wait exceeded window'), { code: 'REVIEWER_CLAIM_TIMEOUT' });
       }
       await sleep(REVIEWER_CLAIM_POLL_MS);
     }
     let created = false;
+    let createdRequestId = null;
     let adopted;
+    let adoptedRequestId = null;
     try {
       // Re-validate UNDER the lock: the claim may have changed since we read.
-      const boundNow = await confirmedBinding();
-      if (boundNow) return boundNow.sessionId;
       const r = await readClaimRecord(file);
+      ensureActive();
+      const boundNow = await confirmedRoundBinding(r.value);
+      ensureActive();
+      if (boundNow) return boundNow;
       const rStale = !r.incomplete && r.exists
         ? Date.now() - Number(r.value.updatedAt || 0) > REVIEWER_CLAIM_LEASE_MS
         : false;
-      if (r.value?.sessionId && typeof r.value.sessionId === 'string' && rStale) {
-        // A crashed owner recorded a session: reconcile it instead of launching.
+      if (r.value?.sessionId && typeof r.value.sessionId === 'string' && rStale
+        && r.value.sentAt == null && typeof probeRequest === 'function') {
+        // AMBIGUOUS stale record (round-4): the session exists but the send
+        // marker is missing — the owner crashed somewhere between session
+        // acceptance and marking the send. Prove liveness through the real
+        // launcher probe (host session history) before deciding:
+        const verdict = await probeRequest(r.value.sessionId, r.value.requestId ?? null).catch(() => 'unknown');
+        ensureActive();
+        if (verdict === 'sent') {
+          // The request WAS delivered (proof positive): adopt the SAME
+          // session, mark the send durably, and never re-prompt/re-launch
+          // this request identity.
+          adopted = await adopt(r.value.sessionId, r.value.claimant);
+          adoptedRequestId = r.value.requestId ?? null;
+          ensureActive();
+          await writeClaimRecord(file, { ...r.value, sentAt: Date.now(), updatedAt: Date.now() }).catch(() => {});
+          ensureActive();
+        } else if (verdict === 'unsent') {
+          // The request provably never landed (session dead or prompt
+          // absent from history): expire the ambiguous record atomically and
+          // fall into the (re)create branch — exactly one fresh request.
+          ensureActive();
+          await writeClaimRecord(file, {
+            ...r.value, sessionId: null, sentAt: null,
+            updatedAt: Date.now() - 2 * REVIEWER_CLAIM_LEASE_MS,
+          });
+          ensureActive();
+          createdRequestId = randomUUID();
+          ensureActive();
+          await writeClaimRecord(file, {
+            claimant: identity, sessionId: null, sentAt: null,
+            requestId: createdRequestId,
+            revision: round?.revision ?? revision,
+            attemptId: round?.attemptId ?? null,
+            proofCommit: round?.proofCommit ?? null,
+            findingIds: Array.isArray(round?.findingIds) ? round.findingIds : [],
+            updatedAt: Date.now(),
+          });
+          created = true;
+        }
+        // 'unknown': the probe could not prove delivery either way — never
+        // guess. Leave the record intact and retry on the next pass (bounded
+        // by REVIEWER_CLAIM_WAIT_MS).
+      } else if (r.value?.sessionId && typeof r.value.sessionId === 'string' && rStale) {
+        // A crashed owner recorded a session (a SENT request): reconcile it
+        // instead of launching — sent requests are never duplicated (T-H12
+        // round-3). The send marker survives the owner: `{...record}` keeps
+        // requestId/sentAt so adopters see the same request identity.
         adopted = await adopt(r.value.sessionId, r.value.claimant);
+        adoptedRequestId = r.value.requestId ?? null;
       } else if (!(r.exists && !r.incomplete && !rStale)) {
         // Absent, stale-empty, or dead-incomplete: (re)create the claim in
-        // place. Safe under the lock — we are the sole creator right now.
-        await writeClaimRecord(file, { claimant: identity, sessionId: null, updatedAt: Date.now() });
+        // place with the round attribution (T-H12) AND a fresh durable
+        // request identity persisted BEFORE the request is sent (T-H12
+        // round-3). A stale UNSENT record (requestId set, sentAt null) is
+        // recovered exactly once — this creation — never re-sent under the
+        // crashed owner's identity.
+        createdRequestId = randomUUID();
+        ensureActive();
+        await writeClaimRecord(file, {
+          claimant: identity, sessionId: null, sentAt: null,
+          requestId: createdRequestId,
+          revision: round?.revision ?? revision,
+          attemptId: round?.attemptId ?? null,
+          proofCommit: round?.proofCommit ?? null,
+          findingIds: Array.isArray(round?.findingIds) ? round.findingIds : [],
+          updatedAt: Date.now(),
+        });
         created = true;
       }
       // else: a fresh in-progress claim appeared while we waited — its
@@ -1695,10 +2088,53 @@ async function reserveReviewerLaunch({ c, change, task, launch }) {
     } finally {
       await releaseReclaimLock(lockFile, identity);
     }
-    if (adopted !== undefined) return adopted;
-    if (created) return await launch({ file, identity });
+    ensureActive();
+    if (adopted !== undefined) {
+      // The original owner may have crashed between launch and the durable
+      // request audit. Adoption is the reconciliation of THAT same request,
+      // so the round's single request audit is ensured exactly once here.
+      await ensureRoundRequestAudit(c, change, revision, adopted, adoptedRequestId, round, isStopped);
+      return adopted;
+    }
+    if (created) {
+      ensureActive();
+      return await launch({ file, identity, requestId: createdRequestId });
+    }
     continue;
   }
+}
+
+/**
+ * Exactly-once durable request audit for a review round. A live owner audits
+ * its own `review_round_requested` after a successful launch; when a crashed
+ * owner is adopted before it could, the adopting pass appends it here.
+ * Idempotent: an existing audit for this revision+request is never repeated.
+ * @param {ChangeControlApi} c
+ * @param {any} change
+ * @param {string} revision
+ * @param {string} sessionId
+ * @param {string | null} requestId
+ * @param {any} round
+ * @param {(() => boolean) | undefined} [isStopped]
+ */
+async function ensureRoundRequestAudit(c, change, revision, sessionId, requestId, round, isStopped) {
+  if (isStopped?.()) return;
+  const history = await c.history(change.id).catch(() => []);
+  if (isStopped?.()) return;
+  const already = Array.isArray(history) && history.some((/** @type {any} */ e) =>
+    e?.kind === 'review_orchestration' && e.action === 'review_round_requested'
+    && e.revision === revision
+    && (requestId == null || e.requestId === requestId));
+  if (already || isStopped?.()) return;
+  await c.appendAudit({
+    kind: 'review_orchestration', changeId: change.id,
+    action: 'review_round_requested',
+    sessionId, revision,
+    ...(requestId ? { requestId } : {}),
+    ...(round?.attemptId ? { attemptId: round.attemptId } : {}),
+    ...(round?.proofCommit ? { proofCommit: round.proofCommit } : {}),
+    findingIds: Array.isArray(round?.findingIds) ? round.findingIds : [],
+  }).catch(() => {});
 }
 
 /**
@@ -1728,15 +2164,221 @@ async function hasEscalationAudit(c, changeId) {
 }
 
 /**
- * The most recent reviewer role binding on a Change (repair rounds reuse
- * the same reviewer session), or null when none exists.
+ * Resolve a revision-keyed reviewer record without re-reading ChangeStore.
+ * The locked ChangeStore settlement path supplies its fresh revision and
+ * bindings while holding the write lock, avoiding a non-reentrant store read.
  * @param {ChangeControlApi} c
- * @param {string} changeId
+ * @param {any} change
+ * @param {any} task
+ * @param {string|null} revision
+ * @param {Array<any>|null} lockedBindings
  */
-async function currentReviewerBinding(c, changeId) {
-  const all = await c.listRoleBindings();
-  const mine = all.filter((/** @type {any} */ b) => b.changeId === changeId && b.role === 'reviewer');
-  return mine.length > 0 ? mine[mine.length - 1] : null;
+async function roundReviewerSessionForRevision(c, change, task, revision, lockedBindings = null) {
+  if (typeof revision !== 'string' || revision === '') return null;
+  const { value: record } = await readClaimRecord(reviewerClaimFile(change, task, revision));
+  const sessionId = record && typeof record.sessionId === 'string' ? record.sessionId : null;
+  if (!sessionId) return null;
+  const binding = Array.isArray(lockedBindings)
+    ? lockedBindings.find((entry) => entry?.changeId === change.id && entry.sessionId === sessionId) ?? null
+    : await c.getBinding(change.id, sessionId).catch(() => null);
+  return binding && binding.role === 'reviewer' ? { sessionId } : null;
+}
+
+/**
+ * T-H12 — the reviewer session attributed to the Change's CURRENT
+ * implementation revision: the round's durable record (keyed Change+
+ * revision) must name the session AND its reviewer binding must be
+ * persisted. Any other binding — a prior round's still-live session, or a
+ * record-less one — never satisfies the current round's explicit request.
+ * Returns { sessionId } or null.
+ * @param {ChangeControlApi} c
+ * @param {any} change
+ * @param {any} task
+ */
+async function roundReviewerSession(c, change, task) {
+  const status = await c.status(change.id).catch(() => null);
+  const revision = status?.revision ?? null;
+  if (typeof revision !== 'string' || revision === '') return null;
+  const { value: record } = await readClaimRecord(reviewerClaimFile(change, task, revision));
+  const sessionId = record && typeof record.sessionId === 'string' ? record.sessionId : null;
+  if (!sessionId) return null;
+  const binding = await c.getBinding(change.id, sessionId).catch(() => null);
+  return binding && binding.role === 'reviewer' ? { sessionId } : null;
+}
+
+/**
+ * T-H12 round-3 — atomically invalidate ONLY the current round's durable
+ * claim when its reviewer turn is proven ended without a verdict: the claim
+ * record (keyed Change+current revision) is rewritten in place with the
+ * session cleared and an already-expired timestamp, then that session's
+ * reviewer binding is removed. Other rounds' records/sessions are untouched,
+ * and nothing settles — the round stays fail-closed awaiting a fresh,
+ * recoverable explicit request.
+ * Returns true when this round's record was expired.
+ * @param {ChangeControlApi} c
+ * @param {any} change
+ * @param {any} task
+ * @param {string} sessionId
+ * @param {(() => boolean) | undefined} [isStopped] cancellation gate — re-checked
+ *   after every await and immediately before the claim-expiry write and the
+ *   unbind mutation, so a disposal racing this round's dead-turn recovery can
+ *   never expire or unbind after stop.
+ */
+async function expireReviewerRound(c, change, task, sessionId, isStopped) {
+  if (isStopped?.()) return false;
+  const status = await c.status(change.id).catch(() => null);
+  if (isStopped?.()) return false;
+  const revision = status?.revision ?? null;
+  if (typeof revision !== 'string' || revision === '') return false;
+  const file = reviewerClaimFile(change, task, revision);
+  const { value: record } = await readClaimRecord(file);
+  if (isStopped?.()) return false;
+  if (!record || record.sessionId !== sessionId) return false;
+  // Atomic rewrite (tmp+rename): claim and its send marker cleared together,
+  // so a concurrent reader never sees a half-invalidated round.
+  if (isStopped?.()) return false;
+  await writeClaimRecord(file, {
+    ...record,
+    sessionId: null,
+    sentAt: null,
+    updatedAt: Date.now() - 2 * REVIEWER_CLAIM_LEASE_MS,
+  });
+  if (isStopped?.()) return false;
+  await c.unbindRole(change.id, sessionId, { actor: 'review-orchestration' }).catch(() => {});
+  return true;
+}
+
+/**
+ * T-H12 round-4 (F2) — production observation of the launched reviewer's
+ * turn lifecycle, wired to the REAL launcher handle the launch path already
+ * holds: no caller-supplied reviewerTurn callback, no polling loop of our
+ * own (the handle's wait() is the launcher's event feed), no timers.
+ *
+ * Invariant (production): a reviewer submits its verdict THROUGH its turn
+ * (change_submit_review persists REVIEW→APPROVED|REPAIR before the turn
+ * ends). Therefore a RESOLVED wait() (turn ended, any exit status) while
+ * this round is still in REVIEW means the round can never settle: expire
+ * exactly this round's durable claim/binding (fail-closed — a PASS is never
+ * inferred), audit the dead turn, and issue exactly one fresh explicit
+ * request. Guards against churn:
+ *   - the Change already settled (any state but REVIEW) → the verdict won;
+ *   - the Change moved to a NEW revision → that revision's own round owns it;
+ *   - this session no longer owns the round record → someone else recovered.
+ * Live (unfinished) turns never resolve wait(), so live reviewers are
+ * untouched. Recovery failure leaves durable state for the next wake/restart.
+ *
+ * @param {{ handle: any, c: ChangeControlApi, change: any, task: any,
+ *   revision: string, sessionId: string,
+ *   rebuildReview: (isStopped?: () => boolean) => Promise<any> }} args
+ * @returns {(() => void) | null} a stop for this observation (null when it
+ *   could not be attached) — calling it neutralizes the recovery so a
+ *   disposed controller never recovers a turn it no longer owns.
+ */
+export function observeReviewerTurn({ handle, c, change, task, revision, sessionId, rebuildReview }) {
+  if (!handle || typeof handle.wait !== 'function') return null;
+  // A stopped observer must never recover: the launching controller has been
+  // disposed, and the fresh (restarted/adopting) controller owns the round.
+  // Declared before recover so every awaited boundary below can re-check it —
+  // stopReviewerObservation can fire while handle.wait() is already settling,
+  // and recovery must then perform NO expire/unbind/audit/relaunch mutation.
+  let stopped = false;
+
+  // T-H12 round-5 (F1): BOTH wait() outcomes are addressed — resolved means
+  // the turn ENDED (any exit status); REJECTED means the existing-session
+  // waiter itself died (host-side session gone/unreachable). Rejection must
+  // never be swallowed into a permanent review_pending: it runs the same
+  // guarded, exactly-once dead-turn recovery.
+  // T-H12 round-6 (R5-F1): `stopped` is re-checked after EVERY await and
+  // immediately before EVERY mutation (claim expiry, unbind, audit, relaunch).
+  // A disposal racing a settling wait() therefore invalidates the in-flight
+  // recovery at the next boundary: no disposed controller can write or launch.
+  const recover = async (outcome, error) => {
+    if (stopped) return;
+    const live = await c.get(change.id).catch(() => null);
+    if (stopped) return;
+    if (!live || live.state !== 'REVIEW') return; // settled/converged
+    const status = await c.status(change.id).catch(() => null);
+    if (stopped) return;
+    if ((status?.revision ?? null) !== revision) return; // a new round owns it
+    // expireReviewerRound is the claim-expiry + unbind mutation boundary; it
+    // carries the same stop gate so those mutations are gated internally too.
+    if (stopped) return;
+    const expired = await expireReviewerRound(c, change, task, sessionId, () => stopped);
+    if (stopped) return;
+    if (!expired) return; // round already recovered/superseded
+    if (stopped) return;
+    await c.appendAudit({
+      kind: 'review_orchestration', changeId: change.id,
+      action: 'reviewer_turn_ended_no_verdict',
+      sessionId, revision,
+      exitCode: typeof outcome?.exitCode === 'number' ? outcome.exitCode : null,
+      ...(error ? { error: String(error?.message ?? error) } : {}),
+    }).catch(() => {});
+    // Exactly one fresh explicit request for the same revision. Never
+    // settles anything itself — the new request is the only path forward.
+    if (stopped) return;
+    await rebuildReview(() => stopped).catch(() => {});
+  };
+  Promise.resolve()
+    .then(() => handle.wait())
+    .then(
+      (outcome) => { if (!stopped) return recover(outcome, null); },
+      // Rejected existing-session waiter = dead turn (fail-closed recovery).
+      (error) => { if (!stopped) return recover(null, error); },
+    )
+    .catch(() => { /* observation must never fault the caller's flow */ });
+  return () => { stopped = true; };
+}
+
+/**
+ * T-H12 round-5 (F1) — reattach production turn observation to the round's
+ * EXISTING session: after a controller restart, a duplicate wake, or a
+ * cross-process adoption, the only observer from request time lived in the
+ * (possibly dead) launching process. The durable claim record names the
+ * round's session and request identity; the launcher's existing-session
+ * observer (host session history, not binding/liveness alone) reattaches
+ * observation so a dead/rejected turn still recovers exactly once. A
+ * launcher without the observation surface simply skips — legacy/standalone
+ * behavior is unchanged. Never settles; observation is not completion.
+ * Returns the observation stop function (see observeReviewerTurn) when
+ * observation was (re)attached, or false when it was skipped.
+ * @param {{ api: any, requireTask: () => TaskOrchestratorApi,
+ *   requireChange: () => ChangeControlApi, taskId: string,
+ *   change: any, task: any, revision?: string, sessionId: string,
+ *   isStopped?: () => boolean }} args
+ */
+async function reattachReviewerTurnObservation({ api, requireTask, requireChange, taskId, change, task, revision, sessionId, isStopped }) {
+  if (isStopped?.()) return false;
+  const c = requireChange();
+  let liveRevision = typeof revision === 'string' && revision !== '' ? revision : null;
+  if (liveRevision === null) {
+    const status = await c.status(change.id).catch(() => null);
+    if (isStopped?.()) return false;
+    liveRevision = status?.revision ?? null;
+    if (typeof liveRevision !== 'string' || liveRevision === '') return false;
+  }
+  // Only ever attach observation to the session the round's DURABLE record
+  // names for the current revision — never to a stray binding.
+  const { value: record } = await readClaimRecord(reviewerClaimFile(change, task, liveRevision));
+  if (isStopped?.() || !record || record.sessionId !== sessionId) return false;
+  let observerLauncher = null;
+  try { observerLauncher = /** @type {any} */ (requireTask()).createReviewerLauncher?.({}); } catch { observerLauncher = null; }
+  if (isStopped?.() || typeof observerLauncher?.observeSession !== 'function') return false;
+  const handle = observerLauncher.observeSession(sessionId, record.requestId ?? null);
+  if (isStopped?.()) {
+    try { await handle?.terminate?.(); } catch { /* stop observation only */ }
+    return false;
+  }
+  const stop = observeReviewerTurn({
+    handle, c, change, task, revision: liveRevision, sessionId,
+    rebuildReview: (stopped) => api.runGovernedReview(taskId, { isStopped: stopped }),
+  });
+  if (isStopped?.()) {
+    try { stop?.(); } catch { /* observer is already neutralized */ }
+    try { await handle?.terminate?.(); } catch { /* stop observation only */ }
+    return false;
+  }
+  return stop;
 }
 
 /**
@@ -2210,7 +2852,9 @@ function buildRepairPrompt(taskId, changeId, revision, openFindings) {
  * @param {() => ChangeControlApi} requireChange
  * @param {(taskId: any) => void} requireTaskId
  * @param {string} taskId
- * @param {{ spec?: object, launcherOptions?: object,
+ * @param {{ spec?: object, launcherOptions?: object, revision?: string,
+ *   requestId?: string,
+ *   isStopped?: () => boolean,
  *   recordSession?: (sessionId: string) => Promise<void>,
  *   discardSession?: () => Promise<void> }} [options]
  *
@@ -2231,13 +2875,25 @@ function launchReviewerForTask(requireTask, requireChange, requireTaskId, taskId
     ));
   }
   return (async () => {
+    const ensureActive = () => {
+      if (options.isStopped?.()) {
+        throw Object.assign(new Error('review observer stopped'), { code: 'REVIEW_OBSERVER_STOPPED' });
+      }
+    };
+    ensureActive();
     const task = await Promise.resolve(t.get(taskId));
+    ensureActive();
     if (!task) throw Object.assign(new Error(`task not found: ${taskId}`), { code: 'TASK_NOT_FOUND' });
     const change = await c.findByWorkItem(WORK_ITEM_SYSTEM, taskId);
+    ensureActive();
     if (!change) throw Object.assign(new Error(`no Change linked to task ${taskId}`), { code: 'CHANGE_NOT_FOUND' });
+    ensureActive();
     const launcher = /** @type {any} */ (t).createReviewerLauncher(options.launcherOptions ?? {});
+    const revisionLine = typeof options.revision === 'string' && options.revision !== ''
+      ? ` The implementation revision under review is ${options.revision}; your verdict must name exactly this revision (stale-revision verdicts are rejected).`
+      : '';
     const defaultPrompt = `You are the independent reviewer for task ${task.id}.
-Review the governed Change ${change.id} against its Plan and project task acceptance criteria. Read-only: do NOT modify any files. Inspect the worker's submitted proof and test log and decide PASS / FAIL / ESCALATE with a brief rationale.`;
+Review the governed Change ${change.id} against its Plan and project task acceptance criteria.${revisionLine} Read-only: do NOT modify any files. Inspect the worker's submitted proof and test log and decide PASS / FAIL / ESCALATE with a brief rationale.`;
     const spec = options.spec ?? {
       mode: 'session',
       prompt: defaultPrompt,
@@ -2253,7 +2909,38 @@ Review the governed Change ${change.id} against its Plan and project task accept
           })()
         : {}),
     };
-    const handle = await launcher.launch({ task, spec });
+    // T-H12 round-3: the durable request identity persisted before the send
+    // is handed to the launcher verbatim, so the sent request and its
+    // durable record share one identity across crash windows.
+    const launchInput = /** @type {any} */ ({ task, spec });
+    if (typeof options.requestId === 'string' && options.requestId !== '') {
+      launchInput.requestId = options.requestId;
+    }
+    // T-H12 round-4: the REAL launcher (task-orchestrator/dispatcher) fires
+    // these hooks at the durable boundaries — recordCreated immediately after
+    // session.create (pre-send), recordSent immediately after session.prompt
+    // is accepted — closing the crash window between acceptance and the
+    // caller's own record write. Fake launchers simply never call them; the
+    // legacy post-return recordSession write below then remains the marker.
+    if (typeof options.recordCreated === 'function') {
+      launchInput.recordCreated = async ({ sessionId }) => {
+        ensureActive();
+        await options.recordCreated(sessionId);
+        ensureActive();
+      };
+    }
+    if (typeof options.recordSession === 'function') {
+      launchInput.recordSent = async ({ sessionId }) => {
+        ensureActive();
+        await options.recordSession(sessionId);
+        ensureActive();
+      };
+    }
+    const handle = await launcher.launch(launchInput);
+    if (options.isStopped?.()) {
+      try { await handle?.terminate?.(); } catch { /* best-effort */ }
+      throw Object.assign(new Error('review observer stopped'), { code: 'REVIEW_OBSERVER_STOPPED' });
+    }
     if (typeof handle?.sessionId !== 'string' || handle.sessionId === '') {
       if (typeof handle?.terminate === 'function') {
         try { await handle.terminate(); } catch { /* best-effort */ }
@@ -2265,17 +2952,21 @@ Review the governed Change ${change.id} against its Plan and project task accept
       // T-H5 PR2-01: durably record the launched session BEFORE the binding,
       // so a crash between launch and bind leaves a record a successor claim
       // can adopt (reconcile, not re-launch). Absent for plain host launches.
+      // With the real launcher the accepted-send hook (above) already wrote
+      // this record at the true boundary; the rewrite is idempotent.
       if (typeof options.recordSession === 'function') {
         await options.recordSession(handle.sessionId);
       }
+      ensureActive();
       binding = await c.bindRole(change.id, handle.sessionId, 'reviewer');
+      ensureActive();
     } catch (error) {
       if (typeof handle?.terminate === 'function') {
         try { await handle.terminate(); } catch { /* best-effort */ }
       }
       // T-H5 PR2-01: expire the durable record so a successor claim launches
       // fresh instead of adopting a session we just terminated.
-      if (typeof options.discardSession === 'function') {
+      if (typeof options.discardSession === 'function' && !options.isStopped?.()) {
         try { await options.discardSession(); } catch { /* best-effort */ }
       }
       throw error;

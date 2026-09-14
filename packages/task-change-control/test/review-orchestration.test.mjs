@@ -21,9 +21,13 @@ async function compose(t) {
     update: taskStore.update.bind(taskStore),
     updateIf: (id, e, p) => taskStore.updateIf(id, e, p),
     complete: taskStore.complete.bind(taskStore),
-    createReviewerLauncher: () => ({
-      async launch() { return { sessionId: 'sess-review-x' }; },
-    }),
+    // T-H12: each new revision's review round launches a FRESH session — the
+    // stub must hand out unique ids (a reused id is ALREADY_BOUND, correctly).
+    ...(() => { let n = 0; return {
+      createReviewerLauncher: () => ({
+        async launch() { n += 1; return { sessionId: n === 1 ? 'sess-review-x' : `sess-review-x-${n}` }; },
+      }),
+    }; })(),
   }));
   await ctx.plugin(changeControlPlugin, { storePath: join(dir, 'changes.json') });
   await ctx.plugin(plugin);

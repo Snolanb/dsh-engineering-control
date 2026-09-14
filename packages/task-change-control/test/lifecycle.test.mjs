@@ -77,7 +77,9 @@ async function composeWithPolicy(t, { storePrefix = 'tcc-th5-policy-' } = {}) {
         reviewerLaunches += 1;
         return {
           sessionId: REVIEWER_SESSION,
-          wait: async () => ({ exitCode: 0 }),
+          // T-H12 round-4: a healthy reviewer turn stays pending — the
+          // production observer treats ONLY a resolved wait() as a dead turn.
+          wait: () => new Promise(() => {}),
           terminate: async () => true,
         };
       },
@@ -97,7 +99,13 @@ async function compose(t, {
   withReviewerLauncher = true,
   storePrefix = 'tcc-th5-',
   reviewerLaunchDelay = 0,
-  reviewerSessionId = () => REVIEWER_SESSION,
+  // T-H12: each review round (new revision) launches its OWN reviewer
+  // session — default ids stay launch-unique, with the canonical first one.
+  reviewerSessionId = (n) => (n === 1 ? REVIEWER_SESSION : `${REVIEWER_SESSION}-${n}`),
+  // T-H12 round-5: the fake launcher's existing-session observation surface
+  // (restart/adoption reattach), controllable per test.
+  observableReviewerSessions = false,
+  onObserveSession = null,
 } = {}) {
   const dir = await mkdtemp(join(tmpdir(), storePrefix));
   t.after(() => rm(dir, { recursive: true, force: true }));
@@ -123,6 +131,36 @@ async function compose(t, {
     }),
   };
   let reviewerLaunches = 0;
+  // T-H12 round-4: reviewer turns stay LIVE (wait never resolves) until the
+  // test explicitly ends one — the production observer treats a resolved
+  // wait() as a dead turn and recovers exactly once.
+  const reviewerTurnEnds = new Map(); // sessionId -> 'exited' | 'failed'
+  const reviewerTurnWaiters = new Map(); // sessionId -> { resolve, reject }
+  // Reattached session history has its own host observer feed: it must not
+  // inherit a fresh launch's live waiter and hide a dead reattach turn.
+  const reattachTurnRejects = new Map();
+  const reattachTurnWaiters = new Map();
+  let reattachWaitCalls = 0;
+  const observedSessions = []; // sessions observation was (re)attached to
+  const endReviewerTurn = (sessionId, mode = 'exited') => {
+    reviewerTurnEnds.set(sessionId, mode);
+    const waiter = reviewerTurnWaiters.get(sessionId);
+    if (waiter) {
+      reviewerTurnWaiters.delete(sessionId);
+      waiter.resolve(mode === 'failed' ? { exitCode: 1 } : { exitCode: 0 });
+    }
+  };
+  // T-H12 round-5: make an EXISTING session's waiter reject (host reports
+  // the session unreachable) — the production observer must treat the
+  // rejection as a dead turn, never swallow it into permanent review_pending.
+  const rejectObservedTurn = (sessionId, error = new Error('existing session unreachable')) => {
+    reattachTurnRejects.set(sessionId, error);
+    const waiter = reattachTurnWaiters.get(sessionId);
+    if (waiter) {
+      reattachTurnWaiters.delete(sessionId);
+      waiter.reject(error);
+    }
+  };
   if (withReviewerLauncher) {
     taskOrchestrator.createReviewerLauncher = () => ({
       async launch() {
@@ -131,19 +169,53 @@ async function compose(t, {
         if (reviewerLaunchDelay > 0) {
           await new Promise((resolve) => setTimeout(resolve, reviewerLaunchDelay));
         }
+        const sessionId = reviewerSessionId(n);
         return {
-          sessionId: reviewerSessionId(n),
-          wait: async () => ({ exitCode: 0 }),
+          sessionId,
+          wait: () => {
+            const ended = reviewerTurnEnds.get(sessionId);
+            if (ended) {
+              return Promise.resolve(ended === 'failed' ? { exitCode: 1 } : { exitCode: 0 });
+            }
+            return new Promise((resolve, reject) => reviewerTurnWaiters.set(sessionId, { resolve, reject }));
+          },
           terminate: async () => true,
         };
       },
+      ...(observableReviewerSessions ? {
+        // T-H12 round-5: observation reattach for an EXISTING session
+        // (restart/cross-process adoption) — same controllable turn surface.
+        observeSession(sessionId) {
+          observedSessions.push(sessionId);
+          const reject = (error = new Error('reattached session unreachable')) => {
+            reattachTurnRejects.set(sessionId, error);
+            reattachTurnWaiters.get(sessionId)?.reject(error);
+            reattachTurnWaiters.delete(sessionId);
+          };
+          onObserveSession?.({ sessionId, reject });
+          return {
+            sessionId,
+            wait: () => {
+              reattachWaitCalls += 1;
+              const rejected = reattachTurnRejects.get(sessionId);
+              if (rejected) return Promise.reject(rejected);
+              return new Promise((resolve, rejectWait) => reattachTurnWaiters.set(sessionId, { resolve, reject: rejectWait }));
+            },
+          };
+        },
+      } : {}),
     });
   }
   ctx.provide('taskOrchestrator', Object.freeze(taskOrchestrator));
   const storePath = join(dir, 'changes.json');
   await ctx.plugin(changeControlPlugin, { storePath });
   await ctx.plugin(plugin);
-  return { ctx, taskStore, dir, storePath, taskOrchestrator, reviewerLaunches: () => reviewerLaunches };
+  return {
+    ctx, taskStore, dir, storePath, taskOrchestrator,
+    reviewerLaunches: () => reviewerLaunches, endReviewerTurn, rejectObservedTurn,
+    reattachWaitCalls: () => reattachWaitCalls,
+    observedSessions: () => [...observedSessions],
+  };
 }
 
 /** Create a governed task with an accepted plan, leaving the Change in READY (the guard's required state). */
@@ -211,6 +283,16 @@ const repairLauncher = (sessionId) => ({
     };
   },
 });
+
+/** Bounded condition wait (test-side observation of async production fibers). */
+async function waitFor(predicate, timeoutMs = 5000, label = 'condition') {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (await predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 15));
+  }
+  throw new Error(`waitFor timed out: ${label}`);
+}
 
 /** Drive the production trigger: governed dispatch of the READY task to a successful completion. */
 async function dispatchGovernedSuccess(ctx, taskStore, dir, change, overrides = {}) {
@@ -292,7 +374,7 @@ test('T-H5: fail verdict routes the repair worker automatically; the loop re-ent
   assert.equal(r1.outcome, 'review_pending', 'second review round awaits its verdict');
   assert.equal((await ctx.changeControl.get(change.id)).state, 'REVIEW');
   assert.equal((await taskStore.get(task.id)).status, 'in_review');
-  assert.equal(reviewerLaunches(), 1, 'the existing reviewer session is reused, not relaunched');
+  assert.equal(reviewerLaunches(), 2, 'T-H12: the new revision gets its own fresh reviewer session — the prior round\'s is never re-prompted');
 
   // The repair round claimed the UNRESOLVED FINDING ID from the fail verdict.
   const disk = JSON.parse(readFileSync(storePath, 'utf8'));
@@ -347,7 +429,7 @@ test('T-H5: repeated fail loops honor maxRepairRounds → escalation; re-invocat
   const escalations = (await ctx.changeControl.history(change.id))
     .filter((e) => e.kind === 'review_orchestration' && e.action === 'escalated');
   assert.equal(escalations.length, 1, 'escalation audited exactly once');
-  assert.equal(reviewerLaunches(), 1, 'no reviewer launch after escalation');
+  assert.equal(reviewerLaunches(), 3, 'one reviewer launch per revision: rounds a1, a2, a3; no reviewer launch after escalation');
 });
 
 test('T-H5: deterministic preflight fails closed (no reviewer launch); the controller resumes after correction', async (t) => {
@@ -366,6 +448,400 @@ test('T-H5: deterministic preflight fails closed (no reviewer launch); the contr
   assert.equal(out.outcome, 'review_pending');
   assert.equal((await ctx.changeControl.get(change.id)).state, 'REVIEW');
   assert.equal(reviewerLaunches(), 1);
+});
+
+test('T-H12: failed reviewer prompt claim is recoverable without a lease wait', async (t) => {
+  const { ctx, taskStore, dir, storePath, reviewerLaunches } = await compose(t, {
+    reviewerSessionId: (n) => {
+      if (n === 1) throw Object.assign(new Error('reviewer prompt failed'), { code: 'SESSION_PROMPT_FAILED' });
+      return `sess-review-retry-${n}`;
+    },
+  });
+  const { task, change } = await governedReadyTask(ctx, taskStore, dir);
+  await dispatchGovernedSuccess(ctx, taskStore, dir, change, { preflight: ['FAIL: build'] });
+  assert.equal((await ctx.changeControl.get(change.id)).state, 'PREFLIGHT');
+
+  await assert.rejects(
+    ctx.taskChangeControl.runGovernedReview(task.id, { controllerPreflightOverride: ['pass:build'] }),
+    (error) => error?.code === 'SESSION_PROMPT_FAILED',
+    'the first reviewer prompt failure remains attributable to its launch error',
+  );
+  assert.equal(reviewerLaunches(), 1, 'failed reviewer launch is counted once');
+  assert.equal(
+    (await ctx.changeControl.listRoleBindings()).filter((b) => b.changeId === change.id && b.role === 'reviewer').length,
+    0,
+    'failed reviewer launch leaves no reviewer binding',
+  );
+
+  const started = performance.now();
+  const retry = await ctx.taskChangeControl.runGovernedReview(task.id, { controllerPreflightOverride: ['pass:build'] });
+  const elapsed = performance.now() - started;
+  assert.ok(elapsed < 30_000, `retry must not wait for the ${10 * 60}s claim lease (elapsed ${elapsed}ms)`);
+  assert.equal(retry.outcome, 'review_started');
+  assert.equal(reviewerLaunches(), 2, 'retry launches one fresh reviewer session');
+  const reviewers = (await ctx.changeControl.listRoleBindings())
+    .filter((b) => b.changeId === change.id && b.role === 'reviewer');
+  assert.equal(reviewers.length, 1, 'retry persists exactly one reviewer binding');
+  const revision = (await ctx.changeControl.status(change.id)).revision;
+  const requests = (await ctx.changeControl.history(change.id))
+    .filter((e) => e.kind === 'review_orchestration' && e.action === 'review_round_requested');
+  assert.equal(requests.length, 1, 'only the successful retry records a reviewer request');
+  assert.equal(requests[0].revision, revision, 'request is attributed to the current proof revision');
+  assert.equal(requests[0].sessionId, 'sess-review-retry-2', 'request names the retry reviewer session');
+});
+
+test('T-H12 round-3: a prior round\'s reviewer session can never settle the current round', async (t) => {
+  const { ctx, taskStore, dir, reviewerLaunches } = await compose(t);
+  const { task, change } = await governedReadyTask(ctx, taskStore, dir);
+  await dispatchGovernedSuccess(ctx, taskStore, dir, change);
+
+  // Round A (revision a1, REVIEWER_SESSION) fails; the repair advances the
+  // Change to revision a2 with its OWN round-B reviewer session.
+  const r1 = await ctx.taskChangeControl.runGovernedSdlc(task.id, {
+    verdict: { verdict: 'fail', findings: [finding('p1')] },
+    worker: 'w-repair-rs', workerLauncher: repairLauncher('sess-repair-rs'),
+    repairProof: repairProof('a1', 'a2', 'c2'), maxRepairRounds: 2,
+  });
+  assert.equal(r1.outcome, 'review_pending');
+  assert.equal(reviewerLaunches(), 2, 'round B launched its own reviewer');
+
+  // Negative case 1 — the controller must REJECT a verdict naming round A's
+  // session: it cannot settle round B.
+  await assert.rejects(
+    ctx.taskChangeControl.runGovernedSdlc(task.id, {
+      verdict: { verdict: 'pass', sessionId: REVIEWER_SESSION },
+    }),
+    (error) => error?.code === 'STALE_ROUND_SESSION',
+    'round-A session must not settle round B',
+  );
+  // Direct settlement path rejects identically.
+  await assert.rejects(
+    ctx.taskChangeControl.applyReviewOutcome(task.id, { sessionId: REVIEWER_SESSION, verdict: 'pass' }),
+    (error) => error?.code === 'STALE_ROUND_SESSION',
+    'applyReviewOutcome rejects the stale round session',
+  );
+  // Nothing settled: Change stays in REVIEW, task stays in_review.
+  assert.equal((await ctx.changeControl.get(change.id)).state, 'REVIEW');
+  assert.equal((await taskStore.get(task.id)).status, 'in_review');
+  const audits = await ctx.changeControl.history(change.id);
+  assert.ok(audits.some((e) => e.kind === 'review_orchestration'
+    && e.action === 'review_outcome_wrong_round_session'
+    && e.sessionId === REVIEWER_SESSION),
+    'the rejected cross-round settlement is audited with the offending session');
+  assert.ok(!audits.some((e) => e.action === 'review_pass_approved'),
+    'no settlement was applied');
+
+  // The genuine round-B reviewer session settles.
+  const r2 = await ctx.taskChangeControl.runGovernedSdlc(task.id, {
+    verdict: { verdict: 'pass', sessionId: `${REVIEWER_SESSION}-2` },
+  });
+  assert.equal(r2.outcome, 'approved');
+  assert.equal((await ctx.changeControl.get(change.id)).state, 'APPROVED');
+  assert.equal((await taskStore.get(task.id)).status, 'done');
+});
+
+test('T-H12 round-4: the model-facing change_submit_review tool seam rejects a prior-round reviewer on the current revision (F1)', async (t) => {
+  const { ctx, taskStore, dir, reviewerLaunches } = await compose(t);
+  const { task, change } = await governedReadyTask(ctx, taskStore, dir);
+  await dispatchGovernedSuccess(ctx, taskStore, dir, change);
+
+  // Round A (revision a1, REVIEWER_SESSION) FAILs; repair advances to a2 and
+  // round B launches its own fresh reviewer (REVIEWER_SESSION-2).
+  const r1 = await ctx.taskChangeControl.runGovernedSdlc(task.id, {
+    verdict: { verdict: 'fail', findings: [finding('t1')] },
+    worker: 'w-repair-tool', workerLauncher: repairLauncher('sess-repair-tool'),
+    repairProof: repairProof('a1', 'a2', 'c2'), maxRepairRounds: 2,
+  });
+  assert.equal(r1.outcome, 'review_pending');
+  assert.equal(reviewerLaunches(), 2);
+  assert.equal((await ctx.changeControl.status(change.id)).revision, 'a2');
+
+  const reviewTool = ctx.tools.view().visible.get('change_submit_review');
+  assert.ok(reviewTool, 'real model-facing change_submit_review is registered');
+
+  // The CANONICAL tool seam: round A's still-bound reviewer tries to approve
+  // the CURRENT revision — rejected BEFORE any store mutation.
+  await assert.rejects(
+    reviewTool.execute(
+      { changeId: change.id, review: { verdict: 'pass', revision: 'a2', findings: [] } },
+      { agent: { id: REVIEWER_SESSION } },
+    ),
+    (error) => error?.code === 'STALE_ROUND_SESSION',
+    'the tool seam rejects a prior-round reviewer settling the current revision',
+  );
+  assert.equal((await ctx.changeControl.get(change.id)).state, 'REVIEW', 'no settlement leaked');
+  const rejected = (await ctx.changeControl.history(change.id)).filter((e) =>
+    e.kind === 'review_orchestration' && e.action === 'review_submit_wrong_round_session');
+  assert.equal(rejected.length, 1, 'the rejected tool settlement is audited');
+  assert.equal(rejected[0].sessionId, REVIEWER_SESSION);
+  assert.equal(rejected[0].expectedSessionId, `${REVIEWER_SESSION}-2`);
+
+  // The current round's own reviewer settles through the same seam.
+  const result = await reviewTool.execute(
+    { changeId: change.id, review: { verdict: 'pass', revision: 'a2', findings: [] } },
+    { agent: { id: `${REVIEWER_SESSION}-2` } },
+  );
+  assert.equal(result.state, 'APPROVED', 'the current round reviewer settles through the tool seam');
+  await waitFor(() => taskStore.get(task.id).status === 'done', 5000, 'H11 wake converged the task');
+
+  // Standalone, non-governed Change Control behavior is untouched: an
+  // unlinked Change in REVIEW settles with its (legacy) bound reviewer even
+  // without any durable round record.
+  const standalone = await ctx.changeControl.create({
+    title: 'standalone', objective: 'o', acceptanceCriteria: ['s'], risk: 'low',
+  });
+  for (const state of ['PLANNED', 'READY', 'IMPLEMENTING']) {
+    await ctx.changeControl.transition(standalone.id, state, { actor: 'host' });
+  }
+  await ctx.changeControl.bindRole(standalone.id, 'sess-standalone', 'reviewer');
+  await ctx.changeControl.submitProof(standalone.id, {
+    beforeRevision: 'base', afterRevision: 'solo1', commit_sha: 'solo1',
+    files_changed: ['f'], tests_run: ['t'], remaining_blockers: [],
+    criteria: [{ id: 's', satisfied: true }], deviations: [],
+    workerChecks: ['ok'], controllerPreflight: ['ok'], summary: 'standalone done',
+  });
+  if ((await ctx.changeControl.get(standalone.id)).state === 'PREFLIGHT') {
+    await ctx.changeControl.transition(standalone.id, 'REVIEW', { actor: 'host' });
+  }
+  const soloReview = await reviewTool.execute(
+    { changeId: standalone.id, review: { verdict: 'pass', revision: 'solo1', findings: [] } },
+    { agent: { id: 'sess-standalone' } },
+  );
+  assert.equal(soloReview.state, 'APPROVED', 'standalone (no round record) review behavior is unchanged');
+});
+
+test('T-H12 round-7: a governed REVIEW with no durable round fails closed at the real tool seam', async (t) => {
+  const { ctx, taskStore, dir } = await compose(t);
+  const { task, change } = await governedReadyTask(ctx, taskStore, dir);
+  await dispatchGovernedSuccess(ctx, taskStore, dir, change);
+  const revision = (await ctx.changeControl.status(change.id)).revision;
+  const claimFile = join(dir, '.dsh-governance', 'reviewer-claims', `reviewer-claim-${change.id}-${revision}`);
+  await rm(claimFile, { force: true });
+  const reviewTool = ctx.tools.view().visible.get('change_submit_review');
+  await assert.rejects(
+    reviewTool.execute(
+      { changeId: change.id, review: { verdict: 'pass', revision, findings: [] } },
+      { agent: { id: REVIEWER_SESSION } },
+    ),
+    (error) => error?.code === 'STALE_ROUND_SESSION',
+    'missing current-round state must not authorize a reviewer settlement',
+  );
+  assert.equal((await ctx.changeControl.get(change.id)).state, 'REVIEW');
+  const history = await ctx.changeControl.history(change.id);
+  assert.ok(history.some((event) => event.action === 'review_submit_missing_round'), 'missing-round rejection is audited');
+});
+
+test('T-H12 round-4: a production-launched reviewer turn that exits/fails without a verdict expires only its round and issues exactly one fresh request (fail-closed)', async (t) => {
+  const { ctx, taskStore, dir, reviewerLaunches, endReviewerTurn } = await compose(t);
+  const { task, change } = await governedReadyTask(ctx, taskStore, dir);
+  await dispatchGovernedSuccess(ctx, taskStore, dir, change);
+  assert.equal((await ctx.changeControl.get(change.id)).state, 'REVIEW');
+  assert.equal(reviewerLaunches(), 1);
+
+  // (a) The REAL launched reviewer's turn EXITS without a verdict. The
+  // production observer (wired to the launcher handle, not a caller callback)
+  // expires only round a1 and issues exactly one recoverable fresh request.
+  endReviewerTurn(REVIEWER_SESSION, 'exited');
+  await waitFor(() => reviewerLaunches() === 2, 5000, 'observer recovered the exited round exactly once');
+  const reviewers1 = (await ctx.changeControl.listRoleBindings())
+    .filter((b) => b.changeId === change.id && b.role === 'reviewer');
+  assert.deepEqual(reviewers1.map((b) => b.sessionId), [`${REVIEWER_SESSION}-2`],
+    'only the dead session\'s binding is invalidated — no leak of the dead round');
+  // Fail-closed: the Change never ADVANCES without a real verdict.
+  assert.equal((await ctx.changeControl.get(change.id)).state, 'REVIEW');
+  assert.equal((await taskStore.get(task.id)).status, 'in_review');
+
+  // (b) A turn FAILURE (exit ≠ 0): identical recovery, again exactly once.
+  endReviewerTurn(`${REVIEWER_SESSION}-2`, 'failed');
+  await waitFor(() => reviewerLaunches() === 3, 5000, 'observer recovered the failed turn exactly once');
+
+  // (c) A live reviewer turn: no churn across further controller wakes.
+  const r3 = await ctx.taskChangeControl.runGovernedSdlc(task.id, {});
+  assert.equal(r3.outcome, 'review_pending');
+  assert.equal(r3.sessionId, `${REVIEWER_SESSION}-3`, 'converged on the current round session');
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(reviewerLaunches(), 3, 'healthy reviewer is never re-requested');
+
+  const audits = await ctx.changeControl.history(change.id);
+  const ended = audits.filter((e) => e.kind === 'review_orchestration' && e.action === 'reviewer_turn_ended_no_verdict');
+  assert.deepEqual(
+    ended.map((e) => ({ sessionId: e.sessionId, revision: e.revision, exitCode: e.exitCode })),
+    [
+      { sessionId: REVIEWER_SESSION, revision: 'a1', exitCode: 0 },
+      { sessionId: `${REVIEWER_SESSION}-2`, revision: 'a1', exitCode: 1 },
+    ],
+    'each dead turn is audited with its session, round revision, and exit status',
+  );
+  const requests = audits.filter((e) => e.kind === 'review_orchestration' && e.action === 'review_round_requested');
+  assert.equal(requests.length, 3, 'one explicit request per round turn — initial + two recoveries');
+
+  // The recovered round still settles normally with a real verdict.
+  const r4 = await ctx.taskChangeControl.runGovernedSdlc(task.id, {
+    verdict: { verdict: 'pass', sessionId: `${REVIEWER_SESSION}-3` },
+  });
+  assert.equal(r4.outcome, 'approved');
+  assert.equal((await taskStore.get(task.id)).status, 'done');
+});
+
+test('T-H12 round-5 (F1): restart-style wake reattaches turn observation to the recorded round session; a rejected existing-session waiter recovers exactly once', async (t) => {
+  const { ctx, taskStore, dir, reviewerLaunches, rejectObservedTurn, observedSessions } = await compose(t, { observableReviewerSessions: true });
+  const { task, change } = await governedReadyTask(ctx, taskStore, dir);
+  await dispatchGovernedSuccess(ctx, taskStore, dir, change);
+  assert.equal(reviewerLaunches(), 1);
+  assert.deepEqual(observedSessions(), [], 'fresh launches observe their own handle — no duplicate attach');
+
+  // (a) A restart-style wake finds the round's CONFIRMED session through
+  // durable state alone: NO new launch; production observation reattaches to
+  // exactly the recorded round session (the observer a controller restart
+  // would own — the only durable path back to a dead turn).
+  const r2 = await ctx.taskChangeControl.runGovernedSdlc(task.id, {});
+  assert.equal(r2.outcome, 'review_pending');
+  assert.equal(r2.sessionId, REVIEWER_SESSION);
+  assert.deepEqual(observedSessions(), [REVIEWER_SESSION], 'observation reattached exactly once to the recorded round session');
+  assert.equal(reviewerLaunches(), 1, 'a confirmed round is never re-requested');
+
+  // (b) The existing-session waiter REJECTS (host reports the reviewer
+  // session unreachable): dead-turn recovery — expire only this round,
+  // fail-closed audit with the rejection evidence, exactly one fresh
+  // explicit request. Never swallowed into permanent review_pending.
+  rejectObservedTurn(REVIEWER_SESSION);
+  await waitFor(() => reviewerLaunches() === 2, 5000, 'rejected waiter recovered exactly once');
+  assert.equal((await ctx.changeControl.get(change.id)).state, 'REVIEW', 'no PASS inferred from a rejection');
+  assert.equal((await taskStore.get(task.id)).status, 'in_review');
+  const audits = await ctx.changeControl.history(change.id);
+  const ended = audits.filter((e) => e.kind === 'review_orchestration' && e.action === 'reviewer_turn_ended_no_verdict');
+  assert.equal(ended.length, 1, 'the rejected turn is audited exactly once');
+  assert.equal(ended[0].sessionId, REVIEWER_SESSION);
+  assert.equal(ended[0].revision, 'a1');
+  assert.match(String(ended[0].error ?? ''), /unreachable/, 'the waiter rejection is the audited failure evidence');
+  assert.equal(
+    audits.filter((e) => e.kind === 'review_orchestration' && e.action === 'review_round_requested').length,
+    2, 'initial request + exactly one recovery request — never a burst',
+  );
+  const reviewers = (await ctx.changeControl.listRoleBindings())
+    .filter((b) => b.changeId === change.id && b.role === 'reviewer');
+  assert.deepEqual(reviewers.map((b) => b.sessionId), [`${REVIEWER_SESSION}-2`],
+    'only the rejected round\'s binding was invalidated');
+
+  // (c) The recovered current round still settles normally with a real
+  // verdict — attribution/guard semantics preserved.
+  const r3 = await ctx.taskChangeControl.runGovernedSdlc(task.id, {
+    verdict: { verdict: 'pass', sessionId: `${REVIEWER_SESSION}-2` },
+  });
+  assert.equal(r3.outcome, 'approved');
+  assert.equal((await taskStore.get(task.id)).status, 'done');
+});
+
+test('T-H12 round-8: stop racing a rejected reattach handle leaves no observer recovery', async (t) => {
+  let stopped = false;
+  const { ctx, taskStore, dir, reviewerLaunches, observedSessions, reattachWaitCalls } = await compose(t, {
+    observableReviewerSessions: true,
+    // The reattach host history is independently terminal before attachment;
+    // teardown lands in the same synchronous attachment boundary.
+    onObserveSession: ({ reject }) => {
+      reject(new Error('reattach terminal during teardown'));
+      stopped = true;
+    },
+  });
+  const { task, change } = await governedReadyTask(ctx, taskStore, dir);
+  await dispatchGovernedSuccess(ctx, taskStore, dir, change);
+  const before = await ctx.changeControl.history(change.id);
+
+  const out = await ctx.taskChangeControl.runGovernedReview(task.id, {
+    controllerPreflightOverride: ['pass:build'], isStopped: () => stopped,
+  });
+  assert.equal(out.outcome, 'review_started');
+  assert.deepEqual(observedSessions(), [REVIEWER_SESSION]);
+  // A missing reattach cancellation gate attaches this pre-rejected handle,
+  // synchronously increments this counter, then starts dead-turn recovery.
+  assert.equal(reattachWaitCalls(), 0, 'teardown prevents the reattach observer from draining a dead history');
+  assert.equal(reviewerLaunches(), 1, 'teardown never launches or re-prompts');
+  const after = await ctx.changeControl.history(change.id);
+  assert.deepEqual(after, before, 'no post-stop status/claim expiry/unbind/audit mutation');
+  assert.equal(after.filter((e) => e.kind === 'review_orchestration' && e.action === 'review_round_requested').length, 1);
+  const reviewers = (await ctx.changeControl.listRoleBindings()).filter((b) => b.changeId === change.id && b.role === 'reviewer');
+  assert.deepEqual(reviewers.map((b) => b.sessionId), [REVIEWER_SESSION], 'durable reviewer binding survives teardown');
+});
+
+test('T-H12 round-3: crash before the request is sent recovers the unsent request exactly once', async (t) => {
+  const { ctx, taskStore, dir, reviewerLaunches } = await compose(t);
+  const { task, change } = await governedReadyTask(ctx, taskStore, dir);
+  await dispatchGovernedSuccess(ctx, taskStore, dir, change, { preflight: ['FAIL: build'] });
+  assert.equal((await ctx.changeControl.get(change.id)).state, 'PREFLIGHT');
+
+  // Crash window BEFORE request creation: the dead owner's durable record
+  // holds a request identity but was never sent (no session, no sentAt).
+  const file = reviewerClaimFileFor(task, change, 'a1');
+  await mkdir(dirname(file), { recursive: true });
+  await writeFile(file, JSON.stringify({
+    claimant: 'dead-host:1', requestId: 'req-unsent-1',
+    sessionId: null, sentAt: null, revision: 'a1',
+    updatedAt: Date.now() - 2 * 10 * 60 * 1000,
+  }));
+
+  const rv = await ctx.taskChangeControl.runGovernedReview(task.id, { controllerPreflightOverride: ['pass:build'] });
+  assert.equal(rv.outcome, 'review_started');
+  assert.equal(reviewerLaunches(), 1, 'the unsent request is recovered exactly once');
+
+  // The recovered request runs under a FRESH durable identity (the crashed
+  // owner's identity is never reused), atomically marked sent with the
+  // recorded session.
+  const record = JSON.parse(readFileSync(file, 'utf8'));
+  assert.equal(record.sessionId, REVIEWER_SESSION);
+  assert.equal(typeof record.sentAt, 'number', 'send is durably marked');
+  assert.equal(typeof record.requestId, 'string');
+  assert.notEqual(record.requestId, 'req-unsent-1', 'recovery mints a new request identity');
+
+  // Restart AFTER recovery (re-invocation): converge with zero new launches
+  // and zero duplicate request audits.
+  const rv2 = await ctx.taskChangeControl.runGovernedReview(task.id, { controllerPreflightOverride: ['pass:build'] });
+  assert.equal(rv2.sessionId, REVIEWER_SESSION);
+  assert.equal(reviewerLaunches(), 1, 'no duplicate request after recovery');
+  const requests = (await ctx.changeControl.history(change.id))
+    .filter((e) => e.kind === 'review_orchestration' && e.action === 'review_round_requested');
+  assert.equal(requests.length, 1, 'exactly one audited request for the recovered round');
+  assert.equal(requests[0].requestId, record.requestId, 'audit carries the durable request identity');
+});
+
+test('T-H12 round-3: crash after the request was sent suppresses duplicates — the recorded session is adopted, never re-requested', async (t) => {
+  const { ctx, taskStore, dir, reviewerLaunches } = await compose(t);
+  const { task, change } = await governedReadyTask(ctx, taskStore, dir);
+  await dispatchGovernedSuccess(ctx, taskStore, dir, change, { preflight: ['FAIL: build'] });
+  assert.equal((await ctx.changeControl.get(change.id)).state, 'PREFLIGHT');
+
+  // Crash window AFTER request creation: the dead owner's record marks the
+  // request SENT (session recorded + sentAt) before it bound.
+  const file = reviewerClaimFileFor(task, change, 'a1');
+  await mkdir(dirname(file), { recursive: true });
+  await writeFile(file, JSON.stringify({
+    claimant: 'dead-host:1', requestId: 'req-sent-1',
+    sessionId: 'sess-sent-unbound', sentAt: Date.now() - 11 * 60 * 1000,
+    revision: 'a1', updatedAt: Date.now() - 2 * 10 * 60 * 1000,
+  }));
+
+  const rv = await ctx.taskChangeControl.runGovernedReview(task.id, { controllerPreflightOverride: ['pass:build'] });
+  assert.equal(rv.outcome, 'review_started');
+  assert.equal(rv.sessionId, 'sess-sent-unbound', 'the recorded sent session is adopted');
+  assert.equal(reviewerLaunches(), 0, 'a sent request is never re-sent');
+  const reviewers = (await ctx.changeControl.listRoleBindings())
+    .filter((b) => b.changeId === change.id && b.role === 'reviewer');
+  assert.deepEqual(reviewers.map((b) => b.sessionId), ['sess-sent-unbound'],
+    'the adopted session becomes the round\'s reviewer binding');
+
+  // Restart again: the confirmed binding converges — still zero launches,
+  // and this host added NO duplicate request audit (the send belongs to the
+  // crashed owner; adoption is recorded separately).
+  const rv2 = await ctx.taskChangeControl.runGovernedReview(task.id, { controllerPreflightOverride: ['pass:build'] });
+  assert.equal(rv2.sessionId, 'sess-sent-unbound');
+  assert.equal(reviewerLaunches(), 0);
+  const audits = await ctx.changeControl.history(change.id);
+  assert.equal(
+    audits.filter((e) => e.kind === 'review_orchestration' && e.action === 'review_round_requested').length,
+    0,
+    'no duplicate explicit request is audited for an adopted sent request',
+  );
+  assert.ok(audits.some((e) => e.kind === 'review_orchestration' && e.action === 'reviewer_claim_adopted'
+    && e.sessionId === 'sess-sent-unbound'), 'the adoption (not a request) is what was audited');
 });
 
 test('T-H5: trigger degrades fail-soft when the reviewer launcher is unavailable (completion still converges)', async (t) => {
@@ -513,14 +989,16 @@ test('T-H5 PR1-02: concurrent runGovernedSdlc calls launch and bind exactly ONE 
 // ─── T-H5 PR2-01 — durable cross-process reviewer claim ───────────────────────
 
 /**
- * Durable claim-file convention (mirrors src/service.js, T-H5 PR2-01):
- *   <task.workspace>/.dsh-governance/reviewer-claims/reviewer-claim-<changeId>
+ * Durable claim-file convention (mirrors src/service.js, T-H5 PR2-01 + T-H12):
+ *   <task.workspace>/.dsh-governance/reviewer-claims/reviewer-claim-<changeId>-<encoded revision>
  * Exclusive-create claims it; atomic rewrites record the launched session
  * BEFORE binding so a crashed owner's reviewer is adopted, not re-launched.
+ * The claim is keyed by the Change's CURRENT revision: dispatchGovernedSuccess
+ * defaults to afterRevision 'a1', so the round-1 claim encodes 'a1'.
  */
-function reviewerClaimFileFor(task, change) {
+function reviewerClaimFileFor(task, change, revision = 'a1') {
   const base = typeof task?.workspace === 'string' && task.workspace.trim() !== '' ? task.workspace : tmpdir();
-  return join(base, '.dsh-governance', 'reviewer-claims', `reviewer-claim-${String(change.id)}`);
+  return join(base, '.dsh-governance', 'reviewer-claims', `reviewer-claim-${String(change.id)}-${encodeURIComponent(String(revision))}`);
 }
 
 /** Self-contained host process: same composition as compose(), racing runGovernedSdlc. */
@@ -549,7 +1027,9 @@ const taskOrchestrator = Object.freeze({
       appendFileSync(join(dir, 'reviewer-launches.log'), sessionId + '\\n');
       // Widen the cross-process race window deliberately (env-tunable for stress).
       await new Promise((resolve) => setTimeout(resolve, Number(process.env.TCC_LAUNCH_MS || 200)));
-      return { sessionId, wait: async () => ({ exitCode: 0 }), terminate: async () => true };
+      // T-H12 round-4: the observer treats a RESOLVED wait() as a dead turn.
+      // A healthy live turn is pending until the child exits.
+      return { sessionId, wait: () => new Promise(() => {}), terminate: async () => true };
     },
   }),
 });
