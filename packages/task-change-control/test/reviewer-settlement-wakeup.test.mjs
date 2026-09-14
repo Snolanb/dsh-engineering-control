@@ -36,10 +36,11 @@ const REVIEW_SETTLED_EVENT = 'change-control/review-settled';
 
 // Deterministic stand-in for the host session server (same seam the real
 // createWorkerLauncher/createReviewerLauncher poll via globalThis.fetch).
-function createSessionRpc(proof) {
+function createSessionRpc(proof, { endFirstReviewerOnPrompt = false } = {}) {
   const sessions = new Map();
   const killed = new Set();
   let counter = 0;
+  let endedFirstReviewer = false;
   const createdSessionIds = [];
   const respond = (value) => ({
     ok: true,
@@ -70,7 +71,13 @@ function createSessionRpc(proof) {
     if (method === 'session.selectModel' || method === 'session.cancel') return respond({});
     if (method === 'session.prompt') {
       const s = sessions.get(sessionId);
-      if (s) s.prompt = body.payload?.content?.[0]?.text ?? '';
+      if (s) {
+        s.prompt = body.payload?.content?.[0]?.text ?? '';
+        if (endFirstReviewerOnPrompt && s.preset === 'reviewer' && !endedFirstReviewer) {
+          endedFirstReviewer = true;
+          s.ended = { kind: 'error', error: { message: 'reviewer ended before REVIEW transition' } };
+        }
+      }
       return respond({});
     }
     if (method === 'session.history') {
@@ -161,13 +168,13 @@ async function waitFor(predicate, timeoutMs = 1500) {
 }
 
 /** Full production composition: all three real plugins, real stores. */
-async function compose(t) {
+async function compose(t, rpcOptions = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'h11-wake-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const taskDbPath = join(dir, 'tasks.db');
   const changesJsonPath = join(dir, 'changes.json');
 
-  const rpc = createSessionRpc(workerProof());
+  const rpc = createSessionRpc(workerProof(), rpcOptions);
   const realFetch = globalThis.fetch;
   globalThis.fetch = rpc.fetchImpl;
   t.after(() => { globalThis.fetch = realFetch; });
@@ -267,6 +274,25 @@ async function governedReviewPending(c) {
   const reviewTool = c.ctx.tools.view().visible.get('change_submit_review');
   return { task, change, orch, cc, tcc, reviewerSession, reviewTool, workerSession: c.rpc.createdSessionIds[0] };
 }
+
+test('T-H12 round-8: real no-policy reviewer terminal before PREFLIGHT→REVIEW recovers once', async (t) => {
+  const c = await compose(t, { endFirstReviewerOnPrompt: true });
+  const { task, change, orch, cc } = await governedReviewPending(c);
+
+  // The real createReviewerLauncher/session-history seam records a terminal
+  // before the fallback transition. Observation must wait for REVIEW, expire
+  // that round once, and issue one fresh request without inferring PASS.
+  await waitFor(async () => c.rpc.createdSessionIds.length === 3
+    && (await cc.history(change.id)).filter((e) => e.kind === 'review_orchestration' && e.action === 'review_round_requested').length === 2, 15000);
+  assert.equal((await cc.get(change.id)).state, 'REVIEW');
+  assert.equal(orch.get(task.id).status, 'in_review');
+  const history = await cc.history(change.id);
+  assert.equal(history.filter((e) => e.kind === 'review_orchestration' && e.action === 'reviewer_turn_ended_no_verdict').length, 1);
+  assert.equal(history.filter((e) => e.kind === 'review_orchestration' && e.action === 'review_round_requested').length, 2);
+  const reviewers = (await cc.listRoleBindings()).filter((b) => b.changeId === change.id && b.role === 'reviewer');
+  assert.equal(reviewers.length, 1, 'only the recovered live reviewer remains bound');
+  assert.notEqual(reviewers[0].sessionId, c.rpc.createdSessionIds[1]);
+});
 
 const failFindings = [{
   severity: 'critical', category: 'test', location: 'src/x.js',

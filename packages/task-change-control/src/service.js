@@ -855,6 +855,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         // session (restart wake, confirmed binding, cross-process adoption)
         // reattaches observation right after the reservation resolves.
         let launchedHere = false;
+        let launchedHandle = null;
         const sessionId = await withReviewerReservation(`${change.id}:${revision}`, async () => {
           return reserveReviewerLaunch({
             isStopped,
@@ -939,43 +940,25 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
                 ...(round.proofCommit !== null ? { proofCommit: round.proofCommit } : {}),
                 findingIds: round.findingIds,
               });
-              // T-H12 round-4 (F2): production observation of the real
-              // launched reviewer's turn lifecycle — the launcher's own
-              // handle, not a caller-supplied callback. A turn that ENDS
-              // (any reason) while this round is still unsettled is a dead
-              // round: expire exactly this round's claim/binding and issue
-              // exactly one fresh explicit request. A settled Change
-              // (verdict persisted before the turn ended) or a superseding
-              // revision means no churn; runGovernedReview's claim machinery
-              // keeps the recovery exactly-once across processes.
-              ensureActive();
-              const stopObserve = observeReviewerTurn({
-                handle: launched.handle, c, change, task, revision,
-                sessionId: launched.sessionId,
-                rebuildReview: (isStopped) => api.runGovernedReview(taskId, { isStopped }),
-              });
-              if (stopObserve) activeObservationStops.add(stopObserve);
+              // Keep the real launch handle until PREFLIGHT→REVIEW below.
+              // In the NO_POLICY fallback a terminal history observed before
+              // that transition would otherwise see PREFLIGHT and be lost.
+              launchedHandle = launched.handle;
               launchedHere = true;
               return launched.sessionId;
             },
           });
         });
         ensureActive();
-        if (!launchedHere) {
-          // Existing round session (per the durable record): reattach
-          // production turn observation to the real session lifecycle.
-          const stopObserve = await reattachReviewerTurnObservation({
-            api, requireTask, requireChange, taskId, change, task, revision, sessionId,
-          }).catch(() => false);
-          if (typeof stopObserve === 'function') activeObservationStops.add(stopObserve);
-        }
         // A successful store runPreflight is authoritative for the state
         // move: under a real preflight policy the store itself performed
         // PREFLIGHT→REVIEW. Re-read the live state and transition ONLY in
-        // the NO_POLICY fallback, where the store did not move it — exactly
-        // one PREFLIGHT→REVIEW transition, never a double move.
+        // the NO_POLICY fallback, where the store did not move it. Crucially,
+        // attach turn observation only AFTER this transition: an immediately
+        // terminal real session must recover its REVIEW round, never observe
+        // PREFLIGHT and disappear before the state move.
         const liveAfterPreflight = await c.get(change.id);
-         ensureActive();
+        ensureActive();
         if (liveAfterPreflight.state === 'PREFLIGHT') {
           await c.transition(change.id, 'REVIEW', { actor: 'review-orchestration' }).catch((err) => {
             if (err?.name !== 'ChangeDomainError') throw err;
@@ -984,7 +967,26 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
             // so the stage already converged; its launch is bound under the
             // same claim we just released.
           });
+          ensureActive();
         }
+        let stopObserve = null;
+        if (launchedHere) {
+          stopObserve = observeReviewerTurn({
+            handle: launchedHandle, c, change, task, revision, sessionId,
+            rebuildReview: (stopped) => api.runGovernedReview(taskId, { isStopped: stopped }),
+          });
+        } else {
+          stopObserve = await reattachReviewerTurnObservation({
+            api, requireTask, requireChange, taskId, change, task, revision, sessionId, isStopped,
+          }).catch(() => false);
+        }
+        // A stop may race either real `observeSession` or observer creation.
+        // Neutralize the returned observation instead of leaving it untracked.
+        if (isStopped?.()) {
+          try { stopObserve?.(); } catch { /* best-effort */ }
+          return { outcome: 'review_started', sessionId, changeId: change.id };
+        }
+        if (typeof stopObserve === 'function') activeObservationStops.add(stopObserve);
         return { outcome: 'review_started', sessionId, changeId: change.id };
       })();
     },
@@ -1237,7 +1239,8 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
      *   repairProof?: object,
      *   repairFindings?: object[],
      *   repairClaim?: string,
-     *   leaseSeconds?: number }} [options]
+     *   leaseSeconds?: number,
+     *   isStopped?: () => boolean }} [options]
      * @returns {Promise<{ outcome: string, [key: string]: any }>}
      */
     runGovernedSdlc(taskId, options = {}) {
@@ -1245,6 +1248,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
       const c = requireChange();
       requireTaskId(taskId);
       const maxRepairRounds = options.maxRepairRounds ?? 3;
+      const isStopped = typeof options.isStopped === 'function' ? options.isStopped : undefined;
       // The verdict is one-shot per call: a repair loop that re-enters the
       // REVIEW stage must never re-settle the same verdict.
       let verdict = options.verdict && (options.verdict.verdict === 'pass' || options.verdict.verdict === 'fail')
@@ -1312,7 +1316,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
             }
             // Deterministic preflight + reviewer launch/bind (reviewer
             // sessions never touch task claim/lease).
-            const rv = await api.runGovernedReview(taskId, { controllerPreflightOverride: options.controllerPreflightOverride });
+            const rv = await api.runGovernedReview(taskId, { controllerPreflightOverride: options.controllerPreflightOverride, isStopped });
             if (rv.outcome === 'preflight_failed') {
               return { outcome: 'preflight_failed', taskId, changeId: change.id };
             }
@@ -1367,7 +1371,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
                 // while only a prior round's reviewer was bound): issue
                 // exactly one new explicit review round without re-running
                 // preflight.
-                const rv = await api.runGovernedReview(taskId, { controllerPreflightOverride: options.controllerPreflightOverride });
+                const rv = await api.runGovernedReview(taskId, { controllerPreflightOverride: options.controllerPreflightOverride, isStopped });
                 if (rv.outcome === 'preflight_failed') {
                   return { outcome: 'preflight_failed', taskId, changeId: change.id };
                 }
@@ -1383,7 +1387,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
                 if (!observedLaunchSessionIds.has(reviewer.sessionId)) {
                   const stopObserve = await reattachReviewerTurnObservation({
                     api, requireTask, requireChange, taskId, change, task,
-                    sessionId: reviewer.sessionId,
+                    sessionId: reviewer.sessionId, isStopped,
                   }).catch(() => false);
                   if (typeof stopObserve === 'function') activeObservationStops.add(stopObserve);
                 }
@@ -2340,28 +2344,41 @@ export function observeReviewerTurn({ handle, c, change, task, revision, session
  * observation was (re)attached, or false when it was skipped.
  * @param {{ api: any, requireTask: () => TaskOrchestratorApi,
  *   requireChange: () => ChangeControlApi, taskId: string,
- *   change: any, task: any, revision?: string, sessionId: string }} args
+ *   change: any, task: any, revision?: string, sessionId: string,
+ *   isStopped?: () => boolean }} args
  */
-async function reattachReviewerTurnObservation({ api, requireTask, requireChange, taskId, change, task, revision, sessionId }) {
+async function reattachReviewerTurnObservation({ api, requireTask, requireChange, taskId, change, task, revision, sessionId, isStopped }) {
+  if (isStopped?.()) return false;
   const c = requireChange();
   let liveRevision = typeof revision === 'string' && revision !== '' ? revision : null;
   if (liveRevision === null) {
     const status = await c.status(change.id).catch(() => null);
+    if (isStopped?.()) return false;
     liveRevision = status?.revision ?? null;
     if (typeof liveRevision !== 'string' || liveRevision === '') return false;
   }
   // Only ever attach observation to the session the round's DURABLE record
   // names for the current revision — never to a stray binding.
   const { value: record } = await readClaimRecord(reviewerClaimFile(change, task, liveRevision));
-  if (!record || record.sessionId !== sessionId) return false;
+  if (isStopped?.() || !record || record.sessionId !== sessionId) return false;
   let observerLauncher = null;
   try { observerLauncher = /** @type {any} */ (requireTask()).createReviewerLauncher?.({}); } catch { observerLauncher = null; }
-  if (typeof observerLauncher?.observeSession !== 'function') return false;
-  return observeReviewerTurn({
-    handle: observerLauncher.observeSession(sessionId, record.requestId ?? null),
-    c, change, task, revision: liveRevision, sessionId,
-    rebuildReview: (isStopped) => api.runGovernedReview(taskId, { isStopped }),
+  if (isStopped?.() || typeof observerLauncher?.observeSession !== 'function') return false;
+  const handle = observerLauncher.observeSession(sessionId, record.requestId ?? null);
+  if (isStopped?.()) {
+    try { await handle?.terminate?.(); } catch { /* stop observation only */ }
+    return false;
+  }
+  const stop = observeReviewerTurn({
+    handle, c, change, task, revision: liveRevision, sessionId,
+    rebuildReview: (stopped) => api.runGovernedReview(taskId, { isStopped: stopped }),
   });
+  if (isStopped?.()) {
+    try { stop?.(); } catch { /* observer is already neutralized */ }
+    try { await handle?.terminate?.(); } catch { /* stop observation only */ }
+    return false;
+  }
+  return stop;
 }
 
 /**

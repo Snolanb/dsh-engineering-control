@@ -764,10 +764,11 @@ export function createSessionLauncher({ rpc = createSessionRpcClient(), pollInte
         throw new WorkerDispatchError('observeSession requires a session id', 'SESSION_ID_MISSING')
       }
       let waitPromise
+      let stopped = false
       const wait = () => {
         if (!waitPromise) {
           waitPromise = (async () => {
-            while (true) {
+            while (!stopped) {
               const events = sessionEvents(await rpc.call('session.history', { sessionId, maxMessages: historyMaxMessages }))
               let baseline = 0
               if (typeof requestId === 'string' && requestId !== '') {
@@ -788,7 +789,13 @@ export function createSessionLauncher({ rpc = createSessionRpcClient(), pollInte
         }
         return waitPromise
       }
-      return { sessionId, wait }
+      return {
+        sessionId,
+        wait,
+        // This stops only the reattached history observer; it must never
+        // cancel the independently-owned reviewer session.
+        async terminate() { stopped = true; return true },
+      }
     },
     /**
      * T-H12 round-4 — authoritative request-liveness reconciliation. Proves,

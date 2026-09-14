@@ -105,6 +105,7 @@ async function compose(t, {
   // T-H12 round-5: the fake launcher's existing-session observation surface
   // (restart/adoption reattach), controllable per test.
   observableReviewerSessions = false,
+  onObserveSession = null,
 } = {}) {
   const dir = await mkdtemp(join(tmpdir(), storePrefix));
   t.after(() => rm(dir, { recursive: true, force: true }));
@@ -134,8 +135,12 @@ async function compose(t, {
   // test explicitly ends one — the production observer treats a resolved
   // wait() as a dead turn and recovers exactly once.
   const reviewerTurnEnds = new Map(); // sessionId -> 'exited' | 'failed'
-  const reviewerTurnRejects = new Map(); // sessionId -> Error (waiter rejection)
   const reviewerTurnWaiters = new Map(); // sessionId -> { resolve, reject }
+  // Reattached session history has its own host observer feed: it must not
+  // inherit a fresh launch's live waiter and hide a dead reattach turn.
+  const reattachTurnRejects = new Map();
+  const reattachTurnWaiters = new Map();
+  let reattachWaitCalls = 0;
   const observedSessions = []; // sessions observation was (re)attached to
   const endReviewerTurn = (sessionId, mode = 'exited') => {
     reviewerTurnEnds.set(sessionId, mode);
@@ -149,10 +154,10 @@ async function compose(t, {
   // the session unreachable) — the production observer must treat the
   // rejection as a dead turn, never swallow it into permanent review_pending.
   const rejectObservedTurn = (sessionId, error = new Error('existing session unreachable')) => {
-    reviewerTurnRejects.set(sessionId, error);
-    const waiter = reviewerTurnWaiters.get(sessionId);
+    reattachTurnRejects.set(sessionId, error);
+    const waiter = reattachTurnWaiters.get(sessionId);
     if (waiter) {
-      reviewerTurnWaiters.delete(sessionId);
+      reattachTurnWaiters.delete(sessionId);
       waiter.reject(error);
     }
   };
@@ -182,14 +187,19 @@ async function compose(t, {
         // (restart/cross-process adoption) — same controllable turn surface.
         observeSession(sessionId) {
           observedSessions.push(sessionId);
+          const reject = (error = new Error('reattached session unreachable')) => {
+            reattachTurnRejects.set(sessionId, error);
+            reattachTurnWaiters.get(sessionId)?.reject(error);
+            reattachTurnWaiters.delete(sessionId);
+          };
+          onObserveSession?.({ sessionId, reject });
           return {
             sessionId,
             wait: () => {
-              const ended = reviewerTurnEnds.get(sessionId);
-              if (ended) return Promise.resolve(ended === 'failed' ? { exitCode: 1 } : { exitCode: 0 });
-              const rejected = reviewerTurnRejects.get(sessionId);
+              reattachWaitCalls += 1;
+              const rejected = reattachTurnRejects.get(sessionId);
               if (rejected) return Promise.reject(rejected);
-              return new Promise((resolve, reject) => reviewerTurnWaiters.set(sessionId, { resolve, reject }));
+              return new Promise((resolve, rejectWait) => reattachTurnWaiters.set(sessionId, { resolve, reject: rejectWait }));
             },
           };
         },
@@ -203,6 +213,7 @@ async function compose(t, {
   return {
     ctx, taskStore, dir, storePath, taskOrchestrator,
     reviewerLaunches: () => reviewerLaunches, endReviewerTurn, rejectObservedTurn,
+    reattachWaitCalls: () => reattachWaitCalls,
     observedSessions: () => [...observedSessions],
   };
 }
@@ -719,6 +730,37 @@ test('T-H12 round-5 (F1): restart-style wake reattaches turn observation to the 
   });
   assert.equal(r3.outcome, 'approved');
   assert.equal((await taskStore.get(task.id)).status, 'done');
+});
+
+test('T-H12 round-8: stop racing a rejected reattach handle leaves no observer recovery', async (t) => {
+  let stopped = false;
+  const { ctx, taskStore, dir, reviewerLaunches, observedSessions, reattachWaitCalls } = await compose(t, {
+    observableReviewerSessions: true,
+    // The reattach host history is independently terminal before attachment;
+    // teardown lands in the same synchronous attachment boundary.
+    onObserveSession: ({ reject }) => {
+      reject(new Error('reattach terminal during teardown'));
+      stopped = true;
+    },
+  });
+  const { task, change } = await governedReadyTask(ctx, taskStore, dir);
+  await dispatchGovernedSuccess(ctx, taskStore, dir, change);
+  const before = await ctx.changeControl.history(change.id);
+
+  const out = await ctx.taskChangeControl.runGovernedReview(task.id, {
+    controllerPreflightOverride: ['pass:build'], isStopped: () => stopped,
+  });
+  assert.equal(out.outcome, 'review_started');
+  assert.deepEqual(observedSessions(), [REVIEWER_SESSION]);
+  // A missing reattach cancellation gate attaches this pre-rejected handle,
+  // synchronously increments this counter, then starts dead-turn recovery.
+  assert.equal(reattachWaitCalls(), 0, 'teardown prevents the reattach observer from draining a dead history');
+  assert.equal(reviewerLaunches(), 1, 'teardown never launches or re-prompts');
+  const after = await ctx.changeControl.history(change.id);
+  assert.deepEqual(after, before, 'no post-stop status/claim expiry/unbind/audit mutation');
+  assert.equal(after.filter((e) => e.kind === 'review_orchestration' && e.action === 'review_round_requested').length, 1);
+  const reviewers = (await ctx.changeControl.listRoleBindings()).filter((b) => b.changeId === change.id && b.role === 'reviewer');
+  assert.deepEqual(reviewers.map((b) => b.sessionId), [REVIEWER_SESSION], 'durable reviewer binding survives teardown');
 });
 
 test('T-H12 round-3: crash before the request is sent recovers the unsent request exactly once', async (t) => {
