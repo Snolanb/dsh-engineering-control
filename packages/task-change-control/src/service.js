@@ -767,13 +767,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
       };
       // T-H13 test seam: production keeps the 11-minute claim deadline, while
       // focused recovery tests may inject a short deterministic window/backoff.
-      const recovery = options.reviewerRecovery ?? options.recovery ?? {};
-      const recoveryOptions = {
-        claimWaitMs: recovery.deadlineMs ?? recovery.claimWaitMs ?? options.reviewerClaimWaitMs ?? options.recoveryDeadlineMs,
-        claimPollMs: recovery.pollMs ?? recovery.claimPollMs ?? options.reviewerClaimPollMs,
-        recoveryBackoffMs: recovery.backoffMs ?? recovery.recoveryBackoffMs ?? options.recoveryBackoffMs,
-        recoveryBackoffMaxMs: recovery.backoffMaxMs ?? recovery.recoveryBackoffMaxMs ?? options.recoveryBackoffMaxMs,
-      };
+      const reviewerRecovery = options.reviewerRecovery ?? {};
       const t = requireTask();
       const c = requireChange();
       requireTaskId(taskId);
@@ -867,7 +861,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         let launchedHandle = null;
         const sessionId = await withReviewerReservation(`${change.id}:${revision}`, async () => {
           return reserveReviewerLaunch({
-             ...recoveryOptions,
+             reviewerRecovery,
             isStopped,
             c, change, task, revision, round,
             // T-H12 round-4: authoritative request-liveness reconciliation for
@@ -1326,7 +1320,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
             }
             // Deterministic preflight + reviewer launch/bind (reviewer
             // sessions never touch task claim/lease).
-            const rv = await api.runGovernedReview(taskId, { controllerPreflightOverride: options.controllerPreflightOverride, isStopped, reviewerRecovery: options.reviewerRecovery ?? options.recovery });
+            const rv = await api.runGovernedReview(taskId, { controllerPreflightOverride: options.controllerPreflightOverride, isStopped, reviewerRecovery: options.reviewerRecovery });
             if (rv.outcome === 'preflight_failed') {
               return { outcome: 'preflight_failed', taskId, changeId: change.id };
             }
@@ -1381,7 +1375,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
                 // while only a prior round's reviewer was bound): issue
                 // exactly one new explicit review round without re-running
                 // preflight.
-                const rv = await api.runGovernedReview(taskId, { controllerPreflightOverride: options.controllerPreflightOverride, isStopped, reviewerRecovery: options.reviewerRecovery ?? options.recovery });
+                const rv = await api.runGovernedReview(taskId, { controllerPreflightOverride: options.controllerPreflightOverride, isStopped, reviewerRecovery: options.reviewerRecovery });
                 if (rv.outcome === 'preflight_failed') {
                   return { outcome: 'preflight_failed', taskId, changeId: change.id };
                 }
@@ -1968,14 +1962,13 @@ function probeWithinDeadline(probeRequest, sessionId, requestId, deadline, isSto
  *   launch: (holder: { file: string, identity: string, requestId: string }) => Promise<string>,
  *   probeRequest?: (sessionId: string, requestId: string | null) => Promise<'sent'|'unsent'|'unknown'>,
  *   isStopped?: () => boolean,
- *   claimWaitMs?: number, claimPollMs?: number,
- *   recoveryBackoffMs?: number, recoveryBackoffMaxMs?: number,
+ *   reviewerRecovery?: { deadlineMs?: number, pollMs?: number, backoffMs?: number, backoffMaxMs?: number },
  * }} deps
  * @returns {Promise<string>} the reviewer session id to use
  */
 async function reserveReviewerLaunch({
   c, change, task, revision, round, launch, probeRequest, isStopped,
-  claimWaitMs, claimPollMs, recoveryBackoffMs, recoveryBackoffMaxMs,
+  reviewerRecovery = {},
 }) {
   const ensureActive = () => {
     if (isStopped?.()) {
@@ -1986,10 +1979,10 @@ async function reserveReviewerLaunch({
   const file = reviewerClaimFile(change, task, revision);
   const lockFile = reclaimLockFile(file);
   const identity = claimIdentity();
-  const waitMs = milliseconds(claimWaitMs, REVIEWER_CLAIM_WAIT_MS);
-  const pollMs = milliseconds(claimPollMs, REVIEWER_CLAIM_POLL_MS);
-  const backoffMs = milliseconds(recoveryBackoffMs, pollMs);
-  const backoffMaxMs = milliseconds(recoveryBackoffMaxMs, REVIEWER_RECOVERY_BACKOFF_MAX_MS);
+  const waitMs = milliseconds(reviewerRecovery.deadlineMs, REVIEWER_CLAIM_WAIT_MS);
+  const pollMs = milliseconds(reviewerRecovery.pollMs, REVIEWER_CLAIM_POLL_MS);
+  const backoffMs = milliseconds(reviewerRecovery.backoffMs, pollMs);
+  const backoffMaxMs = milliseconds(reviewerRecovery.backoffMaxMs, REVIEWER_RECOVERY_BACKOFF_MAX_MS);
   const deadline = Date.now() + waitMs;
   let unknownAttempts = 0;
   const uncertain = (record) => {
@@ -2118,6 +2111,8 @@ async function reserveReviewerLaunch({
     let createdRequestId = null;
     let adopted;
     let adoptedRequestId = null;
+    let unknownRecord = null;
+    let unknownDelay = 0;
     try {
       // Re-validate UNDER the lock: the claim may have changed since we read.
       const r = await readClaimRecord(file);
@@ -2177,13 +2172,11 @@ async function reserveReviewerLaunch({
           unknownAttempts += 1;
           ensureActive();
           if (Date.now() >= deadline) throw uncertain(r.value);
-          const delay = Math.min(
+          unknownRecord = r.value;
+          unknownDelay = Math.min(
             recoveryBackoff(unknownAttempts, backoffMs, backoffMaxMs),
             Math.max(0, deadline - Date.now()),
           );
-          await sleep(delay, isStopped);
-          ensureActive();
-          if (Date.now() >= deadline) throw uncertain(r.value);
         }
       } else if (r.value?.sessionId && typeof r.value.sessionId === 'string' && rStale) {
         // A crashed owner recorded a session (a SENT request): reconcile it
@@ -2216,6 +2209,16 @@ async function reserveReviewerLaunch({
       // owner is mid-launch; leave it alone and wait for its session/bind.
     } finally {
       await releaseReclaimLock(lockFile, identity);
+    }
+    if (unknownRecord) {
+      // Release the reclaim lock before sleeping so another owner can observe
+      // the unchanged ambiguous record and converge without duplicate launch.
+      ensureActive();
+      if (Date.now() >= deadline) throw uncertain(unknownRecord);
+      await sleep(unknownDelay, isStopped);
+      ensureActive();
+      if (Date.now() >= deadline) throw uncertain(unknownRecord);
+      continue;
     }
     ensureActive();
     if (adopted !== undefined) {

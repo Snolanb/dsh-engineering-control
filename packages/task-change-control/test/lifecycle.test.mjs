@@ -649,7 +649,12 @@ test('T-H12 round-4: a production-launched reviewer turn that exits/fails withou
   // production observer (wired to the launcher handle, not a caller callback)
   // expires only round a1 and issues exactly one recoverable fresh request.
   endReviewerTurn(REVIEWER_SESSION, 'exited');
-  await waitFor(() => reviewerLaunches() === 2, 5000, 'observer recovered the exited round exactly once');
+  await waitFor(async () => {
+    const history = await ctx.changeControl.history(change.id);
+    return history.some((event) => event.kind === 'review_orchestration' && event.action === 'reviewer_turn_ended_no_verdict')
+      && history.filter((event) => event.kind === 'review_orchestration' && event.action === 'review_round_requested').length === 2
+      && reviewerLaunches() === 2;
+  }, 5000, 'observer recovered the exited round exactly once');
   const reviewers1 = (await ctx.changeControl.listRoleBindings())
     .filter((b) => b.changeId === change.id && b.role === 'reviewer');
   assert.deepEqual(reviewers1.map((b) => b.sessionId), [`${REVIEWER_SESSION}-2`],
@@ -660,7 +665,12 @@ test('T-H12 round-4: a production-launched reviewer turn that exits/fails withou
 
   // (b) A turn FAILURE (exit ≠ 0): identical recovery, again exactly once.
   endReviewerTurn(`${REVIEWER_SESSION}-2`, 'failed');
-  await waitFor(() => reviewerLaunches() === 3, 5000, 'observer recovered the failed turn exactly once');
+  await waitFor(async () => {
+    const history = await ctx.changeControl.history(change.id);
+    return history.filter((event) => event.kind === 'review_orchestration' && event.action === 'reviewer_turn_ended_no_verdict').length === 2
+      && history.filter((event) => event.kind === 'review_orchestration' && event.action === 'review_round_requested').length === 3
+      && reviewerLaunches() === 3;
+  }, 5000, 'observer recovered the failed turn exactly once');
 
   // (c) A live reviewer turn: no churn across further controller wakes.
   const r3 = await ctx.taskChangeControl.runGovernedSdlc(task.id, {});
@@ -712,7 +722,12 @@ test('T-H12 round-5 (F1): restart-style wake reattaches turn observation to the 
   // fail-closed audit with the rejection evidence, exactly one fresh
   // explicit request. Never swallowed into permanent review_pending.
   rejectObservedTurn(REVIEWER_SESSION);
-  await waitFor(() => reviewerLaunches() === 2, 5000, 'rejected waiter recovered exactly once');
+  await waitFor(async () => {
+    const history = await ctx.changeControl.history(change.id);
+    return history.some((event) => event.kind === 'review_orchestration' && event.action === 'reviewer_turn_ended_no_verdict')
+      && history.filter((event) => event.kind === 'review_orchestration' && event.action === 'review_round_requested').length === 2
+      && reviewerLaunches() === 2;
+  }, 5000, 'rejected waiter recovered exactly once');
   assert.equal((await ctx.changeControl.get(change.id)).state, 'REVIEW', 'no PASS inferred from a rejection');
   assert.equal((await taskStore.get(task.id)).status, 'in_review');
   const audits = await ctx.changeControl.history(change.id);
