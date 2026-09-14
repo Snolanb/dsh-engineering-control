@@ -130,7 +130,7 @@ async function startStubHost(t) {
       const events = s?.prompt
         ? [{ seq: 1, type: 'user/message', data: { message: { content: [{ type: 'text', text: s.prompt }] } } }]
         : [];
-      return respond({ events });
+      return respond({ events, hasMore: false });
     }
     return respond({});
   });

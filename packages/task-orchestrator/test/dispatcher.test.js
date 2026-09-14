@@ -583,3 +583,79 @@ test('session RPC client sends DSH envelopes and surfaces structured errors', as
   assert.equal(requests[0].url, 'http://127.0.0.1:3080/api/session.prompt')
   assert.equal(JSON.parse(requests[0].init.body).rpcId, 'task-dispatch-rpc-1')
 })
+
+test('probeRequest returns unknown on transient RPC rejection', async () => {
+  const rpc = { async call() { throw new Error('network error') } }
+  const launcher = createSessionLauncher({ rpc, historyMaxMessages: 100 })
+  const verdict = await launcher.probeRequest('sess-1', 'req-1')
+  assert.equal(verdict, 'unknown')
+})
+
+test('probeRequest returns unsent on the structured session-not-found semantic', async () => {
+  const rpc = {
+    async call() {
+      throw Object.assign(new Error('session is gone'), { code: 'session-not-found' })
+    },
+  }
+  const launcher = createSessionLauncher({ rpc })
+  const verdict = await launcher.probeRequest('sess-1', 'req-1')
+  assert.equal(verdict, 'unsent')
+})
+
+test('probeRequest requires an exact request marker in a user message', async () => {
+  const rpc = {
+    async call() {
+      return { events: [
+        { seq: 1, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'req-1' }] } } },
+        { seq: 2, type: 'user/message', data: { message: { content: [{ type: 'text', text: '[review-request req-10]' }] } } },
+      ], hasMore: false }
+    },
+  }
+  const launcher = createSessionLauncher({ rpc })
+  const verdict = await launcher.probeRequest('sess-1', 'req-1')
+  assert.equal(verdict, 'unsent')
+})
+
+test('probeRequest returns unknown on malformed history response', async () => {
+  const rpc = {
+    async call(method) {
+      return { events: null, hasMore: undefined }
+    }
+  }
+  const launcher = createSessionLauncher({ rpc, historyMaxMessages: 100 })
+  const verdict = await launcher.probeRequest('sess-1', 'req-1')
+  assert.equal(verdict, 'unknown')
+})
+
+test('probeRequest returns unknown on truncated history without completeness metadata', async () => {
+  const rpc = {
+    async call(method) {
+      return { events: [], hasMore: true }
+    }
+  }
+  const launcher = createSessionLauncher({ rpc, historyMaxMessages: 100 })
+  const verdict = await launcher.probeRequest('sess-1', 'req-1')
+  assert.equal(verdict, 'unknown')
+})
+
+test('probeRequest returns sent on exact request marker', async () => {
+  const rpc = {
+    async call(method) {
+      return { events: [{ seq: 1, type: 'user/message', data: { message: { content: [{ type: 'text', text: 'prompt\n[review-request req-1]' }] } } }], hasMore: false }
+    }
+  }
+  const launcher = createSessionLauncher({ rpc, historyMaxMessages: 100 })
+  const verdict = await launcher.probeRequest('sess-1', 'req-1')
+  assert.equal(verdict, 'sent')
+})
+
+test('probeRequest returns unsent on complete history without marker', async () => {
+  const rpc = {
+    async call(method) {
+      return { events: [{ seq: 1, type: 'user/message', data: { message: { content: [{ type: 'text', text: 'prompt' }] } } }], hasMore: false }
+    }
+  }
+  const launcher = createSessionLauncher({ rpc, historyMaxMessages: 100 })
+  const verdict = await launcher.probeRequest('sess-1', 'req-1')
+  assert.equal(verdict, 'unsent')
+})

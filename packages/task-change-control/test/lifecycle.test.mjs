@@ -106,6 +106,8 @@ async function compose(t, {
   // (restart/adoption reattach), controllable per test.
   observableReviewerSessions = false,
   onObserveSession = null,
+  // T-H13: optional probe seam for bounded recovery regressions.
+  reviewerProbe = null,
 } = {}) {
   const dir = await mkdtemp(join(tmpdir(), storePrefix));
   t.after(() => rm(dir, { recursive: true, force: true }));
@@ -182,6 +184,11 @@ async function compose(t, {
           terminate: async () => true,
         };
       },
+      ...(typeof reviewerProbe === 'function' ? {
+        probeRequest(sessionId, requestId) {
+          return reviewerProbe(sessionId, requestId);
+        },
+      } : {}),
       ...(observableReviewerSessions ? {
         // T-H12 round-5: observation reattach for an EXISTING session
         // (restart/cross-process adoption) — same controllable turn surface.
@@ -642,7 +649,12 @@ test('T-H12 round-4: a production-launched reviewer turn that exits/fails withou
   // production observer (wired to the launcher handle, not a caller callback)
   // expires only round a1 and issues exactly one recoverable fresh request.
   endReviewerTurn(REVIEWER_SESSION, 'exited');
-  await waitFor(() => reviewerLaunches() === 2, 5000, 'observer recovered the exited round exactly once');
+  await waitFor(async () => {
+    const history = await ctx.changeControl.history(change.id);
+    return history.some((event) => event.kind === 'review_orchestration' && event.action === 'reviewer_turn_ended_no_verdict')
+      && history.filter((event) => event.kind === 'review_orchestration' && event.action === 'review_round_requested').length === 2
+      && reviewerLaunches() === 2;
+  }, 5000, 'observer recovered the exited round exactly once');
   const reviewers1 = (await ctx.changeControl.listRoleBindings())
     .filter((b) => b.changeId === change.id && b.role === 'reviewer');
   assert.deepEqual(reviewers1.map((b) => b.sessionId), [`${REVIEWER_SESSION}-2`],
@@ -653,7 +665,12 @@ test('T-H12 round-4: a production-launched reviewer turn that exits/fails withou
 
   // (b) A turn FAILURE (exit ≠ 0): identical recovery, again exactly once.
   endReviewerTurn(`${REVIEWER_SESSION}-2`, 'failed');
-  await waitFor(() => reviewerLaunches() === 3, 5000, 'observer recovered the failed turn exactly once');
+  await waitFor(async () => {
+    const history = await ctx.changeControl.history(change.id);
+    return history.filter((event) => event.kind === 'review_orchestration' && event.action === 'reviewer_turn_ended_no_verdict').length === 2
+      && history.filter((event) => event.kind === 'review_orchestration' && event.action === 'review_round_requested').length === 3
+      && reviewerLaunches() === 3;
+  }, 5000, 'observer recovered the failed turn exactly once');
 
   // (c) A live reviewer turn: no churn across further controller wakes.
   const r3 = await ctx.taskChangeControl.runGovernedSdlc(task.id, {});
@@ -705,7 +722,12 @@ test('T-H12 round-5 (F1): restart-style wake reattaches turn observation to the 
   // fail-closed audit with the rejection evidence, exactly one fresh
   // explicit request. Never swallowed into permanent review_pending.
   rejectObservedTurn(REVIEWER_SESSION);
-  await waitFor(() => reviewerLaunches() === 2, 5000, 'rejected waiter recovered exactly once');
+  await waitFor(async () => {
+    const history = await ctx.changeControl.history(change.id);
+    return history.some((event) => event.kind === 'review_orchestration' && event.action === 'reviewer_turn_ended_no_verdict')
+      && history.filter((event) => event.kind === 'review_orchestration' && event.action === 'review_round_requested').length === 2
+      && reviewerLaunches() === 2;
+  }, 5000, 'rejected waiter recovered exactly once');
   assert.equal((await ctx.changeControl.get(change.id)).state, 'REVIEW', 'no PASS inferred from a rejection');
   assert.equal((await taskStore.get(task.id)).status, 'in_review');
   const audits = await ctx.changeControl.history(change.id);
@@ -801,6 +823,132 @@ test('T-H12 round-3: crash before the request is sent recovers the unsent reques
     .filter((e) => e.kind === 'review_orchestration' && e.action === 'review_round_requested');
   assert.equal(requests.length, 1, 'exactly one audited request for the recovered round');
   assert.equal(requests[0].requestId, record.requestId, 'audit carries the durable request identity');
+});
+
+test('T-H13: transient unknown probe retries and adopts the original delivered request', async (t) => {
+  const verdicts = ['unknown', 'sent'];
+  const probes = [];
+  const { ctx, taskStore, dir, reviewerLaunches } = await compose(t, {
+    reviewerProbe: async (sessionId, requestId) => {
+      probes.push({ sessionId, requestId });
+      return verdicts.shift() ?? 'sent';
+    },
+  });
+  const { task, change } = await governedReadyTask(ctx, taskStore, dir);
+  await dispatchGovernedSuccess(ctx, taskStore, dir, change, { preflight: ['FAIL: build'] });
+  const file = reviewerClaimFileFor(task, change, 'a1');
+  await mkdir(dirname(file), { recursive: true });
+  const original = {
+    claimant: 'dead-host:1', requestId: 'req-transient',
+    sessionId: 'sess-delivered', sentAt: null, revision: 'a1',
+    updatedAt: Date.now() - 2 * 10 * 60 * 1000,
+  };
+  await writeFile(file, JSON.stringify(original));
+
+  const rv = await ctx.taskChangeControl.runGovernedReview(task.id, {
+    controllerPreflightOverride: ['pass:build'],
+    reviewerRecovery: { deadlineMs: 100, pollMs: 1, backoffMs: 1, backoffMaxMs: 4 },
+  });
+  assert.equal(rv.outcome, 'review_started');
+  assert.equal(rv.sessionId, original.sessionId);
+  assert.equal(reviewerLaunches(), 0, 'an unknown probe must never launch a duplicate reviewer');
+  assert.equal(probes.length, 2, 'the transient ambiguity is retried');
+  assert.deepEqual(probes[0], probes[1]);
+  const recovered = JSON.parse(readFileSync(file, 'utf8'));
+  assert.equal(recovered.requestId, original.requestId);
+  assert.equal(typeof recovered.sentAt, 'number', 'the adopted request is durably marked sent');
+  const reviewers = (await ctx.changeControl.listRoleBindings())
+    .filter((b) => b.changeId === change.id && b.role === 'reviewer');
+  assert.deepEqual(reviewers.map((b) => b.sessionId), [original.sessionId]);
+});
+
+test('T-H13: persistent unknown probe fails recoverably without mutating the durable record', async (t) => {
+  let probes = 0;
+  const { ctx, taskStore, dir, reviewerLaunches } = await compose(t, {
+    reviewerProbe: async () => { probes += 1; return 'unknown'; },
+  });
+  const { task, change } = await governedReadyTask(ctx, taskStore, dir);
+  await dispatchGovernedSuccess(ctx, taskStore, dir, change, { preflight: ['FAIL: build'] });
+  const file = reviewerClaimFileFor(task, change, 'a1');
+  await mkdir(dirname(file), { recursive: true });
+  const original = {
+    claimant: 'dead-host:1', requestId: 'req-uncertain',
+    sessionId: 'sess-uncertain', sentAt: null, revision: 'a1',
+    updatedAt: Date.now() - 2 * 10 * 60 * 1000,
+  };
+  await writeFile(file, JSON.stringify(original));
+
+  await assert.rejects(
+    ctx.taskChangeControl.runGovernedSdlc(task.id, {
+      controllerPreflightOverride: ['pass:build'],
+      reviewerRecovery: { deadlineMs: 35, pollMs: 1, backoffMs: 1, backoffMaxMs: 4 },
+    }),
+    (error) => error?.code === 'REVIEWER_REQUEST_UNCERTAIN'
+      && error.recoverable === true
+      && error.details?.requestId === original.requestId,
+  );
+  assert.ok(probes > 1, 'persistent ambiguity is retried before the deadline');
+  assert.equal(reviewerLaunches(), 0, 'persistent ambiguity never launches a duplicate reviewer');
+  assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), original);
+  assert.equal((await ctx.changeControl.get(change.id)).state, 'PREFLIGHT');
+  assert.deepEqual((await ctx.changeControl.listRoleBindings())
+    .filter((b) => b.changeId === change.id && b.role === 'reviewer'), []);
+});
+
+test('T-H13: cancellation stops unknown recovery before any durable mutation or launch', async (t) => {
+  let stopped = false;
+  const { ctx, taskStore, dir, reviewerLaunches } = await compose(t, {
+    reviewerProbe: async () => { stopped = true; return 'unknown'; },
+  });
+  const { task, change } = await governedReadyTask(ctx, taskStore, dir);
+  await dispatchGovernedSuccess(ctx, taskStore, dir, change, { preflight: ['FAIL: build'] });
+  const file = reviewerClaimFileFor(task, change, 'a1');
+  await mkdir(dirname(file), { recursive: true });
+  const original = {
+    claimant: 'dead-host:1', requestId: 'req-cancel',
+    sessionId: 'sess-cancel', sentAt: null, revision: 'a1',
+    updatedAt: Date.now() - 2 * 10 * 60 * 1000,
+  };
+  await writeFile(file, JSON.stringify(original));
+
+  await assert.rejects(
+    ctx.taskChangeControl.runGovernedReview(task.id, {
+      controllerPreflightOverride: ['pass:build'], isStopped: () => stopped,
+      reviewerRecovery: { deadlineMs: 100, pollMs: 5, backoffMs: 5, backoffMaxMs: 5 },
+    }),
+    (error) => error?.code === 'REVIEW_OBSERVER_STOPPED',
+  );
+  assert.equal(reviewerLaunches(), 0);
+  assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), original);
+  assert.equal((await ctx.changeControl.get(change.id)).state, 'PREFLIGHT');
+});
+
+test('T-H13: authoritative unsent probe replaces the ambiguous request exactly once', async (t) => {
+  let probes = 0;
+  const { ctx, taskStore, dir, reviewerLaunches } = await compose(t, {
+    reviewerProbe: async () => { probes += 1; return 'unsent'; },
+  });
+  const { task, change } = await governedReadyTask(ctx, taskStore, dir);
+  await dispatchGovernedSuccess(ctx, taskStore, dir, change, { preflight: ['FAIL: build'] });
+  const file = reviewerClaimFileFor(task, change, 'a1');
+  await mkdir(dirname(file), { recursive: true });
+  await writeFile(file, JSON.stringify({
+    claimant: 'dead-host:1', requestId: 'req-unsent-session',
+    sessionId: 'sess-never-delivered', sentAt: null, revision: 'a1',
+    updatedAt: Date.now() - 2 * 10 * 60 * 1000,
+  }));
+
+  const rv = await ctx.taskChangeControl.runGovernedReview(task.id, {
+    controllerPreflightOverride: ['pass:build'],
+    reviewerRecovery: { deadlineMs: 100, pollMs: 1, backoffMs: 1, backoffMaxMs: 4 },
+  });
+  assert.equal(rv.outcome, 'review_started');
+  assert.equal(reviewerLaunches(), 1);
+  assert.equal(probes, 1);
+  const recovered = JSON.parse(readFileSync(file, 'utf8'));
+  assert.notEqual(recovered.requestId, 'req-unsent-session');
+  assert.equal(recovered.sessionId, rv.sessionId);
+  assert.equal(typeof recovered.sentAt, 'number');
 });
 
 test('T-H12 round-3: crash after the request was sent suppresses duplicates — the recorded session is adopted, never re-requested', async (t) => {
