@@ -62,6 +62,30 @@ test('review settlement guard rejects the session it names before any mutation',
   });
 });
 
+test('settlement guard is rechecked under the write lock', async () => {
+  await withReviewStore(async (store, change) => {
+    const calls = [];
+    const { unregister } = registerReviewSettlementGuard(store, async (args) => {
+      calls.push(args);
+      if (!args.locked) {
+        await store.recordAttempt(change.id, { attemptId: 'impl-2', workerId: 'worker-2', revision: 'r2', status: 'completed' });
+      }
+      if (args.locked) {
+        assert.equal(args.currentRevision, 'r2', 'the locked check sees the revision advance');
+        throw Object.assign(new Error('locked round changed'), { code: 'STALE_ROUND_SESSION' });
+      }
+    });
+    await assert.rejects(
+      store.submitReview(change.id, pass(), { sessionId: 'round-session' }),
+      (error) => error?.code === 'STALE_ROUND_SESSION',
+    );
+    assert.equal(calls.length, 2, 'authorization runs before and inside the write lock');
+    assert.equal(calls[1].locked, true, 'the second check receives the locked snapshot');
+    assert.equal((await store.get(change.id)).state, 'REVIEW', 'the locked rejection leaves state unchanged');
+    unregister();
+  });
+});
+
 test('no guard registered → standalone submitReview behavior is unchanged', async () => {
   await withReviewStore(async (store, change) => {
     const result = await store.submitReview(change.id, pass(), { sessionId: 'prior-round-session' });

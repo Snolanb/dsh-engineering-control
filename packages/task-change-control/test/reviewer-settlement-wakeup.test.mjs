@@ -723,3 +723,50 @@ test('T-H12 round-6: mid-flight teardown after reviewer wait settles performs no
   const claim = JSON.parse(readFileSync(claimFile, 'utf8'));
   assert.equal(claim.sessionId, sessionId, 'round claim not expired/cleared after stop');
 });
+
+test('T-H12 round-7: stop token propagates through an in-flight rebuild and blocks relaunch', async (t) => {
+  let resolveRebuild;
+  let rebuildStarted;
+  const rebuildGate = new Promise((resolve) => { resolveRebuild = resolve; });
+  const started = new Promise((resolve) => { rebuildStarted = resolve; });
+  let relaunched = 0;
+  let stoppedSignal;
+  const handle = {
+    wait: () => Promise.resolve({ exitCode: 1 }),
+  };
+  const rebuildReview = async (isStopped) => {
+    stoppedSignal = isStopped;
+    rebuildStarted();
+    await rebuildGate;
+    if (!isStopped?.()) relaunched += 1;
+  };
+  const workspace = mkdtempSync(join(tmpdir(), 'h11-r7-'));
+  t.after(() => rmSync(workspace, { recursive: true, force: true }));
+  mkdirSync(join(workspace, '.dsh-governance', 'reviewer-claims'), { recursive: true });
+  writeFileSync(
+    join(workspace, '.dsh-governance', 'reviewer-claims', 'reviewer-claim-c-rebuild-abc123'),
+    JSON.stringify({ claimant: 'host:r7', sessionId: 'sess-r7', updatedAt: Date.now() }),
+  );
+  const c = {
+    async get() { return { state: 'REVIEW' }; },
+    async status() { return { revision: 'abc123' }; },
+    async unbindRole() {},
+    async appendAudit() {},
+  };
+  const stop = observeReviewerTurn({
+    handle,
+    c,
+    change: { id: 'c-rebuild' },
+    task: { workspace },
+    revision: 'abc123',
+    sessionId: 'sess-r7',
+    rebuildReview,
+  });
+  await started;
+  assert.equal(typeof stoppedSignal, 'function', 'rebuild receives the observer cancellation token');
+  stop();
+  resolveRebuild();
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(stoppedSignal(), true, 'the token observes teardown during the rebuild');
+  assert.equal(relaunched, 0, 'an in-flight rebuild cannot relaunch after teardown');
+});

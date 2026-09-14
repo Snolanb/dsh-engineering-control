@@ -755,20 +755,29 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
      *   launch never wedges the Change in REVIEW.
      *
      * @param {string} taskId
-     * @param {{ preflight?: (proof: any) => boolean, controllerPreflightOverride?: string[] }} [options]
+     * @param {{ preflight?: (proof: any) => boolean, controllerPreflightOverride?: string[], isStopped?: () => boolean }} [options]
      * @returns {Promise<{ outcome: 'review_started' | 'preflight_failed', sessionId?: string, changeId?: string }>}
      */
     runGovernedReview(taskId, options = {}) {
+      const isStopped = typeof options.isStopped === 'function' ? options.isStopped : null;
+      const ensureActive = () => {
+        if (isStopped?.()) {
+          throw Object.assign(new Error('review observer stopped'), { code: 'REVIEW_OBSERVER_STOPPED' });
+        }
+      };
       const t = requireTask();
       const c = requireChange();
       requireTaskId(taskId);
       return (async () => {
+        ensureActive();
         const task = await Promise.resolve(t.get(taskId));
+        ensureActive();
         if (!task) throw Object.assign(new Error(`task not found: ${taskId}`), { code: 'TASK_NOT_FOUND' });
         if (task.status !== 'in_review') {
           throw Object.assign(new Error(`expected task status in_review (got ${task.status})`), { code: 'INVALID_TASK_STATE' });
         }
         const change = await c.findByWorkItem(WORK_ITEM_SYSTEM, taskId);
+        ensureActive();
         if (!change) throw Object.assign(new Error(`no Change linked to task ${taskId}`), { code: 'CHANGE_NOT_FOUND' });
         if (!['PREFLIGHT', 'REVIEW'].includes(change.state)) {
           throw Object.assign(new Error(`expected Change PREFLIGHT or REVIEW (got ${change.state})`), { code: 'INVALID_CHANGE_STATE' });
@@ -778,6 +787,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         // never accept a verdict (stale-revision rejection), so fail closed
         // here instead.
         const statusNow = await c.status(change.id);
+        ensureActive();
         const revision = statusNow?.revision ?? null;
         if (typeof revision !== 'string' || revision.trim() === '') {
           throw Object.assign(
@@ -807,6 +817,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
               changedFiles: Array.isArray(proof?.files_changed) ? proof.files_changed : [],
               checkResults,
             });
+            ensureActive();
             preflightPassed = true;
           } catch (/** @type {any} */ err) {
             if (err?.code === 'NO_POLICY') {
@@ -821,10 +832,14 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
             }
           }
           if (!preflightPassed) {
-            await c.appendAudit({ kind: 'review_orchestration', changeId: change.id, action: 'preflight_failed' });
+            ensureActive();
+             await c.appendAudit({ kind: 'review_orchestration', changeId: change.id, action: 'preflight_failed' });
+             ensureActive();
             return { outcome: 'preflight_failed' };
           }
-          await c.appendAudit({ kind: 'review_orchestration', changeId: change.id, action: 'preflight_passed' });
+          ensureActive();
+           await c.appendAudit({ kind: 'review_orchestration', changeId: change.id, action: 'preflight_passed' });
+           ensureActive();
         }
         // T-H5 PR1-02 + PR2-01: serialize check→launch→bind for ONE round.
         // The in-process tail lock is the fast local serializer (keyed by
@@ -842,6 +857,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         let launchedHere = false;
         const sessionId = await withReviewerReservation(`${change.id}:${revision}`, async () => {
           return reserveReviewerLaunch({
+            isStopped,
             c, change, task, revision, round,
             // T-H12 round-4: authoritative request-liveness reconciliation for
             // an ambiguous durable record (session pre-send record present,
@@ -862,6 +878,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
               let launched;
               try {
                 launched = await launchReviewerForTask(requireTask, requireChange, requireTaskId, taskId, {
+                  isStopped,
                   revision,
                   requestId,
                   // T-H12 round-4 pre-send marker: session.create accepted →
@@ -897,6 +914,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
                   },
                 });
               } catch (error) {
+                if (isStopped?.()) throw error;
                 // A launcher/session.prompt failure occurs before a reviewer
                 // request exists. Expire this round's empty claim so the next
                 // governed wake can recover immediately without a 10-minute
@@ -907,6 +925,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
                 }).catch(() => {});
                 throw error;
               }
+              ensureActive();
               // T-H12: durable audit of this round's ONE explicit reviewer
               // request (launch = the single production prompt), carrying
               // the same durable request identity the claim record persisted
@@ -929,10 +948,11 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
               // (verdict persisted before the turn ended) or a superseding
               // revision means no churn; runGovernedReview's claim machinery
               // keeps the recovery exactly-once across processes.
+              ensureActive();
               const stopObserve = observeReviewerTurn({
                 handle: launched.handle, c, change, task, revision,
                 sessionId: launched.sessionId,
-                rebuildReview: () => api.runGovernedReview(taskId, {}),
+                rebuildReview: (isStopped) => api.runGovernedReview(taskId, { isStopped }),
               });
               if (stopObserve) activeObservationStops.add(stopObserve);
               launchedHere = true;
@@ -940,6 +960,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
             },
           });
         });
+        ensureActive();
         if (!launchedHere) {
           // Existing round session (per the durable record): reattach
           // production turn observation to the real session lifecycle.
@@ -954,6 +975,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         // the NO_POLICY fallback, where the store did not move it — exactly
         // one PREFLIGHT→REVIEW transition, never a double move.
         const liveAfterPreflight = await c.get(change.id);
+         ensureActive();
         if (liveAfterPreflight.state === 'PREFLIGHT') {
           await c.transition(change.id, 'REVIEW', { actor: 'review-orchestration' }).catch((err) => {
             if (err?.name !== 'ChangeDomainError') throw err;
@@ -1136,29 +1158,46 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
      * @param {{ changeId: string, sessionId: string }} args
      * @returns {Promise<void>} resolves when the settlement is authorized
      */
-    async reviewSettlementGuard({ changeId, sessionId } = {}) {
+    async reviewSettlementGuard({ changeId, sessionId, lockedChange = null, currentRevision = null, lockedBindings = null, locked = false } = {}) {
       const c = requireChange();
-      const change = await c.get(changeId).catch(() => null);
+      const change = lockedChange ?? await c.get(changeId).catch(() => null);
       if (!change?.workItem || change.workItem.system !== WORK_ITEM_SYSTEM) return;
+      if (change.state !== 'REVIEW') return;
       let task = null;
       try {
         const t = requireTask();
         task = await Promise.resolve(t.get(change.workItem.id)).catch(() => null);
       } catch { task = null; }
-      if (!task) return;
-      const round = await roundReviewerSession(c, change, task).catch(() => null);
-      if (!round || round.sessionId === sessionId) return;
-      const status = await c.status(changeId).catch(() => null);
-      await c.appendAudit({
+      if (!task) {
+        throw Object.assign(new Error(`governed review round unavailable for Change ${changeId}`), { code: 'STALE_ROUND_SESSION' });
+      }
+      const revision = currentRevision ?? (await c.status(changeId).catch(() => null))?.revision ?? null;
+      const round = await roundReviewerSessionForRevision(c, change, task, revision, lockedBindings).catch(() => null);
+      const audit = {
         kind: 'review_orchestration', changeId,
-        action: 'review_submit_wrong_round_session',
-        sessionId, expectedSessionId: round.sessionId,
-        revision: status?.revision ?? null,
-      }).catch(() => {});
-      throw Object.assign(
-        new Error(`session ${sessionId} is not the current review round's reviewer`),
-        { code: 'STALE_ROUND_SESSION' },
-      );
+        action: round ? 'review_submit_wrong_round_session' : 'review_submit_missing_round',
+        sessionId,
+        ...(round?.sessionId ? { expectedSessionId: round.sessionId } : {}),
+        revision,
+      };
+      if (!round || round.sessionId !== sessionId) {
+        if (locked) {
+          throw Object.assign(
+            new Error(round ? `session ${sessionId} is not the current review round's reviewer` : `no durable review round for Change ${changeId}`),
+            { code: 'STALE_ROUND_SESSION', reviewSettlementAudit: audit },
+          );
+        }
+        await c.appendAudit(audit).catch(() => {});
+        throw Object.assign(
+          new Error(round ? `session ${sessionId} is not the current review round's reviewer` : `no durable review round for Change ${changeId}`),
+          { code: 'STALE_ROUND_SESSION' },
+        );
+      }
+      if (!locked) return;
+      // A lock-context guard has already validated the durable round and binding.
+      return;
+
+
     },
 
     /**
@@ -1845,10 +1884,17 @@ function sleep(ms) {
  *   round?: { revision: string, attemptId?: string|null, proofCommit?: string|null, findingIds?: string[] },
  *   launch: (holder: { file: string, identity: string, requestId: string }) => Promise<string>,
  *   probeRequest?: (sessionId: string, requestId: string | null) => Promise<'sent'|'unsent'|'unknown'>,
+ *   isStopped?: () => boolean,
  * }} deps
  * @returns {Promise<string>} the reviewer session id to use
  */
-async function reserveReviewerLaunch({ c, change, task, revision, round, launch, probeRequest }) {
+async function reserveReviewerLaunch({ c, change, task, revision, round, launch, probeRequest, isStopped }) {
+  const ensureActive = () => {
+    if (isStopped?.()) {
+      throw Object.assign(new Error('review observer stopped'), { code: 'REVIEW_OBSERVER_STOPPED' });
+    }
+  };
+  ensureActive();
   const file = reviewerClaimFile(change, task, revision);
   const lockFile = reclaimLockFile(file);
   const identity = claimIdentity();
@@ -1861,18 +1907,26 @@ async function reserveReviewerLaunch({ c, change, task, revision, round, launch,
     const binding = await c.getBinding(change.id, sessionId).catch(() => null);
     return binding && binding.role === 'reviewer' ? sessionId : null;
   };
-  const adopt = (sessionId, claimant) => c.bindRole(change.id, sessionId, 'reviewer')
-    .catch((err) => { if (err?.code === 'ALREADY_BOUND') return null; throw err; })
-    .then(() => c.appendAudit({
+  const adopt = async (sessionId, claimant) => {
+    ensureActive();
+    await c.bindRole(change.id, sessionId, 'reviewer')
+      .catch((err) => { if (err?.code === 'ALREADY_BOUND') return null; throw err; });
+    ensureActive();
+    await c.appendAudit({
       kind: 'review_orchestration', changeId: change.id, action: 'reviewer_claim_adopted',
       sessionId, claimant: claimant ?? null,
-    }))
-    .then(() => sessionId);
+    });
+    ensureActive();
+    return sessionId;
+  };
   for (;;) {
+    ensureActive();
     const { exists, incomplete, value: record } = await readClaimRecord(file);
+    ensureActive();
     // 1. This round's confirmed binding: durable and visible across
     //    processes — reuse it, never re-request.
     const bound = await confirmedRoundBinding(record);
+    ensureActive();
     if (bound) return bound;
 
     const stale = !incomplete && exists
@@ -1903,6 +1957,7 @@ async function reserveReviewerLaunch({ c, change, task, revision, round, launch,
       } else {
         // Stale owner: bind the recorded session (a concurrent adopter may
         // have beaten us — ALREADY_BOUND is successful convergence).
+        ensureActive();
         return await adopt(record.sessionId, record.claimant);
       }
     }
@@ -1928,8 +1983,13 @@ async function reserveReviewerLaunch({ c, change, task, revision, round, launch,
     //    its lock is still in the slot before the critical section (T-H5
     //    PR2-03) — a lost lock means backing off, never launching.
     for (;;) {
+      ensureActive();
       if (await acquireReclaimLock(lockFile, identity)
-        && await verifyReclaimLockHeld(lockFile, identity)) break;
+        && await verifyReclaimLockHeld(lockFile, identity)) {
+        ensureActive();
+        break;
+      }
+      ensureActive();
       if (Date.now() > deadline) {
         throw Object.assign(new Error('reviewer claim wait exceeded window'), { code: 'REVIEWER_CLAIM_TIMEOUT' });
       }
@@ -1942,7 +2002,9 @@ async function reserveReviewerLaunch({ c, change, task, revision, round, launch,
     try {
       // Re-validate UNDER the lock: the claim may have changed since we read.
       const r = await readClaimRecord(file);
+      ensureActive();
       const boundNow = await confirmedRoundBinding(r.value);
+      ensureActive();
       if (boundNow) return boundNow;
       const rStale = !r.incomplete && r.exists
         ? Date.now() - Number(r.value.updatedAt || 0) > REVIEWER_CLAIM_LEASE_MS
@@ -1954,22 +2016,28 @@ async function reserveReviewerLaunch({ c, change, task, revision, round, launch,
         // acceptance and marking the send. Prove liveness through the real
         // launcher probe (host session history) before deciding:
         const verdict = await probeRequest(r.value.sessionId, r.value.requestId ?? null).catch(() => 'unknown');
+        ensureActive();
         if (verdict === 'sent') {
           // The request WAS delivered (proof positive): adopt the SAME
           // session, mark the send durably, and never re-prompt/re-launch
           // this request identity.
           adopted = await adopt(r.value.sessionId, r.value.claimant);
           adoptedRequestId = r.value.requestId ?? null;
+          ensureActive();
           await writeClaimRecord(file, { ...r.value, sentAt: Date.now(), updatedAt: Date.now() }).catch(() => {});
+          ensureActive();
         } else if (verdict === 'unsent') {
           // The request provably never landed (session dead or prompt
           // absent from history): expire the ambiguous record atomically and
           // fall into the (re)create branch — exactly one fresh request.
+          ensureActive();
           await writeClaimRecord(file, {
             ...r.value, sessionId: null, sentAt: null,
             updatedAt: Date.now() - 2 * REVIEWER_CLAIM_LEASE_MS,
           });
+          ensureActive();
           createdRequestId = randomUUID();
+          ensureActive();
           await writeClaimRecord(file, {
             claimant: identity, sessionId: null, sentAt: null,
             requestId: createdRequestId,
@@ -1999,6 +2067,7 @@ async function reserveReviewerLaunch({ c, change, task, revision, round, launch,
         // recovered exactly once — this creation — never re-sent under the
         // crashed owner's identity.
         createdRequestId = randomUUID();
+        ensureActive();
         await writeClaimRecord(file, {
           claimant: identity, sessionId: null, sentAt: null,
           requestId: createdRequestId,
@@ -2015,14 +2084,18 @@ async function reserveReviewerLaunch({ c, change, task, revision, round, launch,
     } finally {
       await releaseReclaimLock(lockFile, identity);
     }
+    ensureActive();
     if (adopted !== undefined) {
       // The original owner may have crashed between launch and the durable
       // request audit. Adoption is the reconciliation of THAT same request,
       // so the round's single request audit is ensured exactly once here.
-      await ensureRoundRequestAudit(c, change, revision, adopted, adoptedRequestId, round);
+      await ensureRoundRequestAudit(c, change, revision, adopted, adoptedRequestId, round, isStopped);
       return adopted;
     }
-    if (created) return await launch({ file, identity, requestId: createdRequestId });
+    if (created) {
+      ensureActive();
+      return await launch({ file, identity, requestId: createdRequestId });
+    }
     continue;
   }
 }
@@ -2038,14 +2111,17 @@ async function reserveReviewerLaunch({ c, change, task, revision, round, launch,
  * @param {string} sessionId
  * @param {string | null} requestId
  * @param {any} round
+ * @param {(() => boolean) | undefined} [isStopped]
  */
-async function ensureRoundRequestAudit(c, change, revision, sessionId, requestId, round) {
+async function ensureRoundRequestAudit(c, change, revision, sessionId, requestId, round, isStopped) {
+  if (isStopped?.()) return;
   const history = await c.history(change.id).catch(() => []);
+  if (isStopped?.()) return;
   const already = Array.isArray(history) && history.some((/** @type {any} */ e) =>
     e?.kind === 'review_orchestration' && e.action === 'review_round_requested'
     && e.revision === revision
     && (requestId == null || e.requestId === requestId));
-  if (already) return;
+  if (already || isStopped?.()) return;
   await c.appendAudit({
     kind: 'review_orchestration', changeId: change.id,
     action: 'review_round_requested',
@@ -2081,6 +2157,27 @@ async function hasEscalationAudit(c, changeId) {
   const history = await c.history(changeId);
   return Array.isArray(history)
     && history.some((/** @type {any} */ e) => e.kind === 'review_orchestration' && e.action === 'escalated');
+}
+
+/**
+ * Resolve a revision-keyed reviewer record without re-reading ChangeStore.
+ * The locked ChangeStore settlement path supplies its fresh revision and
+ * bindings while holding the write lock, avoiding a non-reentrant store read.
+ * @param {ChangeControlApi} c
+ * @param {any} change
+ * @param {any} task
+ * @param {string|null} revision
+ * @param {Array<any>|null} lockedBindings
+ */
+async function roundReviewerSessionForRevision(c, change, task, revision, lockedBindings = null) {
+  if (typeof revision !== 'string' || revision === '') return null;
+  const { value: record } = await readClaimRecord(reviewerClaimFile(change, task, revision));
+  const sessionId = record && typeof record.sessionId === 'string' ? record.sessionId : null;
+  if (!sessionId) return null;
+  const binding = Array.isArray(lockedBindings)
+    ? lockedBindings.find((entry) => entry?.changeId === change.id && entry.sessionId === sessionId) ?? null
+    : await c.getBinding(change.id, sessionId).catch(() => null);
+  return binding && binding.role === 'reviewer' ? { sessionId } : null;
 }
 
 /**
@@ -2168,7 +2265,7 @@ async function expireReviewerRound(c, change, task, sessionId, isStopped) {
  *
  * @param {{ handle: any, c: ChangeControlApi, change: any, task: any,
  *   revision: string, sessionId: string,
- *   rebuildReview: () => Promise<any> }} args
+ *   rebuildReview: (isStopped?: () => boolean) => Promise<any> }} args
  * @returns {(() => void) | null} a stop for this observation (null when it
  *   could not be attached) — calling it neutralizes the recovery so a
  *   disposed controller never recovers a turn it no longer owns.
@@ -2216,7 +2313,7 @@ export function observeReviewerTurn({ handle, c, change, task, revision, session
     // Exactly one fresh explicit request for the same revision. Never
     // settles anything itself — the new request is the only path forward.
     if (stopped) return;
-    await rebuildReview().catch(() => {});
+    await rebuildReview(() => stopped).catch(() => {});
   };
   Promise.resolve()
     .then(() => handle.wait())
@@ -2263,7 +2360,7 @@ async function reattachReviewerTurnObservation({ api, requireTask, requireChange
   return observeReviewerTurn({
     handle: observerLauncher.observeSession(sessionId, record.requestId ?? null),
     c, change, task, revision: liveRevision, sessionId,
-    rebuildReview: () => api.runGovernedReview(taskId, {}),
+    rebuildReview: (isStopped) => api.runGovernedReview(taskId, { isStopped }),
   });
 }
 
@@ -2740,6 +2837,7 @@ function buildRepairPrompt(taskId, changeId, revision, openFindings) {
  * @param {string} taskId
  * @param {{ spec?: object, launcherOptions?: object, revision?: string,
  *   requestId?: string,
+ *   isStopped?: () => boolean,
  *   recordSession?: (sessionId: string) => Promise<void>,
  *   discardSession?: () => Promise<void> }} [options]
  *
@@ -2760,10 +2858,19 @@ function launchReviewerForTask(requireTask, requireChange, requireTaskId, taskId
     ));
   }
   return (async () => {
+    const ensureActive = () => {
+      if (options.isStopped?.()) {
+        throw Object.assign(new Error('review observer stopped'), { code: 'REVIEW_OBSERVER_STOPPED' });
+      }
+    };
+    ensureActive();
     const task = await Promise.resolve(t.get(taskId));
+    ensureActive();
     if (!task) throw Object.assign(new Error(`task not found: ${taskId}`), { code: 'TASK_NOT_FOUND' });
     const change = await c.findByWorkItem(WORK_ITEM_SYSTEM, taskId);
+    ensureActive();
     if (!change) throw Object.assign(new Error(`no Change linked to task ${taskId}`), { code: 'CHANGE_NOT_FOUND' });
+    ensureActive();
     const launcher = /** @type {any} */ (t).createReviewerLauncher(options.launcherOptions ?? {});
     const revisionLine = typeof options.revision === 'string' && options.revision !== ''
       ? ` The implementation revision under review is ${options.revision}; your verdict must name exactly this revision (stale-revision verdicts are rejected).`
@@ -2799,12 +2906,24 @@ Review the governed Change ${change.id} against its Plan and project task accept
     // caller's own record write. Fake launchers simply never call them; the
     // legacy post-return recordSession write below then remains the marker.
     if (typeof options.recordCreated === 'function') {
-      launchInput.recordCreated = ({ sessionId }) => options.recordCreated(sessionId);
+      launchInput.recordCreated = async ({ sessionId }) => {
+        ensureActive();
+        await options.recordCreated(sessionId);
+        ensureActive();
+      };
     }
     if (typeof options.recordSession === 'function') {
-      launchInput.recordSent = ({ sessionId }) => options.recordSession(sessionId);
+      launchInput.recordSent = async ({ sessionId }) => {
+        ensureActive();
+        await options.recordSession(sessionId);
+        ensureActive();
+      };
     }
     const handle = await launcher.launch(launchInput);
+    if (options.isStopped?.()) {
+      try { await handle?.terminate?.(); } catch { /* best-effort */ }
+      throw Object.assign(new Error('review observer stopped'), { code: 'REVIEW_OBSERVER_STOPPED' });
+    }
     if (typeof handle?.sessionId !== 'string' || handle.sessionId === '') {
       if (typeof handle?.terminate === 'function') {
         try { await handle.terminate(); } catch { /* best-effort */ }
@@ -2821,14 +2940,16 @@ Review the governed Change ${change.id} against its Plan and project task accept
       if (typeof options.recordSession === 'function') {
         await options.recordSession(handle.sessionId);
       }
+      ensureActive();
       binding = await c.bindRole(change.id, handle.sessionId, 'reviewer');
+      ensureActive();
     } catch (error) {
       if (typeof handle?.terminate === 'function') {
         try { await handle.terminate(); } catch { /* best-effort */ }
       }
       // T-H5 PR2-01: expire the durable record so a successor claim launches
       // fresh instead of adopting a session we just terminated.
-      if (typeof options.discardSession === 'function') {
+      if (typeof options.discardSession === 'function' && !options.isStopped?.()) {
         try { await options.discardSession(); } catch { /* best-effort */ }
       }
       throw error;

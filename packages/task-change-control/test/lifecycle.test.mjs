@@ -599,6 +599,27 @@ test('T-H12 round-4: the model-facing change_submit_review tool seam rejects a p
   assert.equal(soloReview.state, 'APPROVED', 'standalone (no round record) review behavior is unchanged');
 });
 
+test('T-H12 round-7: a governed REVIEW with no durable round fails closed at the real tool seam', async (t) => {
+  const { ctx, taskStore, dir } = await compose(t);
+  const { task, change } = await governedReadyTask(ctx, taskStore, dir);
+  await dispatchGovernedSuccess(ctx, taskStore, dir, change);
+  const revision = (await ctx.changeControl.status(change.id)).revision;
+  const claimFile = join(dir, '.dsh-governance', 'reviewer-claims', `reviewer-claim-${change.id}-${revision}`);
+  await rm(claimFile, { force: true });
+  const reviewTool = ctx.tools.view().visible.get('change_submit_review');
+  await assert.rejects(
+    reviewTool.execute(
+      { changeId: change.id, review: { verdict: 'pass', revision, findings: [] } },
+      { agent: { id: REVIEWER_SESSION } },
+    ),
+    (error) => error?.code === 'STALE_ROUND_SESSION',
+    'missing current-round state must not authorize a reviewer settlement',
+  );
+  assert.equal((await ctx.changeControl.get(change.id)).state, 'REVIEW');
+  const history = await ctx.changeControl.history(change.id);
+  assert.ok(history.some((event) => event.action === 'review_submit_missing_round'), 'missing-round rejection is audited');
+});
+
 test('T-H12 round-4: a production-launched reviewer turn that exits/fails without a verdict expires only its round and issues exactly one fresh request (fail-closed)', async (t) => {
   const { ctx, taskStore, dir, reviewerLaunches, endReviewerTurn } = await compose(t);
   const { task, change } = await governedReadyTask(ctx, taskStore, dir);

@@ -281,7 +281,7 @@ function deepFreeze(value) {
  * Standalone (non-governed) Change Control never registers a guard, so its
  * submitReview behavior is byte-identical to before.
  *
- * @type {WeakMap<object, (args: { changeId: string, sessionId: string }) => Promise<void>>}
+ * @type {WeakMap<object, (args: { changeId: string, sessionId: string, locked?: boolean, lockedChange?: object, currentRevision?: string|null, lockedBindings?: object[] }) => Promise<void>>}
  */
 const reviewSettlementGuards = new WeakMap();
 
@@ -2119,6 +2119,31 @@ export class ChangeStore {
       await this.#refreshChange(changeId);
       const c = this.#changes.get(changeId);
       if (!c) throw Object.assign(new Error(`Change ${changeId} not found`), { code: 'NOT_FOUND' });
+
+      // Re-run governed settlement authorization while this store's write lock
+      // holds the fresh Change, attempts, and bindings snapshot. The pre-lock
+      // guard is only an early rejection; it can never authorize a race.
+      const lockedSessionId = opts.sessionId;
+      const settlementGuard = getReviewSettlementGuard(this);
+      if (settlementGuard && typeof lockedSessionId === 'string' && lockedSessionId !== '') {
+        const currentAttempts = this.#attempts.get(changeId) ?? [];
+        try {
+          await settlementGuard({
+            changeId, sessionId: lockedSessionId, locked: true,
+            lockedChange: freezeChange(c),
+            currentRevision: currentAttempts.at(-1)?.revision ?? null,
+            lockedBindings: structuredClone(this.#bindings.get(changeId) ?? []),
+          });
+        } catch (error) {
+          const audit = error?.reviewSettlementAudit;
+          if (audit) {
+            await reseedFromDisk(this.#file);
+            this.#audit.push({ ...audit, eventId: nextEventId() });
+            await this.#persist();
+          }
+          throw error;
+        }
+      }
 
       // Validate change is in REVIEW state
       if (c.state !== 'REVIEW') {
