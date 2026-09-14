@@ -431,6 +431,38 @@ function sessionEvents(value) {
     .filter(event => event && typeof event.type === 'string')
 }
 
+// A probe may classify absence only after the host has proved that this is a
+// complete, structurally valid history page. The ordinary sessionEvents helper
+// intentionally tolerates partial pages for the live wait loop; probes cannot.
+function validatedSessionHistory(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)
+    || !Array.isArray(value.events) || typeof value.hasMore !== 'boolean') return null
+  const events = []
+  for (const entry of value.events) {
+    const event = entry?.event ?? entry
+    if (event === null || typeof event !== 'object' || Array.isArray(event)
+      || typeof event.type !== 'string' || event.type.trim() === ''
+      || !Number.isSafeInteger(event.seq) || event.seq < 0
+      || !Object.prototype.hasOwnProperty.call(event, 'data')) return null
+    events.push(event)
+  }
+  return { events, complete: value.hasMore === false }
+}
+
+function requestMarkerInEvents(events, requestId) {
+  const marker = `[review-request ${requestId}]`
+  return events.some(event => {
+    if (event.type !== 'user/message') return false
+    const content = event.data?.message?.content ?? event.data?.content
+    return Array.isArray(content) && content.some(block =>
+      block?.type === 'text' && typeof block.text === 'string' && block.text.includes(marker))
+  })
+}
+
+function isSessionNotFoundError(error) {
+  return error !== null && typeof error === 'object' && error.code === 'session-not-found'
+}
+
 function sessionAssistantText(events, afterSeq = -1) {
   return events
     .filter(event => event.seq > afterSeq && event.type === 'assistant/message')
@@ -798,20 +830,30 @@ export function createSessionLauncher({ rpc = createSessionRpcClient(), pollInte
       }
     },
     /**
-     * T-H12 round-4 — authoritative request-liveness reconciliation. Proves,
-     * from the host's own session history, whether the request carrying
-     * `requestId` (embedded in the prompt by launch) was ever DELIVERED to
-     * `sessionId`. Returns 'sent' | 'unsent' ('sent' only on positive proof).
-     * A session the host no longer knows (restart/death) yields an error or
-     * an empty history: its queued request died with it — 'unsent', so
-     * exactly one fresh request is the safe recovery.
+     * T-H13 — fail-closed request-liveness reconciliation. A probe can only
+     * call a request unsent when the host gives the stable session-not-found
+     * semantic or a complete, validated history page. Every other failure or
+     * incomplete page is unknown, because absence is not evidence of delivery.
+     * A sent result requires the exact request marker in this session's user
+     * message history.
      */
     async probeRequest(sessionId, requestId) {
-      if (typeof sessionId !== 'string' || sessionId === '') return 'unsent'
-      if (typeof requestId !== 'string' || requestId === '') return 'unsent'
-      const events = await rpc.call('session.history', { sessionId, maxMessages: historyMaxMessages })
-        .catch(() => ({ events: [] }))
-      return JSON.stringify(sessionEvents(events)).includes(requestId) ? 'sent' : 'unsent'
+      if (typeof sessionId !== 'string' || sessionId === '') return 'unknown'
+      if (typeof requestId !== 'string' || requestId === '') return 'unknown'
+      let response
+      try {
+        response = await rpc.call('session.history', { sessionId, maxMessages: historyMaxMessages })
+      } catch (error) {
+        return isSessionNotFoundError(error) ? 'unsent' : 'unknown'
+      }
+      try {
+        const page = validatedSessionHistory(response)
+        if (!page) return 'unknown'
+        if (requestMarkerInEvents(page.events, requestId)) return 'sent'
+        return page.complete ? 'unsent' : 'unknown'
+      } catch {
+        return 'unknown'
+      }
     },
   }
 }

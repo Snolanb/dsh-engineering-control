@@ -765,6 +765,15 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
           throw Object.assign(new Error('review observer stopped'), { code: 'REVIEW_OBSERVER_STOPPED' });
         }
       };
+      // T-H13 test seam: production keeps the 11-minute claim deadline, while
+      // focused recovery tests may inject a short deterministic window/backoff.
+      const recovery = options.reviewerRecovery ?? options.recovery ?? {};
+      const recoveryOptions = {
+        claimWaitMs: recovery.deadlineMs ?? recovery.claimWaitMs ?? options.reviewerClaimWaitMs ?? options.recoveryDeadlineMs,
+        claimPollMs: recovery.pollMs ?? recovery.claimPollMs ?? options.reviewerClaimPollMs,
+        recoveryBackoffMs: recovery.backoffMs ?? recovery.recoveryBackoffMs ?? options.recoveryBackoffMs,
+        recoveryBackoffMaxMs: recovery.backoffMaxMs ?? recovery.recoveryBackoffMaxMs ?? options.recoveryBackoffMaxMs,
+      };
       const t = requireTask();
       const c = requireChange();
       requireTaskId(taskId);
@@ -858,6 +867,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         let launchedHandle = null;
         const sessionId = await withReviewerReservation(`${change.id}:${revision}`, async () => {
           return reserveReviewerLaunch({
+             ...recoveryOptions,
             isStopped,
             c, change, task, revision, round,
             // T-H12 round-4: authoritative request-liveness reconciliation for
@@ -1316,7 +1326,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
             }
             // Deterministic preflight + reviewer launch/bind (reviewer
             // sessions never touch task claim/lease).
-            const rv = await api.runGovernedReview(taskId, { controllerPreflightOverride: options.controllerPreflightOverride, isStopped });
+            const rv = await api.runGovernedReview(taskId, { controllerPreflightOverride: options.controllerPreflightOverride, isStopped, reviewerRecovery: options.reviewerRecovery ?? options.recovery });
             if (rv.outcome === 'preflight_failed') {
               return { outcome: 'preflight_failed', taskId, changeId: change.id };
             }
@@ -1371,7 +1381,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
                 // while only a prior round's reviewer was bound): issue
                 // exactly one new explicit review round without re-running
                 // preflight.
-                const rv = await api.runGovernedReview(taskId, { controllerPreflightOverride: options.controllerPreflightOverride, isStopped });
+                const rv = await api.runGovernedReview(taskId, { controllerPreflightOverride: options.controllerPreflightOverride, isStopped, reviewerRecovery: options.reviewerRecovery ?? options.recovery });
                 if (rv.outcome === 'preflight_failed') {
                   return { outcome: 'preflight_failed', taskId, changeId: change.id };
                 }
@@ -1704,8 +1714,18 @@ function withReviewerReservation(changeId, fn) {
  */
 const REVIEWER_CLAIM_LEASE_MS = 10 * 60 * 1000;
 const REVIEWER_CLAIM_POLL_MS = 50;
+const REVIEWER_RECOVERY_BACKOFF_MAX_MS = 1000;
 /** Bounded wait: lease + grace, so a corrupt record can never block forever. */
 const REVIEWER_CLAIM_WAIT_MS = REVIEWER_CLAIM_LEASE_MS + 60_000;
+
+function milliseconds(value, fallback) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
+function recoveryBackoff(attempt, baseMs, maxMs) {
+  if (baseMs <= 0 || maxMs <= 0) return 0;
+  return Math.min(maxMs, baseMs * (2 ** Math.min(Math.max(attempt - 1, 0), 30)));
+}
 
 /**
  * T-H12: one durable review-round record per (Change, revision). The
@@ -1865,9 +1885,68 @@ async function releaseReclaimLock(lockFile, identity) {
   if (rec?.owner === identity) await rm(lockFile, { force: true }).catch(() => {});
 }
 
-/** @param {number} ms */
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+/**
+ * Sleep without leaving a recovery fiber asleep after its controller is
+ * disposed. The short polling slices also keep cancellation responsive while
+ * preserving a deterministic backoff (no jitter).
+ * @param {number} ms
+ * @param {(() => boolean) | undefined} isStopped
+ * @returns {Promise<boolean>} false when cancellation was observed
+ */
+function sleep(ms, isStopped) {
+  const duration = Math.max(0, Number(ms) || 0);
+  if (duration === 0) return Promise.resolve(!isStopped?.());
+  return new Promise((resolve) => {
+    const deadline = Date.now() + duration;
+    let timer;
+    const tick = () => {
+      if (isStopped?.()) {
+        if (timer) clearTimeout(timer);
+        resolve(false);
+        return;
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        resolve(true);
+        return;
+      }
+      timer = setTimeout(tick, Math.min(REVIEWER_CLAIM_POLL_MS, remaining));
+    };
+    tick();
+  });
+}
+
+/**
+ * Keep a stuck host probe inside the same recovery deadline. A stop callback
+ * is polled while the RPC is pending because the RPC seam has no AbortSignal.
+ */
+function probeWithinDeadline(probeRequest, sessionId, requestId, deadline, isStopped) {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) return Promise.resolve('unknown');
+  return new Promise((resolve) => {
+    let settled = false;
+    let timeout;
+    let stopTimer;
+    const finish = (verdict) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      clearTimeout(stopTimer);
+      resolve(verdict);
+    };
+    timeout = setTimeout(() => finish('unknown'), remaining);
+    const checkStopped = () => {
+      if (isStopped?.() || Date.now() >= deadline) {
+        finish('unknown');
+        return;
+      }
+      stopTimer = setTimeout(checkStopped, Math.min(REVIEWER_CLAIM_POLL_MS, deadline - Date.now()));
+    };
+    if (isStopped) checkStopped();
+    Promise.resolve()
+      .then(() => probeRequest(sessionId, requestId))
+      .then(finish, () => finish('unknown'));
+  });
 }
 
 /**
@@ -1889,10 +1968,15 @@ function sleep(ms) {
  *   launch: (holder: { file: string, identity: string, requestId: string }) => Promise<string>,
  *   probeRequest?: (sessionId: string, requestId: string | null) => Promise<'sent'|'unsent'|'unknown'>,
  *   isStopped?: () => boolean,
+ *   claimWaitMs?: number, claimPollMs?: number,
+ *   recoveryBackoffMs?: number, recoveryBackoffMaxMs?: number,
  * }} deps
  * @returns {Promise<string>} the reviewer session id to use
  */
-async function reserveReviewerLaunch({ c, change, task, revision, round, launch, probeRequest, isStopped }) {
+async function reserveReviewerLaunch({
+  c, change, task, revision, round, launch, probeRequest, isStopped,
+  claimWaitMs, claimPollMs, recoveryBackoffMs, recoveryBackoffMaxMs,
+}) {
   const ensureActive = () => {
     if (isStopped?.()) {
       throw Object.assign(new Error('review observer stopped'), { code: 'REVIEW_OBSERVER_STOPPED' });
@@ -1902,7 +1986,29 @@ async function reserveReviewerLaunch({ c, change, task, revision, round, launch,
   const file = reviewerClaimFile(change, task, revision);
   const lockFile = reclaimLockFile(file);
   const identity = claimIdentity();
-  const deadline = Date.now() + REVIEWER_CLAIM_WAIT_MS;
+  const waitMs = milliseconds(claimWaitMs, REVIEWER_CLAIM_WAIT_MS);
+  const pollMs = milliseconds(claimPollMs, REVIEWER_CLAIM_POLL_MS);
+  const backoffMs = milliseconds(recoveryBackoffMs, pollMs);
+  const backoffMaxMs = milliseconds(recoveryBackoffMaxMs, REVIEWER_RECOVERY_BACKOFF_MAX_MS);
+  const deadline = Date.now() + waitMs;
+  let unknownAttempts = 0;
+  const uncertain = (record) => {
+    const error = Object.assign(
+      new Error(`reviewer request delivery remains uncertain for session ${record?.sessionId ?? '(unknown)'}`),
+      {
+        code: 'REVIEWER_REQUEST_UNCERTAIN',
+        recoverable: true,
+        details: {
+          changeId: change.id,
+          revision,
+          sessionId: record?.sessionId ?? null,
+          requestId: record?.requestId ?? null,
+          attempts: unknownAttempts,
+        },
+      },
+    );
+    return error;
+  };
   // The round's request is satisfied iff the durable round record names the
   // session AND its reviewer binding is persisted (both durable).
   const confirmedRoundBinding = async (record) => {
@@ -1943,10 +2049,11 @@ async function reserveReviewerLaunch({ c, change, task, revision, round, launch,
     //    orphaned reviewer is reconciled, not re-created.
     if (record?.sessionId && typeof record.sessionId === 'string') {
       if (!stale) {
-        if (Date.now() > deadline) {
+        if (Date.now() >= deadline) {
           throw Object.assign(new Error('reviewer claim owner has not bound its session within the wait window'), { code: 'REVIEWER_CLAIM_TIMEOUT' });
         }
-        await sleep(REVIEWER_CLAIM_POLL_MS);
+        await sleep(pollMs, isStopped);
+        ensureActive();
         continue;
       }
       // T-H12 round-4: a stale record with a session but NO send marker is
@@ -1954,10 +2061,12 @@ async function reserveReviewerLaunch({ c, change, task, revision, round, launch,
       // response lost). Re-requesting here could duplicate a LIVE request;
       // re-binding could adopt a session that never received it. Resolve
       // authoritatively through the launcher probe UNDER the reclaim lock;
-      // only when the probe cannot say (absent, or a confirmed send) fall
-      // back to the legacy adoption.
-      if (record.sentAt == null && typeof probeRequest === 'function') {
-        // fall through to the serialized section below
+      // without a probe surface the outcome remains unknown and is handled
+      // with the same bounded fail-closed recovery.
+      const hasRequestId = typeof record.requestId === 'string' && record.requestId !== '';
+      if (record.sentAt == null && hasRequestId) {
+        // fall through to the serialized section below; without a probe
+        // surface the outcome is unknown and must still fail closed.
       } else {
         // Stale owner: bind the recorded session (a concurrent adopter may
         // have beaten us — ALREADY_BOUND is successful convergence).
@@ -1970,10 +2079,11 @@ async function reserveReviewerLaunch({ c, change, task, revision, round, launch,
     //    the session to be recorded (bounded), never launch a second
     //    reviewer.
     if (exists && !incomplete && !stale) {
-      if (Date.now() > deadline) {
+      if (Date.now() >= deadline) {
         throw Object.assign(new Error('reviewer claim wait exceeded window'), { code: 'REVIEWER_CLAIM_TIMEOUT' });
       }
-      await sleep(REVIEWER_CLAIM_POLL_MS);
+      await sleep(pollMs, isStopped);
+      ensureActive();
       continue;
     }
 
@@ -1990,14 +2100,19 @@ async function reserveReviewerLaunch({ c, change, task, revision, round, launch,
       ensureActive();
       if (await acquireReclaimLock(lockFile, identity)
         && await verifyReclaimLockHeld(lockFile, identity)) {
-        ensureActive();
+        try {
+          ensureActive();
+        } catch (error) {
+          await releaseReclaimLock(lockFile, identity);
+          throw error;
+        }
         break;
       }
       ensureActive();
-      if (Date.now() > deadline) {
+      if (Date.now() >= deadline) {
         throw Object.assign(new Error('reviewer claim wait exceeded window'), { code: 'REVIEWER_CLAIM_TIMEOUT' });
       }
-      await sleep(REVIEWER_CLAIM_POLL_MS);
+      await sleep(pollMs, isStopped);
     }
     let created = false;
     let createdRequestId = null;
@@ -2014,12 +2129,15 @@ async function reserveReviewerLaunch({ c, change, task, revision, round, launch,
         ? Date.now() - Number(r.value.updatedAt || 0) > REVIEWER_CLAIM_LEASE_MS
         : false;
       if (r.value?.sessionId && typeof r.value.sessionId === 'string' && rStale
-        && r.value.sentAt == null && typeof probeRequest === 'function') {
+        && r.value.sentAt == null
+        && typeof r.value.requestId === 'string' && r.value.requestId !== '') {
         // AMBIGUOUS stale record (round-4): the session exists but the send
         // marker is missing — the owner crashed somewhere between session
         // acceptance and marking the send. Prove liveness through the real
         // launcher probe (host session history) before deciding:
-        const verdict = await probeRequest(r.value.sessionId, r.value.requestId ?? null).catch(() => 'unknown');
+        const verdict = typeof probeRequest === 'function'
+          ? await probeWithinDeadline(probeRequest, r.value.sessionId, r.value.requestId, deadline, isStopped)
+          : 'unknown';
         ensureActive();
         if (verdict === 'sent') {
           // The request WAS delivered (proof positive): adopt the SAME
@@ -2052,10 +2170,21 @@ async function reserveReviewerLaunch({ c, change, task, revision, round, launch,
             updatedAt: Date.now(),
           });
           created = true;
+        } else {
+          // UNKNOWN is not evidence of non-delivery. Keep the durable record
+          // untouched and retry with deterministic bounded backoff; only the
+          // recovery deadline can end this uncertainty.
+          unknownAttempts += 1;
+          ensureActive();
+          if (Date.now() >= deadline) throw uncertain(r.value);
+          const delay = Math.min(
+            recoveryBackoff(unknownAttempts, backoffMs, backoffMaxMs),
+            Math.max(0, deadline - Date.now()),
+          );
+          await sleep(delay, isStopped);
+          ensureActive();
+          if (Date.now() >= deadline) throw uncertain(r.value);
         }
-        // 'unknown': the probe could not prove delivery either way — never
-        // guess. Leave the record intact and retry on the next pass (bounded
-        // by REVIEWER_CLAIM_WAIT_MS).
       } else if (r.value?.sessionId && typeof r.value.sessionId === 'string' && rStale) {
         // A crashed owner recorded a session (a SENT request): reconcile it
         // instead of launching — sent requests are never duplicated (T-H12
