@@ -102,3 +102,29 @@ test('change_bootstrap_task + change_for_task round-trip through the real regist
   assert.equal(read.linked, true);
   assert.equal(read.change.id, boot.change.id);
 });
+
+// The host materializes a successful tool result by calling output.render and
+// treating the return value as an array of content blocks (ToolRuntime
+// createSuccessResult -> content.map). Returning the raw value instead throws
+// "content is not iterable" in the real host — which execute-level tests above
+// cannot observe, because they never run the render step.
+test('integration tools render an array of content blocks, never a raw value', async (t) => {
+  const { ctx, taskStore } = await compose(t);
+  const task = await taskStore.create({ title: 'render contract' });
+  const visible = ctx.tools.view().visible;
+  for (const name of INTEGRATION_TOOLS) {
+    const definition = visible.get(name);
+    assert.equal(typeof definition.output?.render, 'function', `${name} declares a renderer`);
+    const args = { taskId: task.id };
+    const value = await definition.execute(args, {});
+    const rendered = definition.output.render(args, value);
+    assert.ok(Array.isArray(rendered), `${name}.output.render must return an array of content blocks`);
+    assert.ok(rendered.length > 0, `${name}.output.render must return at least one content block`);
+    for (const block of rendered) {
+      assert.equal(block.type, 'text', `${name}.output.render blocks must be text blocks`);
+      assert.equal(typeof block.text, 'string', `${name}.output.render block text must be a string`);
+    }
+    const text = rendered.map((block) => block.text).join('\n');
+    assert.equal(text, JSON.stringify(value, null, 2), `${name} must render the produced value, not discard it`);
+  }
+});

@@ -2,6 +2,16 @@
 import { defineTool } from '@deepseek-ai/dsh-tools';
 
 /**
+ * The host's output.render contract is an ARRAY of content blocks, not the raw
+ * value: ToolRuntime materializes a successful result via content.map(...), so
+ * returning the value directly fails at render time with "content is not
+ * iterable". Both integration tools render through this one helper.
+ */
+function contentText(value) {
+  return [{ type: 'text', text: JSON.stringify(value === undefined ? null : value, null, 2) }];
+}
+
+/**
  * The entire model-facing integration surface: exactly two tools.
  * No generic change_create/change_bind will ever exist here — creation and
  * role binding are host/controller responsibilities only.
@@ -9,7 +19,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools';
  * @param {{ getChangeForTask: Function, bootstrapTask: Function }} service the taskChangeControl service
  */
 export function createIntegrationTools(service) {
-  const out = { schema: { type: 'object', additionalProperties: true }, render: (_a, v) => v };
+  const out = { schema: { type: 'object', additionalProperties: true }, render: (_a, v) => contentText(v) };
   return [
     defineTool({
       name: 'change_for_task',
