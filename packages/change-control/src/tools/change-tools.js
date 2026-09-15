@@ -6,6 +6,16 @@ import { createChangeControlService } from '../service/change-control-service.js
 import { TRANSITIONS, ChangeDomainError, RISK_LEVELS } from '../domain/change.js';
 
 /**
+ * The host's output.render contract is an ARRAY of content blocks, not the raw
+ * value: ToolRuntime materializes a successful result via content.map(...), so
+ * returning the value directly fails at render time with "content is not
+ * iterable". Every Change tool renders through this one helper.
+ */
+function contentText(value) {
+  return [{ type: 'text', text: JSON.stringify(value === undefined ? null : value, null, 2) }];
+}
+
+/**
  * Validate changeId is a valid UUID before any store access.
  */
 function validateChangeId(changeId) {
@@ -81,7 +91,7 @@ export function createChangeTools(changeControl, ctx) {
       name: 'change_get',
       description: 'Get a Change record by ID.',
       parameters: { changeId: { type: 'string' } },
-      output: { schema: { type: 'object', additionalProperties: true }, render: (_a, v) => v },
+      output: { schema: { type: 'object', additionalProperties: true }, render: (_a, v) => contentText(v) },
       execute: async (args, exec) => {
         validateChangeId(args.changeId);
         const { sessionId } = await deriveIdentity(args, exec, changeControl);
@@ -108,7 +118,7 @@ export function createChangeTools(changeControl, ctx) {
       name: 'change_submit_plan',
       description: 'Submit a plan for a Change. Requires planner role on DRAFT/PLANNED change.',
       parameters: { changeId: { type: 'string' }, content: { type: 'object', additionalProperties: true } },
-      output: { schema: { type: 'object', additionalProperties: true }, render: (_a, v) => v },
+      output: { schema: { type: 'object', additionalProperties: true }, render: (_a, v) => contentText(v) },
       execute: async (args, exec) => {
         validateChangeId(args.changeId);
         if (!args.content || typeof args.content !== 'object') {
@@ -129,7 +139,7 @@ export function createChangeTools(changeControl, ctx) {
       name: 'change_submit_proof',
       description: 'Submit proof of implementation. Requires worker role on IMPLEMENTING change with accepted plan.',
       parameters: { changeId: { type: 'string' }, proof: { type: 'string' } },
-      output: { schema: { type: 'object', additionalProperties: true }, render: (_a, v) => v },
+      output: { schema: { type: 'object', additionalProperties: true }, render: (_a, v) => contentText(v) },
       execute: async (args, exec) => {
         validateChangeId(args.changeId);
         if (!args.proof || typeof args.proof !== 'string') {
@@ -164,7 +174,7 @@ export function createChangeTools(changeControl, ctx) {
       name: 'change_submit_review',
       description: 'Submit a review for a Change. Requires reviewer role on REVIEW change with matching revision.',
       parameters: { changeId: { type: 'string' }, review: { type: 'object', additionalProperties: true } },
-      output: { schema: { type: 'object', additionalProperties: true }, render: (_a, v) => v },
+      output: { schema: { type: 'object', additionalProperties: true }, render: (_a, v) => contentText(v) },
       execute: async (args, exec) => {
         validateChangeId(args.changeId);
         if (!args.review || typeof args.review !== 'object') {
@@ -206,7 +216,7 @@ export function createChangeTools(changeControl, ctx) {
         changeId: { type: 'string' },
         repair: { type: 'object', additionalProperties: true },
       },
-      output: { schema: { type: 'object', additionalProperties: true }, render: (_a, v) => v },
+      output: { schema: { type: 'object', additionalProperties: true }, render: (_a, v) => contentText(v) },
       execute: async (args, exec) => {
         validateChangeId(args.changeId);
         // Reject non-object repair

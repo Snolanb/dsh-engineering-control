@@ -47,3 +47,26 @@ test('registered tools expose executable definitions with output contracts', asy
     assert.equal(typeof definition.output?.render, 'function');
   }
 });
+
+// The host materializes a successful tool result by calling output.render and
+// treating the return value as an array of content blocks (ToolRuntime
+// createSuccessResult -> content.map). Returning the raw value instead is not a
+// cosmetic difference: it throws "content is not iterable" in the real host,
+// which is why tool.execute-level tests never caught it.
+test('every Change tool renders an array of content blocks, never a raw value', async () => {
+  const tools = await runtime('.test-tools-render.json');
+  const changeTools = ['change_get', 'change_submit_plan', 'change_submit_proof', 'change_submit_review', 'change_submit_repair'];
+  for (const name of changeTools) {
+    const definition = tools.get(name);
+    const value = { id: '11111111-2222-3333-4444-555555555555', state: 'DRAFT', success: true };
+    const rendered = definition.output.render({ changeId: value.id }, value);
+    assert.ok(Array.isArray(rendered), `${name}.output.render must return an array of content blocks`);
+    assert.ok(rendered.length > 0, `${name}.output.render must return at least one content block`);
+    for (const block of rendered) {
+      assert.equal(block.type, 'text', `${name}.output.render blocks must be text blocks`);
+      assert.equal(typeof block.text, 'string', `${name}.output.render block text must be a string`);
+    }
+    const text = rendered.map((block) => block.text).join('\n');
+    assert.equal(text, JSON.stringify(value, null, 2), `${name} must render its value, not discard it`);
+  }
+});
