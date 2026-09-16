@@ -32,19 +32,21 @@ const EXPECTED_CAPTAIN_REASONS = {
     'release automation', 'publish to npm', 'push to registry',
   ],
   DESTRUCTIVE_OPERATION: [
-    'delete', 'deleted', 'deleting', 'deletion', 'drop table', 'drop column',
-    'drop database', 'drop schema', 'drop index', 'dropped', 'dropping',
-    'truncate', 'truncated', 'wipe', 'wiped', 'purge', 'purged', 'erase',
-    'erased', 'rm -rf', 'unlink', 'overwrite', 'overwritten', 'irreversible',
+    'delete', 'deleted', 'deleting', 'deletion', 'deletes', 'drop table',
+    'drop column', 'drop database', 'drop schema', 'drop index',
+    'drop the table', 'dropped', 'dropping', 'truncate', 'truncated', 'wipe',
+    'wiped', 'purge', 'purged', 'erase', 'erased', 'irreversible', 'rm -rf',
+    'rm -fr', 'unlink', 'overwrite', 'overwritten', 'hard reset',
   ],
   EXTERNAL_MUTATION: [
     'external write', 'external writes', 'external mutation',
-    'external mutations', 'external api', 'publish package', 'webhook',
-    'outbound',
+    'external mutations', 'external api', 'publish package', 'npm publish',
+    'third party', 'third-party', 'webhook', 'outbound',
   ],
   PERSISTENT_DATA_MIGRATION: [
-    'schema change', 'schema migration', 'schema migrations', 'data migration',
-    'data migrations', 'alter table', 'drop column',
+    'schema change', 'schema migration', 'schema migrations', 'migration',
+    'migrations', 'data migration', 'data migrations', 'alter table',
+    'drop column', 'backfill',
   ],
   SECRETS_CREDENTIALS: [
     'secret', 'secrets', 'credential', 'credentials', 'api key', 'api keys',
@@ -53,7 +55,7 @@ const EXPECTED_CAPTAIN_REASONS = {
   ],
   SECURITY_BOUNDARY: [
     'crypt', 'crypto', 'cryptographic', 'encrypt', 'encrypted', 'encryption',
-    'certificate', 'tls',
+    'hmac signature', 'certificate', 'tls',
   ],
   TOKEN_COUNTING: [
     'token budget', 'token count', 'token counting', 'token estimate',
@@ -185,7 +187,7 @@ const fieldAttributionCases = [
   {
     field: 'acceptance_criteria',
     value: ['The schema migration runs once.'],
-    reason: { id: 'PERSISTENT_DATA_MIGRATION', field: 'acceptance_criteria', match: 'schema migration' },
+    reason: { id: 'PERSISTENT_DATA_MIGRATION', field: 'acceptance_criteria', match: 'migration' },
   },
   {
     field: 'specification',
@@ -289,8 +291,8 @@ test('AC6 false-negative check detects count tokens', () => {
   });
 });
 
-test('trigger vocabulary regression matrix covers false negatives and false positives', () => {
-  const falseNegatives = [
+test('trigger vocabulary regression matrix covers fail-closed and false-positive cases', () => {
+  const mustBeGoverned = [
     ['Deleted rows from the tasks table', 'DESTRUCTIVE_OPERATION', 'deleted'],
     ['Dropped the audit table', 'DESTRUCTIVE_OPERATION', 'dropped'],
     ['Wiped the logs', 'DESTRUCTIVE_OPERATION', 'wiped'],
@@ -298,9 +300,25 @@ test('trigger vocabulary regression matrix covers false negatives and false posi
     ['erased the audit trail', 'DESTRUCTIVE_OPERATION', 'erased'],
     ['Purge the cache', 'DESTRUCTIVE_OPERATION', 'purge'],
     ['Handle encrypted payloads', 'SECURITY_BOUNDARY', 'encrypted'],
+    ['The cron job deletes stale rows', 'DESTRUCTIVE_OPERATION', 'deletes'],
+    ['The migration drops the old column', 'PERSISTENT_DATA_MIGRATION', 'migration'],
+    ['Run a hard reset on the prod queue', 'DESTRUCTIVE_OPERATION', 'hard reset'],
+    ['Backfill the production rows', 'PERSISTENT_DATA_MIGRATION', 'backfill'],
+    ['Write to the third-party API', 'EXTERNAL_MUTATION', 'third-party'],
+    ['Charge the paid subscription', 'BILLING_FINANCIAL', 'subscription'],
+    ['Verify the HMAC signature', 'SECURITY_BOUNDARY', 'hmac signature'],
+    ['npm publish the package', 'EXTERNAL_MUTATION', 'npm publish'],
+    ['Drop the table X', 'DESTRUCTIVE_OPERATION', 'drop the table'],
+    ['rm -fr /tmp/x', 'DESTRUCTIVE_OPERATION', 'rm -fr'],
+    // IRREDUCIBLE AMBIGUITIES: resolved toward fail-closed. Governing costs a
+    // false positive (a captain gate), while excluding costs a false negative
+    // (destructive or third-party work proceeding ungoverned), unacceptable for
+    // a governance classifier.
+    ['Bump a third-party devDependency', 'EXTERNAL_MUTATION', 'third-party'],
+    ['Update the migration guide', 'PERSISTENT_DATA_MIGRATION', 'migration'],
   ];
-  for (const [description, id, match] of falseNegatives) {
-    assert.deepEqual(resolveGovernancePolicy(autoTask(`false-negative-${match}`, { description })), {
+  for (const [description, id, match] of mustBeGoverned) {
+    assert.deepEqual(resolveGovernancePolicy(autoTask(`must-govern-${match}`, { description })), {
       required: true,
       mode: 'auto',
       reasons: [{ id, field: 'description', match }],
@@ -314,8 +332,6 @@ test('trigger vocabulary regression matrix covers false negatives and false posi
     'Add a drop-down menu',
     'Fix the reset button',
     'Subscribe to client events',
-    'Bump a third-party devDependency',
-    'Update the migration guide',
     'Use tokenizer fixtures in tests',
     'Author the release notes',
     'Add a --dry-run flag to the status command',
