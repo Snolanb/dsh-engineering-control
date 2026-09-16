@@ -9,24 +9,26 @@ const CAPTAIN_REASONS = Object.freeze({
   ]),
   BILLING_FINANCIAL: Object.freeze([
     'billing', 'payment', 'payments', 'invoice', 'invoices', 'financial',
-    'subscription', 'subscriptions', 'refund', 'refunds', 'credit card',
+    'subscription fee', 'refund', 'refunds', 'credit card', 'chargeback',
   ]),
   CI_RELEASE_AUTOMATION: Object.freeze([
     'github action', 'github actions', 'workflow file', 'ci workflow',
     'release automation', 'publish to npm', 'push to registry',
   ]),
   DESTRUCTIVE_OPERATION: Object.freeze([
-    'delete', 'deletes', 'deletion', 'drop', 'drops', 'truncate', 'wipe',
-    'purge', 'erase', 'reset', 'rm -rf', 'unlink', 'overwrite', 'irreversible',
+    'delete', 'deleted', 'deleting', 'deletion', 'drop table', 'drop column',
+    'drop database', 'drop schema', 'drop index', 'dropped', 'dropping',
+    'truncate', 'truncated', 'wipe', 'wiped', 'purge', 'purged', 'erase',
+    'erased', 'rm -rf', 'unlink', 'overwrite', 'overwritten', 'irreversible',
   ]),
   EXTERNAL_MUTATION: Object.freeze([
     'external write', 'external writes', 'external mutation',
-    'external mutations', 'third party', 'third-party', 'external api',
-    'publish', 'webhook', 'outbound',
+    'external mutations', 'external api', 'publish package', 'webhook',
+    'outbound',
   ]),
   PERSISTENT_DATA_MIGRATION: Object.freeze([
-    'migration', 'migrations', 'schema change', 'schema migration',
-    'data migration', 'alter table', 'drop column', 'backfill',
+    'schema change', 'schema migration', 'schema migrations', 'data migration',
+    'data migrations', 'alter table', 'drop column',
   ]),
   SECRETS_CREDENTIALS: Object.freeze([
     'secret', 'secrets', 'credential', 'credentials', 'api key', 'api keys',
@@ -34,11 +36,12 @@ const CAPTAIN_REASONS = Object.freeze({
     'encryption key', 'access token',
   ]),
   SECURITY_BOUNDARY: Object.freeze([
-    'crypt', 'crypto', 'cryptographic', 'signature', 'certificate', 'tls',
+    'crypt', 'crypto', 'cryptographic', 'encrypt', 'encrypted', 'encryption',
+    'certificate', 'tls',
   ]),
   TOKEN_COUNTING: Object.freeze([
     'token budget', 'token count', 'token counting', 'token estimate',
-    'token usage', 'count tokens', 'tokenize', 'tokenizer',
+    'token usage', 'count tokens', 'tokenize',
   ]),
 });
 
