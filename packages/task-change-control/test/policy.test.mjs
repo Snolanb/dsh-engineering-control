@@ -25,24 +25,26 @@ const EXPECTED_CAPTAIN_REASONS = {
   ],
   BILLING_FINANCIAL: [
     'billing', 'payment', 'payments', 'invoice', 'invoices', 'financial',
-    'subscription', 'subscriptions', 'refund', 'refunds', 'credit card',
+    'subscription fee', 'refund', 'refunds', 'credit card', 'chargeback',
   ],
   CI_RELEASE_AUTOMATION: [
     'github action', 'github actions', 'workflow file', 'ci workflow',
     'release automation', 'publish to npm', 'push to registry',
   ],
   DESTRUCTIVE_OPERATION: [
-    'delete', 'deletes', 'deletion', 'drop', 'drops', 'truncate', 'wipe',
-    'purge', 'erase', 'reset', 'rm -rf', 'unlink', 'overwrite', 'irreversible',
+    'delete', 'deleted', 'deleting', 'deletion', 'drop table', 'drop column',
+    'drop database', 'drop schema', 'drop index', 'dropped', 'dropping',
+    'truncate', 'truncated', 'wipe', 'wiped', 'purge', 'purged', 'erase',
+    'erased', 'rm -rf', 'unlink', 'overwrite', 'overwritten', 'irreversible',
   ],
   EXTERNAL_MUTATION: [
     'external write', 'external writes', 'external mutation',
-    'external mutations', 'third party', 'third-party', 'external api',
-    'publish', 'webhook', 'outbound',
+    'external mutations', 'external api', 'publish package', 'webhook',
+    'outbound',
   ],
   PERSISTENT_DATA_MIGRATION: [
-    'migration', 'migrations', 'schema change', 'schema migration',
-    'data migration', 'alter table', 'drop column', 'backfill',
+    'schema change', 'schema migration', 'schema migrations', 'data migration',
+    'data migrations', 'alter table', 'drop column',
   ],
   SECRETS_CREDENTIALS: [
     'secret', 'secrets', 'credential', 'credentials', 'api key', 'api keys',
@@ -50,11 +52,12 @@ const EXPECTED_CAPTAIN_REASONS = {
     'encryption key', 'access token',
   ],
   SECURITY_BOUNDARY: [
-    'crypt', 'crypto', 'cryptographic', 'signature', 'certificate', 'tls',
+    'crypt', 'crypto', 'cryptographic', 'encrypt', 'encrypted', 'encryption',
+    'certificate', 'tls',
   ],
   TOKEN_COUNTING: [
     'token budget', 'token count', 'token counting', 'token estimate',
-    'token usage', 'count tokens', 'tokenize', 'tokenizer',
+    'token usage', 'count tokens', 'tokenize',
   ],
 };
 
@@ -182,7 +185,7 @@ const fieldAttributionCases = [
   {
     field: 'acceptance_criteria',
     value: ['The schema migration runs once.'],
-    reason: { id: 'PERSISTENT_DATA_MIGRATION', field: 'acceptance_criteria', match: 'migration' },
+    reason: { id: 'PERSISTENT_DATA_MIGRATION', field: 'acceptance_criteria', match: 'schema migration' },
   },
   {
     field: 'specification',
@@ -284,6 +287,46 @@ test('AC6 false-negative check detects count tokens', () => {
       { id: 'TOKEN_COUNTING', field: 'description', match: 'count tokens' },
     ],
   });
+});
+
+test('trigger vocabulary regression matrix covers false negatives and false positives', () => {
+  const falseNegatives = [
+    ['Deleted rows from the tasks table', 'DESTRUCTIVE_OPERATION', 'deleted'],
+    ['Dropped the audit table', 'DESTRUCTIVE_OPERATION', 'dropped'],
+    ['Wiped the logs', 'DESTRUCTIVE_OPERATION', 'wiped'],
+    ['Deleting the stale records', 'DESTRUCTIVE_OPERATION', 'deleting'],
+    ['erased the audit trail', 'DESTRUCTIVE_OPERATION', 'erased'],
+    ['Purge the cache', 'DESTRUCTIVE_OPERATION', 'purge'],
+    ['Handle encrypted payloads', 'SECURITY_BOUNDARY', 'encrypted'],
+  ];
+  for (const [description, id, match] of falseNegatives) {
+    assert.deepEqual(resolveGovernancePolicy(autoTask(`false-negative-${match}`, { description })), {
+      required: true,
+      mode: 'auto',
+      reasons: [{ id, field: 'description', match }],
+    });
+  }
+
+  const falsePositives = [
+    'Document the method signature',
+    'Change the function signature',
+    'Tighten the type signature',
+    'Add a drop-down menu',
+    'Fix the reset button',
+    'Subscribe to client events',
+    'Bump a third-party devDependency',
+    'Update the migration guide',
+    'Use tokenizer fixtures in tests',
+    'Author the release notes',
+    'Add a --dry-run flag to the status command',
+  ];
+  for (const description of falsePositives) {
+    assert.deepEqual(resolveGovernancePolicy(autoTask(`false-positive-${description}`, { description })), {
+      required: false,
+      mode: 'auto',
+      reasons: [],
+    });
+  }
 });
 
 test('invalid governance modes fail closed with a typed error and code', () => {
