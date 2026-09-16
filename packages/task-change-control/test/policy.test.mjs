@@ -305,7 +305,10 @@ test('trigger vocabulary regression matrix covers fail-closed and false-positive
     ['Run a hard reset on the prod queue', 'DESTRUCTIVE_OPERATION', 'hard reset'],
     ['Backfill the production rows', 'PERSISTENT_DATA_MIGRATION', 'backfill'],
     ['Write to the third-party API', 'EXTERNAL_MUTATION', 'third-party'],
-    ['Charge the paid subscription', 'BILLING_FINANCIAL', 'subscription'],
+    // Bare 'subscription' is deliberately excluded because it governs
+    // client-side event subscriptions; billing uses the qualified phrase,
+    // and this fixture uses that qualified form.
+    ['Charge the subscription fee', 'BILLING_FINANCIAL', 'subscription fee'],
     ['Verify the HMAC signature', 'SECURITY_BOUNDARY', 'hmac signature'],
     ['npm publish the package', 'EXTERNAL_MUTATION', 'npm publish'],
     ['Drop the table X', 'DESTRUCTIVE_OPERATION', 'drop the table'],
