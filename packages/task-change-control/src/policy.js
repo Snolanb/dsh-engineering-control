@@ -9,28 +9,27 @@ const CAPTAIN_REASONS = Object.freeze({
   ]),
   BILLING_FINANCIAL: Object.freeze([
     'billing', 'payment', 'payments', 'invoice', 'invoices', 'financial',
-    'subscription fee', 'refund', 'refunds', 'credit card', 'chargeback',
+    'subscript', 'refund', 'refunds', 'credit card', 'chargeback',
   ]),
   CI_RELEASE_AUTOMATION: Object.freeze([
     'github action', 'github actions', 'workflow file', 'ci workflow',
     'release automation', 'publish to npm', 'push to registry',
   ]),
   DESTRUCTIVE_OPERATION: Object.freeze([
-    'delete', 'deleted', 'deleting', 'deletion', 'deletes', 'drop table',
-    'drop column', 'drop database', 'drop schema', 'drop index',
-    'drop the table', 'dropped', 'dropping', 'truncate', 'truncated', 'wipe',
-    'wiped', 'purge', 'purged', 'erase', 'erased', 'irreversible', 'rm -rf',
-    'rm -fr', 'unlink', 'overwrite', 'overwritten', 'hard reset',
+    'irreversible', 'rm -rf', 'rm -fr', 'rm -r', 'delet', 'drop',
+    'truncat', 'purg', 'wipe', 'eras', 'overwrit', 'unlink', 'reset',
+    'drop table', 'drop column', 'drop database', 'drop schema', 'drop index',
+    'drop the table',
   ]),
   EXTERNAL_MUTATION: Object.freeze([
     'external write', 'external writes', 'external mutation',
-    'external mutations', 'external api', 'publish package', 'npm publish',
-    'third party', 'third-party', 'webhook', 'outbound',
+    'external mutations', 'external api', 'publish', 'third party',
+    'third-party', 'webhook', 'outbound',
   ]),
   PERSISTENT_DATA_MIGRATION: Object.freeze([
-    'schema change', 'schema migration', 'schema migrations', 'migration',
-    'migrations', 'data migration', 'data migrations', 'alter table',
-    'drop column', 'backfill',
+    'migration', 'migrations', 'schema change', 'schema migration',
+    'schema migrations', 'data migration', 'data migrations', 'alter table',
+    'drop column', 'backfil',
   ]),
   SECRETS_CREDENTIALS: Object.freeze([
     'secret', 'secrets', 'credential', 'credentials', 'api key', 'api keys',
@@ -39,7 +38,7 @@ const CAPTAIN_REASONS = Object.freeze({
   ]),
   SECURITY_BOUNDARY: Object.freeze([
     'crypt', 'crypto', 'cryptographic', 'encrypt', 'encrypted', 'encryption',
-    'hmac signature', 'certificate', 'tls',
+    'hmac signature', 'signatures', 'certificate', 'tls',
   ]),
   TOKEN_COUNTING: Object.freeze([
     'token budget', 'token count', 'token counting', 'token estimate',
@@ -76,9 +75,23 @@ function phraseRegExp(phrase) {
   );
 }
 
-// [category, phrase, regExp] in CAPTAIN_REASONS key/phrase order.
+// ponytail: stem match consumes the word (match[1]) and refuses hyphen
+// compounds via the trailing '-' guard; 'drop' covers drops/dropped but not
+// 'drop-down'.
+const PREFIX_STEMS = new Set([
+  'delet', 'drop', 'truncat', 'purg', 'wipe', 'eras', 'overwrit', 'unlink',
+  'reset', 'backfil', 'publish', 'subscript', 'signatures',
+]);
+
+function stemRegExp(stem) {
+  return new RegExp(`(?<![a-z0-9])(${stem}[a-z]*)(?![a-z0-9]|-)`, 'g');
+}
+
+// [category, phrase, regExp, isStem] in CAPTAIN_REASONS key/phrase order.
 const MATCHERS = Object.entries(CAPTAIN_REASONS).flatMap(([category, phrases]) =>
-  phrases.map((phrase) => [category, phrase, phraseRegExp(phrase)]),
+  phrases.map((phrase) => PREFIX_STEMS.has(phrase)
+    ? [category, phrase, stemRegExp(phrase), true]
+    : [category, phrase, phraseRegExp(phrase), false]),
 );
 
 const CATEGORY_ORDER = Object.keys(CAPTAIN_REASONS);
@@ -96,10 +109,10 @@ function specificationStrings(node, out) {
 
 // Rule B/C: among this category's phrases hitting the normalized text,
 // report the one whose FINAL WORD starts earliest; ties prefer the shorter
-// phrase.
+// phrase. Stems report the actual consumed word, not the stem.
 function selectMatch(text, category) {
-  let best = null; // [finalWordPos, phraseLength, phrase]
-  for (const [cat, phrase, re] of MATCHERS) {
+  let best = null; // [finalWordPos, phraseLength, reported]
+  for (const [cat, phrase, re, isStem] of MATCHERS) {
     if (cat !== category) continue;
     re.lastIndex = 0;
     const match = re.exec(text);
@@ -111,7 +124,7 @@ function selectMatch(text, category) {
       || finalWordPos < best[0]
       || (finalWordPos === best[0] && length < best[1])
     ) {
-      best = [finalWordPos, length, phrase];
+      best = [finalWordPos, length, isStem ? match[1] : phrase];
     }
   }
   return best === null ? null : { phrase: best[2] };
@@ -177,4 +190,4 @@ export function resolveGovernancePolicy(task) {
   };
 }
 
-export { CAPTAIN_REASONS, GovernancePolicyError };
+export { CAPTAIN_REASONS, GovernancePolicyError, PREFIX_STEMS };
