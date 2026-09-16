@@ -16,19 +16,21 @@ const CAPTAIN_REASONS = Object.freeze({
     'release automation', 'publish to npm', 'push to registry',
   ]),
   DESTRUCTIVE_OPERATION: Object.freeze([
-    'delete', 'deleted', 'deleting', 'deletion', 'drop table', 'drop column',
-    'drop database', 'drop schema', 'drop index', 'dropped', 'dropping',
-    'truncate', 'truncated', 'wipe', 'wiped', 'purge', 'purged', 'erase',
-    'erased', 'rm -rf', 'unlink', 'overwrite', 'overwritten', 'irreversible',
+    'delete', 'deleted', 'deleting', 'deletion', 'deletes', 'drop table',
+    'drop column', 'drop database', 'drop schema', 'drop index',
+    'drop the table', 'dropped', 'dropping', 'truncate', 'truncated', 'wipe',
+    'wiped', 'purge', 'purged', 'erase', 'erased', 'irreversible', 'rm -rf',
+    'rm -fr', 'unlink', 'overwrite', 'overwritten', 'hard reset',
   ]),
   EXTERNAL_MUTATION: Object.freeze([
     'external write', 'external writes', 'external mutation',
-    'external mutations', 'external api', 'publish package', 'webhook',
-    'outbound',
+    'external mutations', 'external api', 'publish package', 'npm publish',
+    'third party', 'third-party', 'webhook', 'outbound',
   ]),
   PERSISTENT_DATA_MIGRATION: Object.freeze([
-    'schema change', 'schema migration', 'schema migrations', 'data migration',
-    'data migrations', 'alter table', 'drop column',
+    'schema change', 'schema migration', 'schema migrations', 'migration',
+    'migrations', 'data migration', 'data migrations', 'alter table',
+    'drop column', 'backfill',
   ]),
   SECRETS_CREDENTIALS: Object.freeze([
     'secret', 'secrets', 'credential', 'credentials', 'api key', 'api keys',
@@ -37,7 +39,7 @@ const CAPTAIN_REASONS = Object.freeze({
   ]),
   SECURITY_BOUNDARY: Object.freeze([
     'crypt', 'crypto', 'cryptographic', 'encrypt', 'encrypted', 'encryption',
-    'certificate', 'tls',
+    'hmac signature', 'certificate', 'tls',
   ]),
   TOKEN_COUNTING: Object.freeze([
     'token budget', 'token count', 'token counting', 'token estimate',
