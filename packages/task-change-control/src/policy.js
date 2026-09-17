@@ -6,12 +6,10 @@
 // - Multi-word phrases join their tokens with a whitespace run (\s+) so double
 //   spaces / tabs agree with the single-space form (rm family included;
 //   flag-suffix tolerance on rm -rf / rm -fr: rm -rfv / rm -rfi still match).
-// - Destructive operation compounds keep the hyphen-continuation boundary
-//   (?![a-z0-9]) so a hyphen after the verb still fires it (delete-account,
-//   wipe-cache, purge-cache, reset-sessions, hard-reset). The drop family is
-//   excluded: its hyphen compounds (drop-in, drop-off) and space readings
-//   (drop down/in/off/zone) are kept out by the smallest local guard, not a
-//   global boundary flip.
+// - Hyphenated compounds are boundaries unless an explicit destructive
+//   compound label is listed (delete-account, purge-cache, reset-sessions,
+//   hard-reset). The drop family keeps its local guards for space readings
+//   (drop down/in/off/zone) and measurement context.
 // - Ambiguous terms carry a guard: a guarded phrase only counts when its guard
 //   confirms the local reading (billing subscription with technical
 //   realtime/event-stream/websocket suppression, write-mutating third-party /
@@ -39,19 +37,21 @@ const CAPTAIN_REASONS = Object.freeze({
   DESTRUCTIVE_OPERATION: Object.freeze([
     'irreversible', 'rm -rf', 'rm -fr', 'rm -r',
     'delete', 'deleted', 'deleting', 'deletes', 'deletion',
+    'delete-account',
     'drop', 'drops', 'dropped', 'dropping',
+    'drop-table', 'drop-column', 'drop-database', 'drop-schema', 'drop-index',
     'truncate', 'truncated', 'truncating', 'truncates',
-    'purge', 'purges', 'purged', 'purging',
-    'wipe', 'wipes', 'wiped', 'wiping',
+    'purge', 'purges', 'purged', 'purging', 'purge-cache',
+    'wipe', 'wipes', 'wiped', 'wiping', 'wipe-cache',
     'erase', 'erases', 'erased', 'erasing',
     'overwrite', 'overwrites', 'overwrote', 'overwriting', 'overwritten',
-    'unlink', 'unlinks', 'unlinked', 'reset',
+    'unlink', 'unlinks', 'unlinked', 'reset', 'reset-sessions', 'hard-reset',
   ]),
   EXTERNAL_MUTATION: Object.freeze([
     'external write', 'external writes', 'external mutation',
     'external mutations', 'external api', 'external apis',
     'publish', 'publishes', 'published', 'publishing',
-    'third-party', 'webhook', 'webhooks', 'outbound',
+    'third-party', 'third party', 'webhook', 'webhooks', 'outbound',
   ]),
   PERSISTENT_DATA_MIGRATION: Object.freeze([
     'migration', 'migrations', 'migrate', 'migrates', 'migrated',
@@ -85,8 +85,17 @@ class GovernancePolicyError extends Error {
   }
 }
 
-function isPlainObject(value) {
+function isObjectLike(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+function isTopLevelTask(value) {
+  if (!isObjectLike(value)) return false;
+  try {
+    const prototype = Object.getPrototypeOf(value);
+    return prototype === Object.prototype || prototype === null;
+  } catch {
+    return false;
+  }
 }
 
 function normalize(value) {
@@ -107,20 +116,6 @@ const SEP_OVERRIDES = new Map([
   ['rm -fr', 'rm\\s+-fr[iv]?'],
   ['rm -r', 'rm\\s+-r'],
 ]);
-// Destructive operation compounds that must fire through a hyphen
-// continuation (delete-account, wipe-cache, hard-reset, ...). The drop
-// family is excluded: its compounds are UI / procedural readings handled by
-// the local drop guard, so drop keeps the plain hyphen-as-boundary form.
-const DESTRUCTIVE_VERBS = new Set([
-  'delete', 'deleted', 'deleting', 'deletes', 'deletion',
-  'truncate', 'truncated', 'truncating', 'truncates',
-  'purge', 'purges', 'purged', 'purging',
-  'wipe', 'wipes', 'wiped', 'wiping',
-  'erase', 'erases', 'erased', 'erasing',
-  'overwrite', 'overwrites', 'overwrote', 'overwriting', 'overwritten',
-  'unlink', 'unlinks', 'unlinked', 'reset',
-]);
-
 function sourceOf(label) {
   const override = SEP_OVERRIDES.get(label);
   if (override) return override;
@@ -128,12 +123,10 @@ function sourceOf(label) {
 }
 
 function phraseRegExp(label) {
-  const source = sourceOf(label);
-  // Destructive verbs: a hyphen is a word continuation, so it still fires.
-  // Everything else: a hyphen is a compound boundary, so it does not fire.
-  const lead = DESTRUCTIVE_VERBS.has(label) ? '(?<![a-z0-9])' : '(?<![a-z0-9-])';
-  const trail = DESTRUCTIVE_VERBS.has(label) ? '(?![a-z0-9])' : '(?![a-z0-9-])';
-  return new RegExp(`${lead}(${source})${trail}`, 'g');
+  // A hyphen is a boundary unless it is part of the explicitly listed
+  // compound label itself. This keeps delete-key / reset-to-form ordinary
+  // compounds out while retaining delete-account / hard-reset coverage.
+  return new RegExp(`(?<![a-z0-9-])(${sourceOf(label)})(?![a-z0-9-])`, 'g');
 }
 
 // --- local context guards --------------------------------------------------
@@ -142,6 +135,16 @@ function phraseRegExp(label) {
 // lets "write, via a third-party API" and "paid, subscription" resolve.
 function tokens(text) {
   return text.split(/[^a-z0-9]+/).filter(Boolean);
+}
+function tokenRecords(text) {
+  const result = [];
+  const re = /[a-z0-9]+/g;
+  let match = re.exec(text);
+  while (match !== null) {
+    result.push({ word: match[0], start: match.index, end: match.index + match[0].length });
+    match = re.exec(text);
+  }
+  return result;
 }
 function wordsBefore(text, index, n) {
   return tokens(text.slice(0, index)).slice(-n);
@@ -156,6 +159,10 @@ function wordsAfter(text, index, label, span, n) {
 function nextWord(text, index, label, span) {
   return wordsAfter(text, index, label, span, 1)[0] ?? null;
 }
+function hasHardBoundary(text, start, end, includeComma = false) {
+  const separators = includeComma ? /[,.!?;()[\]{}]/ : /[.!?;()[\]{}]/;
+  return separators.test(text.slice(Math.min(start, end), Math.max(start, end)));
+}
 function clauseHas(text, set) {
   return tokens(text).some((w) => set.has(w));
 }
@@ -168,6 +175,16 @@ const DROPS_CONTEXT = new Set([
   'price', 'prices', 'frame', 'frames', 'fps', 'rate', 'rates',
   'temperature', 'temperatures',
 ]);
+const DROP_MEASURE_NOUNS = new Set([
+  'packet', 'packets', 'frame', 'frames', 'fps', 'rate', 'rates',
+  'price', 'prices', 'temperature', 'temperatures',
+]);
+const DROP_METRIC_CONTINUATIONS = new Set([
+  'under', 'during', 'while', 'in', 'by', 'from', 'at', 'over', 'per',
+  'below', 'above', 'occur', 'occurs', 'occurred', 'continue', 'continues',
+  'continued', 'gracefully', 'sharply', 'suddenly', 'significantly',
+  'intermittently', 'overnight', 'unexpectedly',
+]);
 
 // UI elements for the reset guard. "file" / "files" are destructive targets,
 // not UI elements; "css" still covers the reset.css reading.
@@ -176,30 +193,33 @@ const UI_ELEMENTS = new Set([
   'bar', 'menu', 'panel', 'tab', 'tabs', 'link', 'links', 'toggle',
   'switch', 'css',
 ]);
-const ARTICLES = new Set(['a', 'an', 'the', 'this', 'that', 'these', 'those']);
+const ARTICLES = new Set([
+  'a', 'an', 'the', 'this', 'that', 'these', 'those',
+  'my', 'our', 'your', 'its', 'his', 'her', 'all', 'any', 'each', 'every',
+]);
 const DROP_FOLLOWERS = new Set(['down', 'in', 'off', 'zone']);
 const DOC_NOUNS = new Set([
   'guide', 'guides', 'doc', 'docs', 'documentation', 'book', 'books',
   'note', 'notes', 'page', 'pages', 'article', 'articles', 'readme',
-  'manual', 'manuals',
+  'manual', 'manuals', 'nav', 'navigation', 'changelog',
 ]);
 // Outbound-mutation verb family: the write/mutation/publish/export families
 // plus send / upload / push / sync / transmit / forward / stream / emit.
 // Used as the local context that turns "third-party" or "external api(s)"
 // into an EXTERNAL_MUTATION reading.
 const WRITE_CONTEXT = new Set([
-  'write', 'writes', 'writing',
+  'write', 'writes', 'writing', 'written',
   'mutation', 'mutations', 'mutate', 'mutates',
   'webhook', 'webhooks', 'outbound',
   'publish', 'publishes', 'published', 'publishing',
-  'export', 'exports', 'post', 'posts',
-  'send', 'sends', 'sending',
+  'export', 'exports', 'post', 'posts', 'posted', 'posting',
+  'send', 'sends', 'sending', 'sent',
   'upload', 'uploads', 'uploaded', 'uploading',
   'push', 'pushes', 'pushed', 'pushing',
-  'sync', 'syncs', 'synced', 'syncing',
+  'sync', 'syncs', 'synced', 'syncing', 'synchronizing',
   'transmit', 'transmits', 'transmitted', 'transmitting',
   'forward', 'forwards', 'forwarded', 'forwarding',
-  'stream', 'streams', 'streaming',
+  'stream', 'streams', 'streamed', 'streaming',
   'emit', 'emits', 'emitted', 'emitting',
 ]);
 // Principled read-vs-write distinction: a WRITE_CONTEXT word is a noun
@@ -212,7 +232,20 @@ const READ_VERBS = new Set([
 ]);
 const DETERMINERS = new Set([
   'a', 'an', 'the', 'this', 'that', 'these', 'those',
-  'my', 'our', 'your', 'its', 'his', 'her',
+  'my', 'our', 'your', 'its', 'his', 'her', 'all', 'any', 'each', 'every',
+]);
+const CLAUSE_WORDS = new Set(['and', 'or', 'but', 'then', 'while', 'although']);
+const PREPOSITIONS = new Set([
+  'to', 'via', 'through', 'using', 'over', 'into', 'onto', 'against', 'from',
+]);
+const LOCAL_TARGET_WORDS = new Set([
+  'local', 'localhost', 'cache', 'caches', 'filesystem', 'file', 'files',
+  'disk', 'buffer', 'buffers', 'queue', 'queues', 'memory', 'temporary', 'temp',
+]);
+const PUBLISH_TARGETS = new Set([
+  'artifact', 'artifacts', 'package', 'packages', 'release', 'releases',
+  'version', 'versions', 'registry', 'npm', 'repository', 'repositories',
+  'bundle', 'bundles', 'image', 'images', 'feed', 'feeds',
 ]);
 const BILLING_CONTEXT = new Set([
   'paid', 'customer', 'charge', 'charges', 'renew', 'renewal', 'renewals',
@@ -222,135 +255,199 @@ const BILLING_CONTEXT = new Set([
 // Technical subscription context that suppresses the billing reading:
 // realtime / event-stream / websocket plumbing, not money.
 const TECHNICAL_SUBSCRIPTION = new Set([
-  'realtime', 'websocket', 'event', 'stream',
+  'realtime', 'websocket', 'stream', 'streams', 'streaming', 'sse',
 ]);
 const SECURITY_QUALIFIERS = new Set([
   'hmac', 'request', 'requests', 'cryptographic', 'crypto', 'crypt',
-  'signing', 'sign', 'verify', 'verifies',
+  'signing', 'sign', 'signed', 'verify', 'verifies', 'verified', 'verification',
+  'certificate', 'certificates', 'tls',
 ]);
 const ROTATE_WORDS = new Set([
   'rotate', 'rotates', 'rotated', 'rotating', 'rotation',
 ]);
-const SPECIFIC_TOKEN_PHRASES = [
-  'bearer token', 'refresh token', 'access token', 'oauth token',
-  'private key', 'private keys',
-];
 const BILLING_TRIGGER = new Set([
   'bill', 'billing', 'charge', 'charges', 'charged', 'charging', 'fee',
   'fees', 'paid', 'invoice', 'invoiced', 'invoicing', 'invoices',
   'refund', 'refunds', 'chargeback', 'chargebacks',
 ]);
 
-// Smallest-window write context around a third-party / external api(s)
-// phrase: the phrase governs only when an outbound-mutation verb family
-// word sits close to it (and is not a noun reading). Reads/calls/fetches
-// of posts stay ungoverned; the comma-evasion positive ("write, via a
-// third-party API, ...") is preserved.
+// An external/third-party API phrase governs only when a nearby outbound
+// action is syntactically related to it. The relation is deliberately local:
+// clause conjunctions and parenthetical boundaries stop it from becoming a
+// whole-field co-occurrence test.
+const AMBIGUOUS_WRITE_NOUNS = new Set([
+  'write', 'writes', 'post', 'posts', 'export', 'exports',
+]);
 function hasWriteContext(text, index, label, span) {
-  const window = [...wordsBefore(text, index, 5), ...wordsAfter(text, index, label, span, 5)];
-  for (let i = 0; i < window.length; i++) {
-    if (!WRITE_CONTEXT.has(window[i])) continue;
-    const prev = i > 0 ? window[i - 1] : null;
-    if (prev !== null && (DETERMINERS.has(prev) || READ_VERBS.has(prev))) continue;
+  const records = tokenRecords(text);
+  const before = records.filter((record) => record.end <= index);
+  const after = records.filter((record) => record.start >= index + span);
+  const nearbyBefore = before.slice(-8);
+  const nearbyAfter = after.slice(0, 8);
+  const nearby = [...nearbyBefore, ...nearbyAfter];
+  const isThirdParty = label === 'third-party' || label === 'third party';
+
+  // A bare third-party vendor/local reference is not enough. The API phrase
+  // must be present in the same local window; webhook has its own matcher.
+  if (isThirdParty && !nearby.some(({ word }) => word === 'api' || word === 'apis')) {
+    return false;
+  }
+  if (isThirdParty && nearbyAfter.slice(0, 4).some(({ word }) => LOCAL_TARGET_WORDS.has(word))) {
+    return false;
+  }
+
+  for (const action of nearby) {
+    if (!WRITE_CONTEXT.has(action.word)) continue;
+    const actionIndex = records.indexOf(action);
+    const actionBefore = records[actionIndex - 1]?.word ?? null;
+    const actionAfter = records[actionIndex + 1]?.word ?? null;
+    if (DETERMINERS.has(actionBefore) || READ_VERBS.has(actionBefore)) continue;
+    if (action.word === 'publishing' && !PUBLISH_TARGETS.has(actionAfter)) continue;
+    if (AMBIGUOUS_WRITE_NOUNS.has(action.word)
+      && nearbyBefore.some(({ word }) => READ_VERBS.has(word))) continue;
+
+    if (action.end <= index) {
+      const between = records.filter((record) => record.start >= action.end && record.end <= index);
+      if (between.some(({ word }) => CLAUSE_WORDS.has(word))) continue;
+      if (hasHardBoundary(text, action.end, index)) continue;
+      const prepositionIndex = between.findIndex(({ word }) => PREPOSITIONS.has(word));
+      if (prepositionIndex !== -1
+        && between.slice(prepositionIndex + 1).some(({ word }) => LOCAL_TARGET_WORDS.has(word))) {
+        continue;
+      }
+      return true;
+    }
+
+    if (action.start >= index + span) {
+      const between = records.filter((record) => record.start >= index + span && record.end <= action.start);
+      if (between.some(({ word }) => CLAUSE_WORDS.has(word))) continue;
+      if (hasHardBoundary(text, index + span, action.start)) continue;
+      const following = records.slice(actionIndex + 1, actionIndex + 5);
+      const prepositionIndex = following.findIndex(({ word }) => PREPOSITIONS.has(word));
+      if (prepositionIndex !== -1
+        && following.slice(prepositionIndex + 1).some(({ word }) => LOCAL_TARGET_WORDS.has(word))) {
+        continue;
+      }
+      if (following.slice(0, 2).some(({ word }) => LOCAL_TARGET_WORDS.has(word))) continue;
+      return true;
+    }
+  }
+  return false;
+}
+
+// A bare token is material only when a rotate-family word is before the same
+// token occurrence. This handles adjectives while rejecting reverse-order and
+// cross-clause prose such as "Count tokens and rotate the dashboard".
+function rotateTokenGuard(text, index, label, span) {
+  const records = tokenRecords(text);
+  const tokenIndex = records.findIndex((record) => record.start === index);
+  if (tokenIndex === -1) return false;
+  const previous = records.slice(Math.max(0, tokenIndex - 7), tokenIndex);
+  const rotateIndex = previous.findIndex(({ word }) => ROTATE_WORDS.has(word));
+  if (rotateIndex === -1) return false;
+  const rotate = previous[rotateIndex];
+  const between = previous.slice(rotateIndex + 1);
+  if (between.some(({ word }) => CLAUSE_WORDS.has(word))) return false;
+  if (hasHardBoundary(text, rotate.end, index)) return false;
+  const prior = records[tokenIndex - 1]?.word ?? null;
+  return !['bearer', 'refresh', 'access', 'oauth'].includes(prior);
+}
+
+function dropGuard(text, index, label, span) {
+  const after = wordsAfter(text, index, label, span, 4);
+  const next = after.find((word) => !DETERMINERS.has(word)) ?? null;
+  if (next !== null && DROP_FOLLOWERS.has(next)) return false;
+  const before = wordsBefore(text, index, 3);
+  if (before.slice(-2).join(' ') === 'drag and') return false;
+  // A metric noun is the object/subject of a loss measurement, not a
+  // destructive target. Context after a non-metric object is intentionally
+  // ignored: "drops events from the frame queue" must still govern.
+  if (next !== null && DROP_MEASURE_NOUNS.has(next)) return false;
+  if ((next === null || DROP_METRIC_CONTINUATIONS.has(next))
+    && before.some((word) => DROPS_CONTEXT.has(word))) {
+    return false;
+  }
+  return true;
+}
+
+function hasLocalQualifier(text, index, span, qualifiers) {
+  const records = tokenRecords(text);
+  const before = records.filter((record) => record.end <= index).slice(-5);
+  const after = records.filter((record) => record.start >= index + span).slice(0, 5);
+  for (const candidate of [...before, ...after]) {
+    if (!qualifiers.has(candidate.word)) continue;
+    if (hasHardBoundary(text, candidate.end, index, true)
+      || hasHardBoundary(text, index + span, candidate.start, true)) continue;
+    const between = records.filter((record) => (
+      candidate.end <= record.start && record.end <= index
+    ) || (
+      index + span <= record.start && record.end <= candidate.start
+    ));
+    if (between.some(({ word }) => CLAUSE_WORDS.has(word))) continue;
     return true;
   }
   return false;
 }
 
-// Rotate + token co-occurrence, local window: a rotate-family word within
-// 3 words of the token occurrence. Cross-clause "rotate ... and ...
-// tokens" prose does not fire; specific token phrases take precedence.
-function rotateTokenGuard(text, index, label, span) {
-  if (SPECIFIC_TOKEN_PHRASES.some((p) => text.includes(p))) return false;
-  const around = [...wordsBefore(text, index, 3), ...wordsAfter(text, index, label, span, 3)];
-  return around.some((w) => ROTATE_WORDS.has(w));
+function subscriptionGuard(text, index, label, span) {
+  const around = [...wordsBefore(text, index, 5), ...wordsAfter(text, index, label, span, 5)];
+  if (around.some((word) => TECHNICAL_SUBSCRIPTION.has(word))) return false;
+  if (around.some((word) => BILLING_CONTEXT.has(word))) return true;
+  const next = nextWord(text, index, label, span);
+  const prev = wordsBefore(text, index, 1)[0] ?? null;
+  return (next !== null && BILLING_TRIGGER.has(next))
+    || (prev !== null && BILLING_TRIGGER.has(prev));
+}
+
+function migrationGuard(text, index, label, span) {
+  const after = wordsAfter(text, index, label, span, 4);
+  let position = 0;
+  while (position < after.length && ARTICLES.has(after[position])) position += 1;
+  return !DOC_NOUNS.has(after[position]);
+}
+
+function publishingGuard(text, index, label, span) {
+  const after = wordsAfter(text, index, label, span, 5);
+  let position = 0;
+  while (position < after.length && DETERMINERS.has(after[position])) position += 1;
+  if (PUBLISH_TARGETS.has(after[position])) return true;
+  if (PREPOSITIONS.has(after[position])) return true;
+  return after.some((word, offset) => PREPOSITIONS.has(word)
+    && after.slice(offset + 1).some((target) => PUBLISH_TARGETS.has(target)));
 }
 
 // ponytail: each guard is the smallest local reading check for one ambiguous
 // term. A guard returns true when the occurrence should count. Guards receive
 // (text, index, label, span) where span is the actual matched span length.
 const GUARDS = new Map([
-  // drop family: only "drag and drop" / "drop down/in/off/zone" are
-  // non-destructive readings; "drop the users table" stays governed.
-  ['drop', (text, index, label, span) => {
-    const next = nextWord(text, index, label, span);
-    if (next !== null && DROP_FOLLOWERS.has(next)) return false;
-    const before = wordsBefore(text, index, 2);
-    if (before.length === 2 && before[0] === 'drag' && before[1] === 'and') return false;
-    return true;
-  }],
-  // network / measure-context drops/dropped/dropping stay ungoverned.
-  ['drops', (text, index, label, span) => {
-    const around = [...wordsBefore(text, index, 4), ...wordsAfter(text, index, label, span, 4)];
-    return !around.some((w) => DROPS_CONTEXT.has(w));
-  }],
-  ['dropped', (text, index, label, span) => {
-    const around = [...wordsBefore(text, index, 4), ...wordsAfter(text, index, label, span, 4)];
-    return !around.some((w) => DROPS_CONTEXT.has(w));
-  }],
-  ['dropping', (text, index, label, span) => {
-    const around = [...wordsBefore(text, index, 4), ...wordsAfter(text, index, label, span, 4)];
-    return !around.some((w) => DROPS_CONTEXT.has(w));
-  }],
-  // "wipe-down" is a teardown procedure, not a destructive wipe.
+  ['drop', dropGuard],
+  ['drops', dropGuard],
+  ['dropped', dropGuard],
+  ['dropping', dropGuard],
   ['wipe', (text, index, label, span) => nextWord(text, index, label, span) !== 'down'],
-  // UI-control resets stay ungoverned; an article between reset and the UI
-  // noun is skipped ("reset the form" / "reset a button"); file targets and
-  // hard/data resets govern.
   ['reset', (text, index, label, span) => {
-    const after = wordsAfter(text, index, label, span, 2);
-    if (UI_ELEMENTS.has(after[0])) return false;
-    if (ARTICLES.has(after[0]) && UI_ELEMENTS.has(after[1])) return false;
-    return true;
+    const after = wordsAfter(text, index, label, span, 4);
+    let position = 0;
+    while (position < after.length && ARTICLES.has(after[position])) position += 1;
+    return !UI_ELEMENTS.has(after[position]);
   }],
-  // third-party / external api(s) govern only with a local write/mutation
-  // operation; verb-not-noun detection keeps read/list/fetch/call of posts
-  // ungoverned.
   ['third-party', hasWriteContext],
+  ['third party', hasWriteContext],
   ['external api', hasWriteContext],
   ['external apis', hasWriteContext],
-  // signatures govern only with a security qualifier.
-  ['signature', (text) => clauseHas(text, SECURITY_QUALIFIERS)],
-  ['signatures', (text) => clauseHas(text, SECURITY_QUALIFIERS)],
-  // subscription governs with billing context adjacency; technical
-  // realtime / event-stream / websocket context suppresses the reading.
-  ['subscription', (text, index, label, span) => {
-    const around = [...wordsBefore(text, index, 4), ...wordsAfter(text, index, label, span, 4)];
-    if (around.some((w) => TECHNICAL_SUBSCRIPTION.has(w))) return false;
-    if (around.some((w) => BILLING_CONTEXT.has(w))) return true;
-    const next = wordsAfter(text, index, label, span, 1)[0] ?? null;
-    const prev = wordsBefore(text, index, 1)[0] ?? null;
-    return (next !== null && BILLING_TRIGGER.has(next))
-      || (prev !== null && BILLING_TRIGGER.has(prev));
-  }],
-  // migration family governs unless it names documentation.
-  ['migration', (text, index, label, span) => {
-    const next = nextWord(text, index, label, span);
-    return next === null || !DOC_NOUNS.has(next);
-  }],
-  ['migrations', (text, index, label, span) => {
-    const next = nextWord(text, index, label, span);
-    return next === null || !DOC_NOUNS.has(next);
-  }],
-  ['schema migration', (text, index, label, span) => {
-    const next = nextWord(text, index, label, span);
-    return next === null || !DOC_NOUNS.has(next);
-  }],
-  ['schema migrations', (text, index, label, span) => {
-    const next = nextWord(text, index, label, span);
-    return next === null || !DOC_NOUNS.has(next);
-  }],
-  ['data migration', (text, index, label, span) => {
-    const next = nextWord(text, index, label, span);
-    return next === null || !DOC_NOUNS.has(next);
-  }],
-  ['data migrations', (text, index, label, span) => {
-    const next = nextWord(text, index, label, span);
-    return next === null || !DOC_NOUNS.has(next);
-  }],
-  // bare token/tokens govern only on local rotate co-occurrence and only
-  // when no more-specific token phrase is present; prompt token counting
-  // stays out.
+  ['signature', (text, index, label, span) => hasLocalQualifier(text, index, span, SECURITY_QUALIFIERS)],
+  ['signatures', (text, index, label, span) => hasLocalQualifier(text, index, span, SECURITY_QUALIFIERS)],
+  ['subscription', subscriptionGuard],
+  ['migration', migrationGuard],
+  ['migrations', migrationGuard],
+  ['migrate', migrationGuard],
+  ['migrates', migrationGuard],
+  ['migrated', migrationGuard],
+  ['schema migration', migrationGuard],
+  ['schema migrations', migrationGuard],
+  ['data migration', migrationGuard],
+  ['data migrations', migrationGuard],
+  ['publishing', publishingGuard],
   ['token', rotateTokenGuard],
   ['tokens', rotateTokenGuard],
 ]);
@@ -365,7 +462,7 @@ function specificationStrings(node, out, onStack) {
     if (node.trim() !== '') out.push(node);
     return;
   }
-  if (!isPlainObject(node) && !Array.isArray(node)) return;
+  if (!isObjectLike(node) && !Array.isArray(node)) return;
   // Fail closed on a cyclic specification: an object already on the active
   // recursion stack means the input is not a DAG; throw the typed error at
   // the validation boundary rather than crash with a raw RangeError.
@@ -418,7 +515,7 @@ function selectMatch(text, category) {
 }
 
 export function resolveGovernancePolicy(task) {
-  if (!isPlainObject(task) || typeof task.id !== 'string' || task.id === '') {
+  if (!isTopLevelTask(task) || typeof task.id !== 'string' || task.id === '') {
     throw new GovernancePolicyError('INVALID_TASK');
   }
 
@@ -429,7 +526,7 @@ export function resolveGovernancePolicy(task) {
 
   // Absent mode (undefined) defaults to 'auto'; any present non-member value
   // (null, 5, false, 'sometimes', ...) fails closed with the raw value.
-  const rawMode = isPlainObject(task.metadata) && isPlainObject(task.metadata.governance)
+  const rawMode = isObjectLike(task.metadata) && isObjectLike(task.metadata.governance)
     ? task.metadata.governance.mode
     : undefined;
   const mode = rawMode === undefined ? 'auto' : rawMode;
