@@ -33,9 +33,7 @@ const REVIEWER_TOKENS = new Set(['review', 'reviewer']);
 const WORKER_TOKENS = new Set(['test', 'implementation', 'repair', 'worker']);
 
 /**
- * @param {object} deps
- * @param {any} deps.agentTeamsLifecycle optional lifecycle service exposing `subscribe` and `getTeam`
- * @param {any} deps.changeControl Change Control facade
+ * @param {{ agentTeamsLifecycle?: any, changeControl?: any }} [deps]
  * @returns {{ dispose: () => void }} adapter
  */
 export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } = {}) {
@@ -114,6 +112,7 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
         const existing = await Promise.resolve(cc.getBinding(change.id, event.sessionId));
         if (existing) {
           if (existing.role !== role) {
+            /** @type {Error & { code?: string }} */
             const err = new Error(
               `role-conflict: session ${event.sessionId} already bound as ${existing.role}; expected ${role}`,
             );
@@ -125,6 +124,7 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
         }
       }
 
+      /** @type {{ worker?: string }} */
       const options = {};
       if (typeof event.attemptId === 'string' && event.attemptId !== '') {
         options.worker = event.attemptId;
@@ -159,6 +159,7 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
         const existing = await Promise.resolve(cc.getBinding(change.id, event.sessionId));
         if (existing) {
           if (existing.role !== role) {
+            /** @type {Error & { code?: string }} */
             const err = new Error(
               `release-role-conflict: session ${event.sessionId} bound as ${existing.role}; release event maps to ${role}`,
             );
@@ -193,6 +194,7 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
       if (change && typeof change.id === 'string' && typeof cc.getBinding === 'function') {
         const existing = await Promise.resolve(cc.getBinding(change.id, event.sessionId));
         if (existing && existing.role !== role) {
+          /** @type {Error & { code?: string }} */
           const err = new Error(
             `release-role-conflict: session ${event.sessionId} bound as ${existing.role}; release event maps to ${role}`,
           );
@@ -218,8 +220,9 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
    * @returns {boolean}
    */
   function isExpectedNoBindingError(error) {
-    if (!error) return false;
-    if (error.code === 'NOT_FOUND' || error.code === 'NO_BINDING') return true;
+    if (!(error instanceof Error)) return false;
+    const e = /** @type {Error & { code?: string }} */ (error);
+    if (e.code === 'NOT_FOUND' || e.code === 'NO_BINDING') return true;
     return false;
   }
 
@@ -271,7 +274,7 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
   }
 
   if (lifecycle && typeof lifecycle.subscribe === 'function') {
-    unsubscribe = lifecycle.subscribe((event) => handleEvent(event));
+    unsubscribe = lifecycle.subscribe((/** @type {any} */ event) => handleEvent(event));
   }
 
   return { dispose };
