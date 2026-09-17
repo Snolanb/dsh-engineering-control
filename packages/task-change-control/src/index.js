@@ -1,8 +1,10 @@
 import { createTaskChangeControlService, WORK_ITEM_SYSTEM } from './service.js';
 import { createIntegrationTools } from './tools.js';
 import { createLifecycleBootstrapper } from './lifecycle-bootstrap.js';
+import { createAgentTeamsAdapter } from './agent-teams-adapter.js';
 
 export { WORK_ITEM_SYSTEM };
+export { createAgentTeamsAdapter };
 
 /**
  * T9.1 — mandatory-governance task-context provider.
@@ -345,6 +347,19 @@ export default {
       });
       const dispose = controller.start();
       return () => { if (typeof dispose === 'function') dispose(); };
+    });
+
+    // G3 — optional AgentTeams lifecycle adapter: bridges public AgentTeams
+    // session/task events into Change Control role bindings and append-only
+    // audit evidence. Parked behind the same injection boundary as G2;
+    // service absence never blocks plugin startup, and reactivation creates
+    // one fresh adapter per activation.
+    await ctx.inject(['agentTeamsLifecycle', 'changeControl'], (c) => {
+      const lifecycle = c.get('agentTeamsLifecycle');
+      const cc = c.get('changeControl');
+      if (!lifecycle || !cc) return () => {};
+      const adapter = createAgentTeamsAdapter({ agentTeamsLifecycle: lifecycle, changeControl: cc });
+      return () => { adapter.dispose(); };
     });
   },
 };
