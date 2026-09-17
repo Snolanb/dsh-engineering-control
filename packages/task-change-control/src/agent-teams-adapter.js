@@ -133,8 +133,9 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
    * pass. While the guard is held, queueRelease re-inserts entries and
    * returns a deferred Promise; the owner's loop re-reads the array and
    * settles the deferred before the finally-block drain can re-enter.
-   * Unexpected failures are preserved per entry; the outer drain throws the
-   * first unexpected error after all entries have been handled.
+   * Each entry's error is delivered to its own deferred via entry.reject;
+   * the drain itself never rethrows, so a successful outer operation is
+   * never overwritten by a queued-entry failure.
    * @param {string} sessionId
    */
   /**
@@ -145,8 +146,6 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
     if (draining.get(sessionId)) return; // recursive re-entry — already owned
     draining.set(sessionId, true);
     try {
-      let firstError;
-      let hasError = false;
       for (;;) {
         // C3-R4-F4: if dispose ran before this iteration dispatches, settle
         // all remaining deferreds as teardown no-ops and stop dispatching.
@@ -180,15 +179,14 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
           // Promise rejects with its own operation's failure.
           entry.reject?.(err);
           if (entry.settle) pendingDeferreds.delete(entry.settle);
-          // Remember the outer drain's first unexpected error; queued entry
-          // errors are already delivered through their own deferreds.
-          if (!hasError) {
-            firstError = err;
-            hasError = true;
-          }
         }
       }
-      if (hasError) throw firstError;
+      // C3-R5-F1: do NOT rethrow firstError here. Each queued entry's
+      // deferred is already settled via entry.reject(err); rethrowing to
+      // the outer caller would overwrite a successful outer operation with
+      // a queued-entry error, or leak a drain error into a failed outer
+      // operation's finally (suppressed by the operationFailed guard, but
+      // not needed at all).
     } finally {
       draining.delete(sessionId);
     }
@@ -250,6 +248,7 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
     const role = mapRole(event);
     if (!role) return;
     if (!acquire(event.sessionId)) return;
+    let operationFailed = false;
     try {
       const change = await findChangeForEvent(event);
       if (disposed) return;
@@ -306,11 +305,23 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
       }
       if (disposed) return;
       sessionState.set(event.sessionId, 'active');
+    } catch (err) {
+      operationFailed = true;
+      throw err;
     } finally {
       releaseLock(event.sessionId);
       // F1: drain any settled/removed events that were queued while this
       // started was in flight, so a pending release is never dropped.
-      if (!disposed) await drainReleases(event.sessionId);
+      // C3-R5-F1: if the operation itself failed, suppress the drain error
+      // so the original error is not overwritten; queued entries already
+      // settled their own deferreds via entry.reject.
+      if (!disposed) {
+        try {
+          await drainReleases(event.sessionId);
+        } catch (drainErr) {
+          if (!operationFailed) throw drainErr;
+        }
+      }
     }
   }
 
@@ -335,6 +346,7 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
       const role = mapRole(event);
       if (role === null) return;
       if (!acquire(event.sessionId)) return;
+      let operationFailed = false;
       try {
         if (!(typeof cc?.getBinding === 'function')) return;
         const change = await findChangeForEvent(event);
@@ -365,9 +377,19 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
         }
         if (disposed) return;
         sessionState.set(event.sessionId, 'released');
+      } catch (err) {
+        operationFailed = true;
+        throw err;
       } finally {
         releaseLock(event.sessionId);
-        if (!disposed) await drainReleases(event.sessionId);
+        // C3-R5-F1: suppress drain error when the operation itself failed.
+        if (!disposed) {
+          try {
+            await drainReleases(event.sessionId);
+          } catch (drainErr) {
+            if (!operationFailed) throw drainErr;
+          }
+        }
       }
       return;
     }
@@ -377,6 +399,7 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
     const role = mapRole(event);
     if (role === null) return;
     if (!acquire(event.sessionId)) return;
+    let operationFailed = false;
     try {
       const change = await findChangeForEvent(event);
       if (disposed) return;
@@ -404,9 +427,19 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
       }
       if (disposed) return;
       sessionState.set(event.sessionId, 'released');
+    } catch (err) {
+      operationFailed = true;
+      throw err;
     } finally {
       releaseLock(event.sessionId);
-      if (!disposed) await drainReleases(event.sessionId);
+      // C3-R5-F1: suppress drain error when the operation itself failed.
+      if (!disposed) {
+        try {
+          await drainReleases(event.sessionId);
+        } catch (drainErr) {
+          if (!operationFailed) throw drainErr;
+        }
+      }
     }
   }
 
