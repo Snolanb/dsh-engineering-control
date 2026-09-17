@@ -134,8 +134,12 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
    * returns a deferred Promise; the owner's loop re-reads the array and
    * settles the deferred before the finally-block drain can re-enter.
    * Each entry's error is delivered to its own deferred via entry.reject;
-   * the drain itself never rethrows, so a successful outer operation is
-   * never overwritten by a queued-entry failure.
+   * the drain also rethrows the first unexpected error after all entries
+   * have been handled. Outer finally blocks wrap drainReleases in a
+   * try/catch gated on their own operationFailed flag: when the outer
+   * operation failed, the drain error is suppressed so the original outer
+   * error propagates first; when it succeeded, the first queued error
+   * rejects the outer lifecycle Promise.
    * @param {string} sessionId
    */
   /**
@@ -146,6 +150,8 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
     if (draining.get(sessionId)) return; // recursive re-entry — already owned
     draining.set(sessionId, true);
     try {
+      let firstError;
+      let hasError = false;
       for (;;) {
         // C3-R4-F4: if dispose ran before this iteration dispatches, settle
         // all remaining deferreds as teardown no-ops and stop dispatching.
@@ -179,14 +185,18 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
           // Promise rejects with its own operation's failure.
           entry.reject?.(err);
           if (entry.settle) pendingDeferreds.delete(entry.settle);
+          // C3-R6-F1: remember the first unexpected error so the drain can
+          // rethrow it after all entries have been handled. Queued entries
+          // keep their own rejections; the outer finally's operationFailed
+          // guard suppresses this rethrow when the outer operation already
+          // failed with its own error.
+          if (!hasError) {
+            firstError = err;
+            hasError = true;
+          }
         }
       }
-      // C3-R5-F1: do NOT rethrow firstError here. Each queued entry's
-      // deferred is already settled via entry.reject(err); rethrowing to
-      // the outer caller would overwrite a successful outer operation with
-      // a queued-entry error, or leak a drain error into a failed outer
-      // operation's finally (suppressed by the operationFailed guard, but
-      // not needed at all).
+      if (hasError) throw firstError;
     } finally {
       draining.delete(sessionId);
     }
