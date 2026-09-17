@@ -44,9 +44,33 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
   const inFlight = new Map();
   /** @type {Map<string, 'active' | 'released'>} */
   const sessionState = new Map();
+  /** @type {Map<string, Array<{ type: string, event: any }>>} */
+  const pendingReleases = new Map();
   let disposed = false;
   /** @type {(() => void) | undefined} */
   let unsubscribe;
+
+  /**
+   * Drain any queued settled/removed events for a session after a started
+   * operation completes. Each drained event is handled in isolation so a
+   * role conflict on one does not suppress the rest.
+   * @param {string} sessionId
+   */
+  async function drainReleases(sessionId) {
+    /** @type {Array<{ type: string, event: any }> | undefined} */
+    let queue;
+    while ((queue = pendingReleases.get(sessionId)) && queue.length > 0) {
+      pendingReleases.delete(sessionId);
+      for (const entry of queue) {
+        try {
+          await handleSessionReleased(entry.event);
+        } catch {
+          /* one failed release must not suppress the rest */
+        }
+      }
+      if (pendingReleases.has(sessionId)) break;
+    }
+  }
 
   /**
    * Map generic taskKind/role metadata to a Change Control role using exact
@@ -99,17 +123,19 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
    * @param {any} event
    */
   async function handleSessionStarted(event) {
-    if (typeof event.sessionId !== 'string') return;
+    if (typeof event.sessionId !== 'string' || event.sessionId === '') return;
     if (sessionState.has(event.sessionId)) return;
     const role = mapRole(event);
     if (!role) return;
     if (!acquire(event.sessionId)) return;
     try {
       const change = await findChangeForEvent(event);
+      if (disposed) return;
       if (!change || typeof change.id !== 'string') return;
 
       if (typeof cc.getBinding === 'function') {
         const existing = await Promise.resolve(cc.getBinding(change.id, event.sessionId));
+        if (disposed) return;
         if (existing) {
           if (existing.role !== role) {
             /** @type {Error & { code?: string }} */
@@ -130,11 +156,39 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
         options.worker = event.attemptId;
       }
       if (typeof cc.bindRole === 'function') {
-        await Promise.resolve(cc.bindRole(change.id, event.sessionId, role, options));
+        try {
+          await Promise.resolve(cc.bindRole(change.id, event.sessionId, role, options));
+        } catch (err) {
+          // F2: duplicate-bind race — two instances/restart both saw null,
+          // both called bindRole; the second gets ALREADY_BOUND/DUPLICATE.
+          // Re-read getBinding and accept only a matching role.
+          const code = /** @type {Error & { code?: string }} */ (err).code;
+          if (code === 'ALREADY_BOUND' || code === 'DUPLICATE') {
+            if (disposed) return;
+            const re = await Promise.resolve(cc.getBinding(change.id, event.sessionId));
+            if (disposed) return;
+            if (re && re.role === role) {
+              sessionState.set(event.sessionId, 'active');
+            } else if (re) {
+              /** @type {Error & { code?: string }} */
+              const rc = new Error(
+                `role-conflict: session ${event.sessionId} re-bound as ${re.role}; expected ${role}`,
+              );
+              rc.code = 'ROLE_CONFLICT';
+              throw rc;
+            }
+            return;
+          }
+          throw err;
+        }
       }
+      if (disposed) return;
       sessionState.set(event.sessionId, 'active');
     } finally {
       releaseLock(event.sessionId);
+      // F1: drain any settled/removed events that were queued while this
+      // started was in flight, so a pending release is never dropped.
+      if (!disposed) await drainReleases(event.sessionId);
     }
   }
 
@@ -142,9 +196,20 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
    * @param {any} event
    */
   async function handleSessionReleased(event) {
-    if (typeof event.sessionId !== 'string') return;
+    if (typeof event.sessionId !== 'string' || event.sessionId === '') return;
     const state = sessionState.get(event.sessionId);
     if (state === 'released') return;
+    // F1: a started is in flight — queue this release so it drains after
+    // the started completes, instead of being silently dropped.
+    if (inFlight.has(event.sessionId)) {
+      let q = pendingReleases.get(event.sessionId) ?? [];
+      if (!q) {
+        q = [];
+        pendingReleases.set(event.sessionId, q);
+      }
+      q.push({ type: event.type, event });
+      return;
+    }
     if (state === undefined) {
       // No local state: only a binding actually present on Change Control
       // makes this release actionable. Tolerating a missing binding avoids
@@ -155,8 +220,10 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
       try {
         if (!(typeof cc?.getBinding === 'function')) return;
         const change = await findChangeForEvent(event);
+        if (disposed) return;
         if (!change || typeof change.id !== 'string') return;
         const existing = await Promise.resolve(cc.getBinding(change.id, event.sessionId));
+        if (disposed) return;
         if (existing) {
           if (existing.role !== role) {
             /** @type {Error & { code?: string }} */
@@ -171,12 +238,14 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
             await Promise.resolve(cc.unbindRole(change.id, event.sessionId, {}));
           } catch (err) {
             if (isExpectedNoBindingError(err)) {
+              if (disposed) return;
               sessionState.set(event.sessionId, 'released');
             } else {
               throw err;
             }
           }
         }
+        if (disposed) return;
         sessionState.set(event.sessionId, 'released');
       } finally {
         releaseLock(event.sessionId);
@@ -191,8 +260,13 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
     if (!acquire(event.sessionId)) return;
     try {
       const change = await findChangeForEvent(event);
-      if (change && typeof change.id === 'string' && typeof cc.getBinding === 'function') {
+      if (disposed) return;
+      // F6: when Change resolution returns null, leave active state so a
+      // later terminal event can retry; do NOT mark released.
+      if (!change || typeof change.id !== 'string') return;
+      if (typeof cc.getBinding === 'function') {
         const existing = await Promise.resolve(cc.getBinding(change.id, event.sessionId));
+        if (disposed) return;
         if (existing && existing.role !== role) {
           /** @type {Error & { code?: string }} */
           const err = new Error(
@@ -202,13 +276,14 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
           throw err;
         }
       }
-      if (change && typeof change.id === 'string' && typeof cc.unbindRole === 'function') {
+      if (typeof cc.unbindRole === 'function') {
         try {
           await Promise.resolve(cc.unbindRole(change.id, event.sessionId, {}));
         } catch (err) {
           if (!isExpectedNoBindingError(err)) throw err;
         }
       }
+      if (disposed) return;
       sessionState.set(event.sessionId, 'released');
     } finally {
       releaseLock(event.sessionId);
@@ -220,7 +295,8 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
    * @returns {boolean}
    */
   function isExpectedNoBindingError(error) {
-    if (!(error instanceof Error)) return false;
+    // F4: tolerate exact public no-binding codes regardless of Error prototype;
+    // plain objects {code:'NOT_FOUND'}/{code:'NO_BINDING'} must also be accepted.
     const e = /** @type {Error & { code?: string }} */ (error);
     if (e.code === 'NOT_FOUND' || e.code === 'NO_BINDING') return true;
     return false;
@@ -230,7 +306,10 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
    * @param {any} event
    */
   async function handleTaskCompleted(event) {
+    // F3: require non-empty primitive session identifier before any lookup.
+    if (typeof event.sessionId !== 'string' || event.sessionId === '') return;
     const change = await findChangeForEvent(event);
+    if (disposed) return;
     if (!change || typeof change.id !== 'string') return;
     if (typeof cc.appendAudit !== 'function') return;
     await Promise.resolve(cc.appendAudit({
