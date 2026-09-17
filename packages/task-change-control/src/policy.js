@@ -181,9 +181,9 @@ const DROP_MEASURE_NOUNS = new Set([
 ]);
 const DROP_METRIC_CONTINUATIONS = new Set([
   'under', 'during', 'while', 'in', 'by', 'from', 'at', 'over', 'per',
-  'below', 'above', 'occur', 'occurs', 'occurred', 'continue', 'continues',
-  'continued', 'gracefully', 'sharply', 'suddenly', 'significantly',
-  'intermittently', 'overnight', 'unexpectedly',
+  'below', 'above', 'after', 'before', 'occur', 'occurs', 'occurred',
+  'continue', 'continues', 'continued', 'gracefully', 'sharply', 'suddenly',
+  'significantly', 'intermittently', 'overnight', 'unexpectedly',
 ]);
 
 // UI elements for the reset guard. "file" / "files" are destructive targets,
@@ -245,8 +245,10 @@ const LOCAL_TARGET_WORDS = new Set([
 const PUBLISH_TARGETS = new Set([
   'artifact', 'artifacts', 'package', 'packages', 'release', 'releases',
   'version', 'versions', 'registry', 'npm', 'repository', 'repositories',
-  'bundle', 'bundles', 'image', 'images', 'feed', 'feeds',
+  'bundle', 'bundles', 'image', 'images', 'feed', 'feeds', 'docs',
+  'documentation', 'portal', 'site', 'website',
 ]);
+const INTERNAL_PUBLISH_CONTEXT = new Set(['internal', 'local', 'team', 'private']);
 const BILLING_CONTEXT = new Set([
   'paid', 'customer', 'charge', 'charges', 'renew', 'renewal', 'renewals',
   'cancel', 'cancellation', 'cancellations', 'bill', 'billing',
@@ -282,8 +284,8 @@ function hasWriteContext(text, index, label, span) {
   const records = tokenRecords(text);
   const before = records.filter((record) => record.end <= index);
   const after = records.filter((record) => record.start >= index + span);
-  const nearbyBefore = before.slice(-8);
-  const nearbyAfter = after.slice(0, 8);
+  const nearbyBefore = before.slice(-14);
+  const nearbyAfter = after.slice(0, 14);
   const nearby = [...nearbyBefore, ...nearbyAfter];
   const isThirdParty = label === 'third-party' || label === 'third party';
 
@@ -300,9 +302,7 @@ function hasWriteContext(text, index, label, span) {
     if (!WRITE_CONTEXT.has(action.word)) continue;
     const actionIndex = records.indexOf(action);
     const actionBefore = records[actionIndex - 1]?.word ?? null;
-    const actionAfter = records[actionIndex + 1]?.word ?? null;
     if (DETERMINERS.has(actionBefore) || READ_VERBS.has(actionBefore)) continue;
-    if (action.word === 'publishing' && !PUBLISH_TARGETS.has(actionAfter)) continue;
     if (AMBIGUOUS_WRITE_NOUNS.has(action.word)
       && nearbyBefore.some(({ word }) => READ_VERBS.has(word))) continue;
 
@@ -310,6 +310,12 @@ function hasWriteContext(text, index, label, span) {
       const between = records.filter((record) => record.start >= action.end && record.end <= index);
       if (between.some(({ word }) => CLAUSE_WORDS.has(word))) continue;
       if (hasHardBoundary(text, action.end, index)) continue;
+      const relationWords = [...between];
+      while (relationWords.length > 0 && DETERMINERS.has(relationWords.at(-1).word)) {
+        relationWords.pop();
+      }
+      if (relationWords.length > 2
+        && !PREPOSITIONS.has(relationWords.at(-1)?.word)) continue;
       const prepositionIndex = between.findIndex(({ word }) => PREPOSITIONS.has(word));
       if (prepositionIndex !== -1
         && between.slice(prepositionIndex + 1).some(({ word }) => LOCAL_TARGET_WORDS.has(word))) {
@@ -376,6 +382,8 @@ function hasLocalQualifier(text, index, span, qualifiers) {
   const after = records.filter((record) => record.start >= index + span).slice(0, 5);
   for (const candidate of [...before, ...after]) {
     if (!qualifiers.has(candidate.word)) continue;
+    if (candidate.word === 'sign'
+      && (text[candidate.start - 1] === '-' || text[candidate.end] === '-')) continue;
     if (hasHardBoundary(text, candidate.end, index, true)
       || hasHardBoundary(text, index + span, candidate.start, true)) continue;
     const between = records.filter((record) => (
@@ -391,8 +399,10 @@ function hasLocalQualifier(text, index, span, qualifiers) {
 
 function subscriptionGuard(text, index, label, span) {
   const around = [...wordsBefore(text, index, 5), ...wordsAfter(text, index, label, span, 5)];
-  if (around.some((word) => TECHNICAL_SUBSCRIPTION.has(word))) return false;
+  // Billing intent wins over a dual-use technical word such as streaming:
+  // "Cancel the customer streaming subscription" is billing, not transport.
   if (around.some((word) => BILLING_CONTEXT.has(word))) return true;
+  if (around.some((word) => TECHNICAL_SUBSCRIPTION.has(word))) return false;
   const next = nextWord(text, index, label, span);
   const prev = wordsBefore(text, index, 1)[0] ?? null;
   return (next !== null && BILLING_TRIGGER.has(next))
@@ -407,13 +417,36 @@ function migrationGuard(text, index, label, span) {
 }
 
 function publishingGuard(text, index, label, span) {
-  const after = wordsAfter(text, index, label, span, 5);
+  const after = wordsAfter(text, index, label, span, 8);
   let position = 0;
   while (position < after.length && DETERMINERS.has(after[position])) position += 1;
   if (PUBLISH_TARGETS.has(after[position])) return true;
-  if (PREPOSITIONS.has(after[position])) return true;
-  return after.some((word, offset) => PREPOSITIONS.has(word)
-    && after.slice(offset + 1).some((target) => PUBLISH_TARGETS.has(target)));
+  for (let offset = position; offset < after.length; offset += 1) {
+    if (!PREPOSITIONS.has(after[offset])) continue;
+    const destination = after.slice(offset + 1);
+    let destinationPosition = 0;
+    while (destinationPosition < destination.length
+      && DETERMINERS.has(destination[destinationPosition])) destinationPosition += 1;
+    if (INTERNAL_PUBLISH_CONTEXT.has(destination[destinationPosition])) continue;
+    if (destination.slice(destinationPosition).some((target) => PUBLISH_TARGETS.has(target))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function purgeGuard(text, index, label, span) {
+  const after = wordsAfter(text, index, label, span, 4);
+  let position = 0;
+  while (position < after.length && ARTICLES.has(after[position])) position += 1;
+  return !['valve', 'valves'].includes(after[position]);
+}
+
+function deleteGuard(text, index, label, span) {
+  const after = wordsAfter(text, index, label, span, 4);
+  let position = 0;
+  while (position < after.length && ARTICLES.has(after[position])) position += 1;
+  return !['key', 'keys'].includes(after[position]);
 }
 
 // ponytail: each guard is the smallest local reading check for one ambiguous
@@ -428,9 +461,19 @@ const GUARDS = new Map([
   ['reset', (text, index, label, span) => {
     const after = wordsAfter(text, index, label, span, 4);
     let position = 0;
-    while (position < after.length && ARTICLES.has(after[position])) position += 1;
+    while (position < after.length
+      && (ARTICLES.has(after[position]) || after[position] === 'to')) position += 1;
     return !UI_ELEMENTS.has(after[position]);
   }],
+  ['delete', deleteGuard],
+  ['deleted', deleteGuard],
+  ['deleting', deleteGuard],
+  ['deletes', deleteGuard],
+  ['deletion', deleteGuard],
+  ['purge', purgeGuard],
+  ['purges', purgeGuard],
+  ['purged', purgeGuard],
+  ['purging', purgeGuard],
   ['third-party', hasWriteContext],
   ['third party', hasWriteContext],
   ['external api', hasWriteContext],
@@ -447,6 +490,9 @@ const GUARDS = new Map([
   ['schema migrations', migrationGuard],
   ['data migration', migrationGuard],
   ['data migrations', migrationGuard],
+  ['publish', publishingGuard],
+  ['publishes', publishingGuard],
+  ['published', publishingGuard],
   ['publishing', publishingGuard],
   ['token', rotateTokenGuard],
   ['tokens', rotateTokenGuard],
