@@ -91,6 +91,7 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
    */
   async function findChangeForEvent(event) {
     if (!cc || typeof lifecycle?.getTeam !== 'function' || typeof cc.findByWorkItem !== 'function') return null;
+    if (typeof event.teamId !== 'string' || event.teamId === '') return null;
     const team = await Promise.resolve(lifecycle.getTeam(event.teamId));
     if (!team || typeof team.taskId !== 'string') return null;
     return await Promise.resolve(cc.findByWorkItem(WORK_ITEM_SYSTEM, team.taskId));
@@ -182,10 +183,23 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
       return;
     }
 
-    // Local state === 'active'
+    // Local state === 'active': require the accepted release role before
+    // consulting getBinding so unknown/malformed events perform no lookups.
+    const role = mapRole(event);
+    if (role === null) return;
     if (!acquire(event.sessionId)) return;
     try {
       const change = await findChangeForEvent(event);
+      if (change && typeof change.id === 'string' && typeof cc.getBinding === 'function') {
+        const existing = await Promise.resolve(cc.getBinding(change.id, event.sessionId));
+        if (existing && existing.role !== role) {
+          const err = new Error(
+            `release-role-conflict: session ${event.sessionId} bound as ${existing.role}; release event maps to ${role}`,
+          );
+          err.code = 'ROLE_CONFLICT';
+          throw err;
+        }
+      }
       if (change && typeof change.id === 'string' && typeof cc.unbindRole === 'function') {
         try {
           await Promise.resolve(cc.unbindRole(change.id, event.sessionId, {}));
@@ -257,10 +271,7 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
   }
 
   if (lifecycle && typeof lifecycle.subscribe === 'function') {
-    unsubscribe = lifecycle.subscribe((event) => {
-      handleEvent(event);
-      return undefined;
-    });
+    unsubscribe = lifecycle.subscribe((event) => handleEvent(event));
   }
 
   return { dispose };
