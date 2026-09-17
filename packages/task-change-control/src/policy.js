@@ -163,6 +163,14 @@ function hasHardBoundary(text, start, end, includeComma = false) {
   const separators = includeComma ? /[,.!?;()[\]{}]/ : /[.!?;()[\]{}]/;
   return separators.test(text.slice(Math.min(start, end), Math.max(start, end)));
 }
+function localWords(text, index, span, n) {
+  const records = tokenRecords(text);
+  const before = records.filter((record) => record.end <= index).slice(-n)
+    .filter((record) => !hasHardBoundary(text, record.end, index));
+  const after = records.filter((record) => record.start >= index + span).slice(0, n)
+    .filter((record) => !hasHardBoundary(text, index + span, record.start));
+  return [...before, ...after].map(({ word }) => word);
+}
 function clauseHas(text, set) {
   return tokens(text).some((w) => set.has(w));
 }
@@ -190,8 +198,8 @@ const DROP_METRIC_CONTINUATIONS = new Set([
 // not UI elements; "css" still covers the reset.css reading.
 const UI_ELEMENTS = new Set([
   'button', 'buttons', 'form', 'forms', 'field', 'fields', 'box', 'boxes',
-  'bar', 'menu', 'panel', 'tab', 'tabs', 'link', 'links', 'toggle',
-  'switch', 'css',
+  'bar', 'menu', 'panel', 'modal', 'modals', 'tab', 'tabs', 'link', 'links',
+  'toggle', 'switch', 'css',
 ]);
 const ARTICLES = new Set([
   'a', 'an', 'the', 'this', 'that', 'these', 'those',
@@ -253,6 +261,15 @@ const BILLING_CONTEXT = new Set([
   'paid', 'customer', 'charge', 'charges', 'renew', 'renewal', 'renewals',
   'cancel', 'cancellation', 'cancellations', 'bill', 'billing',
   'payment', 'payments', 'refund', 'refunds', 'fee', 'fees',
+]);
+const BILLING_ACTION_CONTEXT = new Set([
+  'paid', 'customer', 'charge', 'charges', 'cancel', 'cancellation',
+  'cancellations', 'bill', 'billing', 'payment', 'payments', 'refund',
+  'refunds', 'fee', 'fees',
+]);
+const KEYBOARD_CONTEXT = new Set([
+  'keyboard', 'keyboards', 'shortcut', 'shortcuts', 'hotkey', 'hotkeys',
+  'handler', 'handlers', 'keydown', 'keyup', 'keypress', 'backspace',
 ]);
 // Technical subscription context that suppresses the billing reading:
 // realtime / event-stream / websocket plumbing, not money.
@@ -398,11 +415,13 @@ function hasLocalQualifier(text, index, span, qualifiers) {
 }
 
 function subscriptionGuard(text, index, label, span) {
-  const around = [...wordsBefore(text, index, 5), ...wordsAfter(text, index, label, span, 5)];
-  // Billing intent wins over a dual-use technical word such as streaming:
-  // "Cancel the customer streaming subscription" is billing, not transport.
+  const around = localWords(text, index, span, 5);
+  // A dual-use technical word keeps renewal/renew ordinary unless a local
+  // billing party or action makes the intent unambiguous.
+  if (around.some((word) => TECHNICAL_SUBSCRIPTION.has(word))) {
+    return around.some((word) => BILLING_ACTION_CONTEXT.has(word));
+  }
   if (around.some((word) => BILLING_CONTEXT.has(word))) return true;
-  if (around.some((word) => TECHNICAL_SUBSCRIPTION.has(word))) return false;
   const next = nextWord(text, index, label, span);
   const prev = wordsBefore(text, index, 1)[0] ?? null;
   return (next !== null && BILLING_TRIGGER.has(next))
@@ -420,6 +439,18 @@ function publishingGuard(text, index, label, span) {
   const after = wordsAfter(text, index, label, span, 8);
   let position = 0;
   while (position < after.length && DETERMINERS.has(after[position])) position += 1;
+  const internalDestination = (start) => {
+    for (let offset = start; offset < after.length; offset += 1) {
+      if (!PREPOSITIONS.has(after[offset])) continue;
+      const destination = after.slice(offset + 1);
+      let destinationPosition = 0;
+      while (destinationPosition < destination.length
+        && DETERMINERS.has(destination[destinationPosition])) destinationPosition += 1;
+      if (INTERNAL_PUBLISH_CONTEXT.has(destination[destinationPosition])) return true;
+    }
+    return false;
+  };
+  if (internalDestination(position)) return false;
   if (PUBLISH_TARGETS.has(after[position])) return true;
   for (let offset = position; offset < after.length; offset += 1) {
     if (!PREPOSITIONS.has(after[offset])) continue;
@@ -427,7 +458,6 @@ function publishingGuard(text, index, label, span) {
     let destinationPosition = 0;
     while (destinationPosition < destination.length
       && DETERMINERS.has(destination[destinationPosition])) destinationPosition += 1;
-    if (INTERNAL_PUBLISH_CONTEXT.has(destination[destinationPosition])) continue;
     if (destination.slice(destinationPosition).some((target) => PUBLISH_TARGETS.has(target))) {
       return true;
     }
@@ -446,7 +476,10 @@ function deleteGuard(text, index, label, span) {
   const after = wordsAfter(text, index, label, span, 4);
   let position = 0;
   while (position < after.length && ARTICLES.has(after[position])) position += 1;
-  return !['key', 'keys'].includes(after[position]);
+  const keyReference = after.slice(position).some((word) => ['key', 'keys'].includes(word));
+  const keyboardReference = after.slice(position).some((word) => KEYBOARD_CONTEXT.has(word));
+  if (!keyReference && !keyboardReference) return true;
+  return !localWords(text, index, span, 6).some((word) => KEYBOARD_CONTEXT.has(word));
 }
 
 // ponytail: each guard is the smallest local reading check for one ambiguous
@@ -459,11 +492,15 @@ const GUARDS = new Map([
   ['dropping', dropGuard],
   ['wipe', (text, index, label, span) => nextWord(text, index, label, span) !== 'down'],
   ['reset', (text, index, label, span) => {
-    const after = wordsAfter(text, index, label, span, 4);
+    const after = wordsAfter(text, index, label, span, 6);
     let position = 0;
     while (position < after.length
       && (ARTICLES.has(after[position]) || after[position] === 'to')) position += 1;
-    return !UI_ELEMENTS.has(after[position]);
+    if (UI_ELEMENTS.has(after[position])) return false;
+    if (['default', 'defaults'].includes(after[position])) {
+      return !localWords(text, index, span, 6).some((word) => UI_ELEMENTS.has(word));
+    }
+    return true;
   }],
   ['delete', deleteGuard],
   ['deleted', deleteGuard],
