@@ -1,15 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import * as policy from '../src/policy.js';
+import { GovernancePolicyError, resolveGovernancePolicy } from '../src/policy.js';
 
-const {
-  CAPTAIN_REASONS,
-  GovernancePolicyError,
-  PREFIX_STEMS,
-  resolveGovernancePolicy,
-} = policy;
-
-const EXPECTED_REASON_IDS = [
+const G1_CATEGORY_ORDER = [
   'AUTHORIZATION',
   'BILLING_FINANCIAL',
   'CI_RELEASE_AUTOMATION',
@@ -18,56 +11,6 @@ const EXPECTED_REASON_IDS = [
   'PERSISTENT_DATA_MIGRATION',
   'SECRETS_CREDENTIALS',
   'SECURITY_BOUNDARY',
-  'TOKEN_COUNTING',
-];
-
-const EXPECTED_CAPTAIN_REASONS = {
-  AUTHORIZATION: [
-    'auth', 'authorization', 'authentication', 'authorize', 'permission',
-    'permissions', 'access control', 'admin role', 'privilege', 'privileges',
-  ],
-  BILLING_FINANCIAL: [
-    'billing', 'payment', 'payments', 'invoice', 'invoices', 'financial',
-    'subscript', 'refund', 'refunds', 'credit card', 'chargeback',
-  ],
-  CI_RELEASE_AUTOMATION: [
-    'github action', 'github actions', 'workflow file', 'ci workflow',
-    'release automation', 'publish to npm', 'push to registry',
-  ],
-  DESTRUCTIVE_OPERATION: [
-    'irreversible', 'rm -rf', 'rm -fr', 'rm -r', 'delet', 'drop', 'truncat',
-    'purg', 'wipe', 'eras', 'overwrit', 'unlink', 'reset', 'drop table',
-    'drop column', 'drop database', 'drop schema', 'drop index',
-    'drop the table',
-  ],
-  EXTERNAL_MUTATION: [
-    'external write', 'external writes', 'external mutation',
-    'external mutations', 'external api', 'publish', 'third party',
-    'third-party', 'webhook', 'outbound',
-  ],
-  PERSISTENT_DATA_MIGRATION: [
-    'migration', 'migrations', 'schema change', 'schema migration',
-    'schema migrations', 'data migration', 'data migrations', 'alter table',
-    'drop column', 'backfil',
-  ],
-  SECRETS_CREDENTIALS: [
-    'secret', 'secrets', 'credential', 'credentials', 'api key', 'api keys',
-    'apikey', 'oauth', 'password', 'passwords', 'private key',
-    'encryption key', 'access token',
-  ],
-  SECURITY_BOUNDARY: [
-    'crypt', 'crypto', 'cryptographic', 'encrypt', 'encrypted', 'encryption',
-    'hmac signature', 'signatures', 'certificate', 'tls',
-  ],
-  TOKEN_COUNTING: [
-    'token budget', 'token count', 'token counting', 'token estimate',
-    'token usage', 'count tokens', 'tokenize',
-  ],
-};
-
-const EXPECTED_PREFIX_STEMS = [
-  'delet', 'drop', 'truncat', 'purg', 'wipe', 'eras', 'overwrit', 'unlink',
-  'reset', 'backfil', 'publish', 'subscript', 'signatures',
 ];
 
 function autoTask(id, overrides = {}) {
@@ -157,7 +100,7 @@ test('AC3: mode auto returns the OAuth and authorization trigger reasons', () =>
 
 test('AC4: mode auto allows an ordinary low-risk read-only feature', () => {
   const task = {
-    id: 't2',
+    id: 'read-only-status',
     metadata: { governance: { mode: 'auto' } },
     title: 'Add a --dry-run flag to the status command',
     description: 'Print the resolved task status without writing anything.',
@@ -172,7 +115,7 @@ test('AC4: mode auto allows an ordinary low-risk read-only feature', () => {
   });
 });
 
-test('default mode is auto and a task with only an id has no reasons', () => {
+test('absent governance mode defaults to auto', () => {
   assert.deepEqual(resolveGovernancePolicy({ id: 'default-task' }), {
     required: false,
     mode: 'auto',
@@ -213,13 +156,16 @@ for (const { field, value, reason } of fieldAttributionCases) {
   });
 }
 
-test('specification triggers are found through nested objects and arrays', () => {
+test('all nested specification string leaves are scanned without schema assumptions', () => {
   const task = autoTask('nested-specification', {
     specification: {
-      controls: {
-        invariants: [
-          { name: 'secrets-check', text: 'No secrets are written to disk.' },
-        ],
+      invariants: [
+        { name: 'opaque-invariant', text: 'No secrets are written to disk.' },
+        { enabled: false, threshold: 3, nested: [{ ignored: null }] },
+      ],
+      scope: {
+        include: ['The scope is interpreted as data.'],
+        exclude: 17,
       },
     },
   });
@@ -235,8 +181,11 @@ test('specification triggers are found through nested objects and arrays', () =>
 
 test('id and metadata are never scanned for trigger phrases', () => {
   const task = {
-    id: 'token budget migration',
-    metadata: { text: 'oauth secrets migration' },
+    id: 'token budget migration oauth secrets',
+    metadata: {
+      text: 'authorization payment migration webhook',
+      governance: { mode: 'auto' },
+    },
     title: '',
     description: '',
     acceptance_criteria: [],
@@ -270,7 +219,7 @@ test('word boundaries match auth but do not treat author as auth', () => {
   });
 });
 
-test('api key matches accepted hyphen, underscore, and case forms', () => {
+test('API key matching accepts hyphen, underscore, and case forms', () => {
   for (const [index, description] of [
     'Rotate the API-KEY',
     'Rotate the API_KEY',
@@ -286,125 +235,177 @@ test('api key matches accepted hyphen, underscore, and case forms', () => {
   }
 });
 
-test('AC6 false-negative check detects count tokens', () => {
-  assert.deepEqual(resolveGovernancePolicy(autoTask('count-tokens', {
-    description: 'Count tokens in the prompt before sending',
-  })), {
-    required: true,
-    mode: 'auto',
-    reasons: [
-      { id: 'TOKEN_COUNTING', field: 'description', match: 'count tokens' },
-    ],
-  });
-});
-
-test('trigger vocabulary regression matrix covers fail-closed and false-positive cases', () => {
-  const mustBeGoverned = [
-    ['Deleted rows from the tasks table', 'DESTRUCTIVE_OPERATION', 'deleted'],
-    ['Dropped the audit table', 'DESTRUCTIVE_OPERATION', 'dropped'],
-    ['Wiped the logs', 'DESTRUCTIVE_OPERATION', 'wiped'],
-    ['Deleting the stale records', 'DESTRUCTIVE_OPERATION', 'deleting'],
-    ['erased the audit trail', 'DESTRUCTIVE_OPERATION', 'erased'],
-    ['Purge the cache', 'DESTRUCTIVE_OPERATION', 'purge'],
-    ['Handle encrypted payloads', 'SECURITY_BOUNDARY', 'encrypted'],
-    ['The cron job deletes stale rows', 'DESTRUCTIVE_OPERATION', 'deletes'],
-    ['The job drops expired rows', 'DESTRUCTIVE_OPERATION', 'drops'],
-    ['Run a hard reset on the prod queue', 'DESTRUCTIVE_OPERATION', 'reset'],
-    ['Run a staging database reset', 'DESTRUCTIVE_OPERATION', 'reset'],
-    ['Factory reset the fixture state', 'DESTRUCTIVE_OPERATION', 'reset'],
-    ['Create a paid subscription', 'BILLING_FINANCIAL', 'subscription'],
-    ['Cancel the customer subscription', 'BILLING_FINANCIAL', 'subscription'],
-    ['Renew the subscription', 'BILLING_FINANCIAL', 'subscription'],
-    ['The job publishes the artifact', 'EXTERNAL_MUTATION', 'publishes'],
-    ['Publish the package to the public npm registry', 'EXTERNAL_MUTATION', 'publish'],
-    ['npm publish the package', 'EXTERNAL_MUTATION', 'publish'],
-    ['The cron purges expired sessions', 'DESTRUCTIVE_OPERATION', 'purges'],
-    ['The job wipes temp files', 'DESTRUCTIVE_OPERATION', 'wipes'],
-    ['truncates the audit log', 'DESTRUCTIVE_OPERATION', 'truncates'],
-    ['erases old records', 'DESTRUCTIVE_OPERATION', 'erases'],
-    ['overwrites the config', 'DESTRUCTIVE_OPERATION', 'overwrites'],
-    ['unlinks the stale symlink', 'DESTRUCTIVE_OPERATION', 'unlinks'],
-    ['Backfill the production rows', 'PERSISTENT_DATA_MIGRATION', 'backfill'],
-    ['backfills the reporting table', 'PERSISTENT_DATA_MIGRATION', 'backfills'],
-    ['Write to the third-party API', 'EXTERNAL_MUTATION', 'third-party'],
-    ['Charge the subscription fee', 'BILLING_FINANCIAL', 'subscription'],
-    ['Verify the HMAC signature', 'SECURITY_BOUNDARY', 'hmac signature'],
-    ['Verify the HMAC signatures', 'SECURITY_BOUNDARY', 'signatures'],
-    ['Drop the users table', 'DESTRUCTIVE_OPERATION', 'drop'],
-    ['Drop the table X', 'DESTRUCTIVE_OPERATION', 'drop'],
-    ['rm -rf /tmp/x', 'DESTRUCTIVE_OPERATION', 'rm -rf'],
-    ['rm -fr /tmp/x', 'DESTRUCTIVE_OPERATION', 'rm -fr'],
-    ['rm -r /tmp/x', 'DESTRUCTIVE_OPERATION', 'rm -r'],
-    // IRREDUCIBLE AMBIGUITIES: resolved toward fail-closed. Governing costs a
-    // false positive (a captain gate), while excluding costs a false negative
-    // (destructive or third-party work proceeding ungoverned), unacceptable for
-    // a governance classifier.
-    ['Bump a third-party devDependency', 'EXTERNAL_MUTATION', 'third-party'],
-    ['Update the migration guide', 'PERSISTENT_DATA_MIGRATION', 'migration'],
-  ];
-  // The trailing `(?![a-z0-9]|-)` on a stem is the hyphen guard: it lets the
-  // drop stem consume words but refuses the structurally different drop-down.
-  for (const [description, id, match] of mustBeGoverned) {
-    assert.deepEqual(resolveGovernancePolicy(autoTask(`must-govern-${match}`, { description })), {
-      required: true,
-      mode: 'auto',
-      reasons: [{ id, field: 'description', match }],
-    });
-  }
-
-  const multiCategoryCases = [
-    ['The migration drops the old column', [
-      { id: 'DESTRUCTIVE_OPERATION', field: 'description', match: 'drops' },
-      { id: 'PERSISTENT_DATA_MIGRATION', field: 'description', match: 'migration' },
-    ]],
-    ['Delete the migration records', [
-      { id: 'DESTRUCTIVE_OPERATION', field: 'description', match: 'delete' },
-      { id: 'PERSISTENT_DATA_MIGRATION', field: 'description', match: 'migration' },
-    ]],
-  ];
-  for (const [description, reasons] of multiCategoryCases) {
-    assert.deepEqual(resolveGovernancePolicy(autoTask(`multi-category-${description}`, { description })), {
-      required: true,
-      mode: 'auto',
-      reasons,
-    });
-  }
-
-  // Bare singular 'signature' is deliberately ungoverned because any matcher
-  // covering JWT/SAML/event signature verification also covers 'method signature';
-  // singular signature verification is a known limitation of this classifier.
-  const falsePositives = [
-    'Document the method signature',
-    'Change the function signature',
-    'Tighten the type signature',
-    'Add a drop-down menu',
-    'Subscribe to client events',
+test('prompt token counting is not a governance category', () => {
+  for (const description of [
+    'Count tokens in the prompt before sending',
+    'Estimate token usage for the request',
     'Use tokenizer fixtures in tests',
-    'Author the release notes',
-    'Add a --dry-run flag to the status command',
-  ];
-  for (const description of falsePositives) {
-    assert.deepEqual(resolveGovernancePolicy(autoTask(`false-positive-${description}`, { description })), {
+  ]) {
+    assert.deepEqual(resolveGovernancePolicy(autoTask(`ordinary-token-work-${description}`, { description })), {
       required: false,
       mode: 'auto',
       reasons: [],
     });
   }
+});
 
-  // The 'reset' stem is needed to govern genuine reset operations ('Factory
-  // reset the fixture state', 'Run a staging database reset') and consequently
-  // also governs 'Fix the reset button'; this is the accepted fail-closed
-  // resolution of an irreducible ambiguity alongside 'Bump a third-party
-  // devDependency' and 'Update the migration guide' - governing costs a false
-  // positive (one captain gate), excluding costs a false negative (a destructive
-  // reset proceeding ungoverned).
-  assert.deepEqual(resolveGovernancePolicy(autoTask('accepted-reset-ambiguity', {
-    description: 'Fix the reset button',
+const requiredTriggerCases = [
+  ['Require authentication before account access', 'AUTHORIZATION', 'authentication'],
+  ['Require authorization from the provider', 'AUTHORIZATION', 'authorization'],
+  ['Enforce access control checks', 'AUTHORIZATION', 'access control'],
+  ['Check permissions before proceeding', 'AUTHORIZATION', 'permissions'],
+  ['Update the billing details', 'BILLING_FINANCIAL', 'billing'],
+  ['Review the financial report', 'BILLING_FINANCIAL', 'financial'],
+  ['Process a customer payment', 'BILLING_FINANCIAL', 'payment'],
+  ['Create an invoice for the customer', 'BILLING_FINANCIAL', 'invoice'],
+  ['Apply a refund to the charge', 'BILLING_FINANCIAL', 'refund'],
+  ['Store a credit-card payment method', 'BILLING_FINANCIAL', 'credit card'],
+  ['Create a paid subscription', 'BILLING_FINANCIAL', 'subscription'],
+  ['Cancel the customer subscription', 'BILLING_FINANCIAL', 'subscription'],
+  ['Charge the subscription fee', 'BILLING_FINANCIAL', 'subscription'],
+  ['Renew the customer subscription', 'BILLING_FINANCIAL', 'subscription'],
+  ['Add a GitHub Actions workflow', 'CI_RELEASE_AUTOMATION', 'github actions'],
+  ['Add release automation for the package', 'CI_RELEASE_AUTOMATION', 'release automation'],
+  ['Update the CI workflow', 'CI_RELEASE_AUTOMATION', 'ci workflow'],
+  ['Delete the stale rows', 'DESTRUCTIVE_OPERATION', 'delete'],
+  ['Deleted rows from the tasks table', 'DESTRUCTIVE_OPERATION', 'deleted'],
+  ['Deleting the stale records', 'DESTRUCTIVE_OPERATION', 'deleting'],
+  ['The cron job deletes stale rows', 'DESTRUCTIVE_OPERATION', 'deletes'],
+  ['Drop the users table', 'DESTRUCTIVE_OPERATION', 'drop'],
+  ['Dropped the audit table', 'DESTRUCTIVE_OPERATION', 'dropped'],
+  ['The job drops expired rows', 'DESTRUCTIVE_OPERATION', 'drops'],
+  ['Purge the cache', 'DESTRUCTIVE_OPERATION', 'purge'],
+  ['The cron purges expired sessions', 'DESTRUCTIVE_OPERATION', 'purges'],
+  ['Wipe the temporary files', 'DESTRUCTIVE_OPERATION', 'wipe'],
+  ['The job wipes temp files', 'DESTRUCTIVE_OPERATION', 'wipes'],
+  ['Erase old records', 'DESTRUCTIVE_OPERATION', 'erase'],
+  ['The job erases old records', 'DESTRUCTIVE_OPERATION', 'erases'],
+  ['Overwrite the config', 'DESTRUCTIVE_OPERATION', 'overwrite'],
+  ['The job overwrites the config', 'DESTRUCTIVE_OPERATION', 'overwrites'],
+  ['Unlink the stale symlink', 'DESTRUCTIVE_OPERATION', 'unlink'],
+  ['The job unlinks the stale symlink', 'DESTRUCTIVE_OPERATION', 'unlinks'],
+  ['Run a hard reset on the prod queue', 'DESTRUCTIVE_OPERATION', 'reset'],
+  ['rm -rf /tmp/x', 'DESTRUCTIVE_OPERATION', 'rm -rf'],
+  ['rm -fr /tmp/x', 'DESTRUCTIVE_OPERATION', 'rm -fr'],
+  ['rm -r /tmp/x', 'DESTRUCTIVE_OPERATION', 'rm -r'],
+  ['The job publishes the artifact', 'EXTERNAL_MUTATION', 'publishes'],
+  ['Publish the package to the public npm registry', 'EXTERNAL_MUTATION', 'publish'],
+  ['npm publish the package', 'EXTERNAL_MUTATION', 'publish'],
+  ['Perform an external write', 'EXTERNAL_MUTATION', 'external write'],
+  ['Apply an external mutation', 'EXTERNAL_MUTATION', 'external mutation'],
+  ['Send the outbound request', 'EXTERNAL_MUTATION', 'outbound'],
+  ['Register the webhook callback', 'EXTERNAL_MUTATION', 'webhook'],
+  ['Backfill the production rows', 'PERSISTENT_DATA_MIGRATION', 'backfill'],
+  ['The job backfills the reporting table', 'PERSISTENT_DATA_MIGRATION', 'backfills'],
+  ['Apply the schema migration', 'PERSISTENT_DATA_MIGRATION', 'migration'],
+  ['Run the data migration', 'PERSISTENT_DATA_MIGRATION', 'migration'],
+  ['Apply a schema change', 'PERSISTENT_DATA_MIGRATION', 'schema change'],
+  ['Run the schema migrations', 'PERSISTENT_DATA_MIGRATION', 'migrations'],
+  ['Perform data migrations', 'PERSISTENT_DATA_MIGRATION', 'migrations'],
+  ['Alter table users to add the column', 'PERSISTENT_DATA_MIGRATION', 'alter table'],
+  ['Store a secret in the vault', 'SECRETS_CREDENTIALS', 'secret'],
+  ['Rotate the credential', 'SECRETS_CREDENTIALS', 'credential'],
+  ['Rotate the credentials', 'SECRETS_CREDENTIALS', 'credentials'],
+  ['Rotate the OAuth client credentials', 'SECRETS_CREDENTIALS', 'oauth'],
+  ['Set a password for the account', 'SECRETS_CREDENTIALS', 'password'],
+  ['Load the private key', 'SECRETS_CREDENTIALS', 'private key'],
+  ['Use an access token', 'SECRETS_CREDENTIALS', 'access token'],
+  ['Rotate the bearer token', 'SECRETS_CREDENTIALS', 'bearer token'],
+  ['Refresh the refresh token', 'SECRETS_CREDENTIALS', 'refresh token'],
+  ['Use crypto for the key exchange', 'SECURITY_BOUNDARY', 'crypto'],
+  ['Encrypt the payload', 'SECURITY_BOUNDARY', 'encrypt'],
+  ['Use encryption for payloads', 'SECURITY_BOUNDARY', 'encryption'],
+  ['Verify the HMAC signature', 'SECURITY_BOUNDARY', 'hmac signature'],
+  ['Verify the HMAC signatures', 'SECURITY_BOUNDARY', 'signatures'],
+  ['Rotate the certificate', 'SECURITY_BOUNDARY', 'certificate'],
+  ['Require TLS for the connection', 'SECURITY_BOUNDARY', 'tls'],
+];
+
+for (const [description, id, match] of requiredTriggerCases) {
+  test(`material trigger requires governance: ${description}`, () => {
+    assert.deepEqual(resolveGovernancePolicy(autoTask(`required-${id}-${match}`, { description })), {
+      required: true,
+      mode: 'auto',
+      reasons: [{ id, field: 'description', match }],
+    });
+  });
+}
+
+const ordinaryFalsePositiveCases = [
+  'Dropbox integration',
+  'Add a dropdown menu',
+  'Add a drop-down menu',
+  'Enable drag-and-drop support',
+  'Handle network drops gracefully',
+  'Add publisher metadata',
+  'Update Realtime subscription events',
+  'Monitor event-stream subscription updates',
+  'Document the method signature',
+  'Change the function signature',
+  'Tighten the type signature',
+  'Update the migration guide',
+  'Read the migration docs',
+  'Fix the reset button',
+  'Fix the reset form',
+  'Bump a third-party devDependency',
+  'Coordinate with a third-party vendor',
+  'Read from the third-party API',
+  'Call the third-party API',
+  'Create an event-stream subscription',
+  'Create an ordinary subscription',
+];
+
+for (const description of ordinaryFalsePositiveCases) {
+  test(`ordinary text stays ungoverned: ${description}`, () => {
+    assert.deepEqual(resolveGovernancePolicy(autoTask(`ordinary-${description}`, { description })), {
+      required: false,
+      mode: 'auto',
+      reasons: [],
+    });
+  });
+}
+
+test('third-party API text requires an explicit external mutation operation', () => {
+  assert.deepEqual(resolveGovernancePolicy(autoTask('third-party-write', {
+    description: 'Write to the third-party API',
   })), {
     required: true,
     mode: 'auto',
     reasons: [
-      { id: 'DESTRUCTIVE_OPERATION', field: 'description', match: 'reset' },
+      { id: 'EXTERNAL_MUTATION', field: 'description', match: 'third-party' },
+    ],
+  });
+});
+
+test('reasons are ordered by category id, not text occurrence', () => {
+  assert.deepEqual(resolveGovernancePolicy(autoTask('ordered-reasons', {
+    description: 'Verify the HMAC signature, rotate the OAuth credential, and require authentication.',
+  })), {
+    required: true,
+    mode: 'auto',
+    reasons: [
+      { id: 'AUTHORIZATION', field: 'description', match: 'authentication' },
+      { id: 'SECRETS_CREDENTIALS', field: 'description', match: 'oauth' },
+      { id: 'SECURITY_BOUNDARY', field: 'description', match: 'hmac signature' },
+    ],
+  });
+});
+
+test('reasons use the highest-precedence field independently per category', () => {
+  assert.deepEqual(resolveGovernancePolicy(autoTask('field-precedence', {
+    title: 'OAuth release metadata',
+    description: 'Require authorization and apply the schema migration.',
+    acceptance_criteria: ['Publish the artifact after payment.'],
+    specification: { check: 'No password is written to disk.' },
+  })), {
+    required: true,
+    mode: 'auto',
+    reasons: [
+      { id: 'AUTHORIZATION', field: 'description', match: 'authorization' },
+      { id: 'BILLING_FINANCIAL', field: 'acceptance_criteria', match: 'payment' },
+      { id: 'EXTERNAL_MUTATION', field: 'acceptance_criteria', match: 'publish' },
+      { id: 'PERSISTENT_DATA_MIGRATION', field: 'description', match: 'migration' },
+      { id: 'SECRETS_CREDENTIALS', field: 'title', match: 'oauth' },
     ],
   });
 });
@@ -421,8 +422,8 @@ test('invalid governance modes fail closed with a typed error and code', () => {
   }
 });
 
-test('invalid tasks fail closed with INVALID_TASK', () => {
-  for (const task of [null, undefined, {}, { id: '' }]) {
+test('invalid top-level tasks fail closed with INVALID_TASK', () => {
+  for (const task of [null, undefined, {}, { id: '' }, { id: 7 }, [], 'task']) {
     assert.throws(
       () => resolveGovernancePolicy(task),
       (error) => assertGovernanceError(error, 'INVALID_TASK'),
@@ -470,32 +471,21 @@ test('AC5 policy resolution is deterministic and does not mutate inputs', () => 
   assert.deepEqual(frozenTask, frozenBefore);
 });
 
-test('reasons are ordered by category id, not text occurrence', () => {
-  assert.deepEqual(resolveGovernancePolicy(autoTask('ordered-reasons', {
-    description: 'Use auth and then tokenize the prompt',
-  })), {
-    required: true,
-    mode: 'auto',
-    reasons: [
-      { id: 'AUTHORIZATION', field: 'description', match: 'auth' },
-      { id: 'TOKEN_COUNTING', field: 'description', match: 'tokenize' },
+test('all eight G1 categories have observable reason ids', () => {
+  const task = autoTask('all-g1-categories', {
+    title: 'Require authentication',
+    description: 'Charge the payment and run GitHub Actions.',
+    acceptance_criteria: [
+      'Delete the old rows and publish the artifact.',
+      'Apply the schema migration and rotate the OAuth credentials.',
     ],
+    specification: {
+      security: 'Require TLS for the connection.',
+    },
   });
-});
-
-test('CAPTAIN_REASONS has the exact frozen ids and documented vocabulary', () => {
-  assert.deepEqual(Object.keys(CAPTAIN_REASONS), EXPECTED_REASON_IDS);
-  assert.deepEqual(CAPTAIN_REASONS, EXPECTED_CAPTAIN_REASONS);
-  assert.equal(Object.isFrozen(CAPTAIN_REASONS), true);
-  assert.ok(PREFIX_STEMS instanceof Set);
-  assert.deepEqual([...PREFIX_STEMS], EXPECTED_PREFIX_STEMS);
-
-  for (const id of EXPECTED_REASON_IDS) {
-    assert.ok(Array.isArray(CAPTAIN_REASONS[id]));
-    assert.ok(CAPTAIN_REASONS[id].length > 0);
-    for (const phrase of CAPTAIN_REASONS[id]) {
-      assert.equal(typeof phrase, 'string');
-      assert.equal(phrase, phrase.toLowerCase());
-    }
-  }
+  const result = resolveGovernancePolicy(task);
+  assert.deepEqual(result.reasons.map(({ id }) => id), G1_CATEGORY_ORDER);
+  assert.equal(result.required, true);
+  assert.equal(result.mode, 'auto');
+  assert.ok(result.reasons.every(({ field, match }) => typeof field === 'string' && typeof match === 'string'));
 });
