@@ -44,8 +44,16 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
   const inFlight = new Map();
   /** @type {Map<string, 'active' | 'released'>} */
   const sessionState = new Map();
-  /** @type {Map<string, Array<{ type: string, event: any }>>} */
+  /** @type {Map<string, Array<{ type: string, event: any, resolve?: (value?: unknown) => void, reject?: (reason?: unknown) => void }>>} */
   const pendingReleases = new Map();
+  // C3-R3-F1: per-session draining guard. While the guard is held, the owner
+  // drains every entry. queueRelease during a drain re-inserts the entry and
+  // returns a deferred Promise; the owner's loop re-reads it and settles the
+  // deferred. The finally-block drain is a recursive call, but the re-inserted
+  // entries settle before the recursive call can run, so the recursive call
+  // sees an empty queue and the outer firstError is never overwritten.
+  /** @type {Map<string, boolean>} */
+  const draining = new Map();
   let disposed = false;
   /** @type {(() => void) | undefined} */
   let unsubscribe;
@@ -81,56 +89,77 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
 
   /**
    * Enqueue a release event for a session whose operation is currently in
-   * flight. A newly allocated queue is stored unconditionally on miss so
-   * later lookups always find an array, never undefined.
+   * flight (or being drained). Returns a deferred Promise that settles only
+   * when the queued release has actually been handled. The owner of the drain
+   * guard picks up re-inserted entries in the same loop and settles each
+   * deferred before the finally-block drain can re-enter.
    * @param {string} sessionId
    * @param {any} event
+   * @returns {Promise<void>}
    */
   function queueRelease(sessionId, event) {
+    /** @type {(value?: unknown) => void} */
+    let resolve = () => {};
+    /** @type {(reason?: unknown) => void} */
+    let reject = () => {};
+    /** @type {Promise<void>} */
+    const deferred = new Promise((res, rej) => {
+      resolve = /** @type {(value?: unknown) => void} */ (res);
+      reject = /** @type {(reason?: unknown) => void} */ (rej);
+    });
     let q = pendingReleases.get(sessionId);
     if (!q) {
       q = [];
       pendingReleases.set(sessionId, q);
     }
-    q.push({ type: event.type, event });
+    q.push({ type: event.type, event, resolve, reject });
+    return deferred;
   }
 
   /**
-   * Drain queued settled/removed events for a session. Drain continues until
-   * the map entry is empty. While draining, release events arriving at a
-   * session whose lock is still held are re-queued by queueRelease and the
-   * outer loop picks them up. Unexpected failures (anything other than the
-   * exact NOT_FOUND/NO_BINDING races the release handler itself tolerates)
-   * are preserved: the first unexpected error is thrown after all remaining
-   * queued entries have been handled, so the originating lifecycle promise
-   * rejects with it while no queued retry is silently lost.
+   * Drain queued settled/removed events for a session. Per-session draining
+   * guard ensures single-owner processing: the guard holder owns every drain
+   * pass. While the guard is held, queueRelease re-inserts entries and
+   * returns a deferred Promise; the owner's loop re-reads the array and
+   * settles the deferred before the finally-block drain can re-enter.
+   * Unexpected failures are preserved per entry; the outer drain throws the
+   * first unexpected error after all entries have been handled.
    * @param {string} sessionId
    */
   async function drainReleases(sessionId) {
-    /** @type {unknown} */
-    let firstError;
-    let hasError = false;
-    for (;;) {
-      const queue = pendingReleases.get(sessionId);
-      if (!queue || queue.length === 0) {
-        pendingReleases.delete(sessionId);
-        break;
-      }
-      const entry = queue.shift();
-      if (entry === undefined) continue;
-      try {
-        await handleSessionReleased(entry.event);
-      } catch (err) {
-        // handleSessionReleased absorbs its own tolerated no-binding races;
-        // anything reaching here is unexpected. Remember the first one and
-        // keep draining the rest (they may still re-queue work).
-        if (!hasError) {
-          firstError = err;
-          hasError = true;
+    if (draining.get(sessionId)) return; // recursive re-entry — already owned
+    draining.set(sessionId, true);
+    try {
+      let firstError;
+      let hasError = false;
+      for (;;) {
+        const queue = pendingReleases.get(sessionId);
+        if (!queue || queue.length === 0) {
+          pendingReleases.delete(sessionId);
+          break;
+        }
+        const entry = queue.shift();
+        if (entry === undefined) continue;
+        try {
+          await handleSessionReleased(entry.event);
+          entry.resolve?.();
+        } catch (err) {
+          // The deferred belongs to the queued emitter, not to this drain:
+          // settle it with the exact error so the originating lifecycle.emit
+          // Promise rejects with its own operation's failure.
+          entry.reject?.(err);
+          // Remember the outer drain's first unexpected error; queued entry
+          // errors are already delivered through their own deferreds.
+          if (!hasError) {
+            firstError = err;
+            hasError = true;
+          }
         }
       }
+      if (hasError) throw firstError;
+    } finally {
+      draining.delete(sessionId);
     }
-    if (hasError) throw firstError;
   }
 
   /**
@@ -255,17 +284,17 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
 
   /**
    * @param {any} event
+   * @returns {Promise<void>}
    */
   async function handleSessionReleased(event) {
     if (typeof event.sessionId !== 'string' || event.sessionId === '') return;
     const state = sessionState.get(event.sessionId);
     if (state === 'released') return;
     // A started (or another release) is in flight for this session — queue
-    // this release so it drains after the in-flight operation completes,
-    // instead of being silently dropped.
+    // this release and return its deferred promise so the originating
+    // lifecycle.emit promise stays pending until drainReleases settles it.
     if (inFlight.has(event.sessionId)) {
-      queueRelease(event.sessionId, event);
-      return;
+      return queueRelease(event.sessionId, event);
     }
     if (state === undefined) {
       // No local state: only a binding actually present on Change Control
