@@ -1,5 +1,6 @@
 import { createTaskChangeControlService, WORK_ITEM_SYSTEM } from './service.js';
 import { createIntegrationTools } from './tools.js';
+import { createLifecycleBootstrapper } from './lifecycle-bootstrap.js';
 
 export { WORK_ITEM_SYSTEM };
 
@@ -322,6 +323,28 @@ export default {
         for (const timer of recoveryTimers.values()) clearTimeout(timer);
         recoveryTimers.clear();
       };
+    });
+
+    // G2 — lifecycle auto-bootstrap: governed tasks that enter an active
+    // state (ready/claimed/running/in_review) get exactly one linked Change
+    // without a captain bootstrap call. Subscribes to the store's notification
+    // channel (no event payload) and rescans persisted tasks; reconciles
+    // active tasks on startup. The disposer returned by start() un-subscribes
+    // on plugin teardown, matching the plugin activation lifetime.
+    // Mocks or test hosts that provide a taskOrchestrator facade without
+    // subscribe() (e.g. worker-binding tests) degrade to no-op.
+    await ctx.inject(['taskOrchestrator', 'changeControl'], (c) => {
+      const orch = c.get('taskOrchestrator');
+      const cc = c.get('changeControl');
+      if (!orch || !cc) throw new Error('taskOrchestrator/changeControl inactive in the G2 bootstrap fiber');
+      if (typeof orch.subscribe !== 'function') return () => {};
+      const controller = createLifecycleBootstrapper({
+        taskOrchestrator: orch,
+        changeControl: cc,
+        bootstrapTask: service.bootstrapTask.bind(service),
+      });
+      const dispose = controller.start();
+      return () => { if (typeof dispose === 'function') dispose(); };
     });
   },
 };
