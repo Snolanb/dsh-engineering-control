@@ -44,7 +44,7 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
   const inFlight = new Map();
   /** @type {Map<string, 'active' | 'released'>} */
   const sessionState = new Map();
-  /** @type {Map<string, Array<{ type: string, event: any, resolve?: (value?: unknown) => void, reject?: (reason?: unknown) => void }>>} */
+  /** @type {Map<string, Array<{ type: string, event: any, resolve?: (value?: unknown) => void, reject?: (reason?: unknown) => void, settle?: () => void }>>} */
   const pendingReleases = new Map();
   // C3-R3-F1: per-session draining guard. While the guard is held, the owner
   // drains every entry. queueRelease during a drain re-inserts the entry and
@@ -57,6 +57,10 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
   let disposed = false;
   /** @type {(() => void) | undefined} */
   let unsubscribe;
+  // C3-R4-F3/F4: tracks every live deferred so dispose can settle it
+  // deterministically. Entries are removed when the deferred is settled.
+  /** @type {Set<() => void>} */
+  const pendingDeferreds = new Set();
 
   /**
    * Safely extract a public error code from a thrown value. Returns the
@@ -107,12 +111,19 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
       resolve = /** @type {(value?: unknown) => void} */ (res);
       reject = /** @type {(reason?: unknown) => void} */ (rej);
     });
+    // Track a settle closure so dispose() can resolve the deferred
+    // deterministically if the drain never runs.
+    const settle = () => {
+      pendingDeferreds.delete(settle);
+      resolve();
+    };
+    pendingDeferreds.add(settle);
     let q = pendingReleases.get(sessionId);
     if (!q) {
       q = [];
       pendingReleases.set(sessionId, q);
     }
-    q.push({ type: event.type, event, resolve, reject });
+    q.push({ type: event.type, event, resolve, reject, settle });
     return deferred;
   }
 
@@ -126,6 +137,10 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
    * first unexpected error after all entries have been handled.
    * @param {string} sessionId
    */
+  /**
+   * @type {Array<{ type: string, event: any, resolve?: (value?: unknown) => void, reject?: (reason?: unknown) => void, settle?: () => void }>}
+   */
+  /** @param {string} sessionId */
   async function drainReleases(sessionId) {
     if (draining.get(sessionId)) return; // recursive re-entry — already owned
     draining.set(sessionId, true);
@@ -133,6 +148,21 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
       let firstError;
       let hasError = false;
       for (;;) {
+        // C3-R4-F4: if dispose ran before this iteration dispatches, settle
+        // all remaining deferreds as teardown no-ops and stop dispatching.
+        if (disposed) {
+          const queue = pendingReleases.get(sessionId);
+          if (queue) {
+            for (const e of queue) {
+              if (e.settle) {
+                e.settle();
+                pendingDeferreds.delete(e.settle);
+              }
+            }
+            pendingReleases.delete(sessionId);
+          }
+          break;
+        }
         const queue = pendingReleases.get(sessionId);
         if (!queue || queue.length === 0) {
           pendingReleases.delete(sessionId);
@@ -143,11 +173,13 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
         try {
           await handleSessionReleased(entry.event);
           entry.resolve?.();
+          if (entry.settle) pendingDeferreds.delete(entry.settle);
         } catch (err) {
           // The deferred belongs to the queued emitter, not to this drain:
           // settle it with the exact error so the originating lifecycle.emit
           // Promise rejects with its own operation's failure.
           entry.reject?.(err);
+          if (entry.settle) pendingDeferreds.delete(entry.settle);
           // Remember the outer drain's first unexpected error; queued entry
           // errors are already delivered through their own deferreds.
           if (!hasError) {
@@ -426,6 +458,12 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
     if (typeof unsubscribe === 'function') {
       unsubscribe();
     }
+    // C3-R4-F3: deterministically settle every live deferred so no
+    // originating lifecycle.emit Promise can hang after teardown.
+    for (const settle of pendingDeferreds) {
+      settle();
+    }
+    pendingDeferreds.clear();
   }
 
   if (lifecycle && typeof lifecycle.subscribe === 'function') {
