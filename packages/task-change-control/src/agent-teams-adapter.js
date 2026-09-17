@@ -15,13 +15,22 @@ import { WORK_ITEM_SYSTEM } from './service.js';
  * - A known session ID is processed exactly once in the lifecycle
  *   started → released state. Unknown session IDs are ignored without change
  *   lookups or mutations.
- * - `session.started` performs at most one binding, using the public
- *   `getBinding` surface when available so duplicate delivery after an adapter
- *   restart is idempotent and conflicting roles fail closed.
- * - `session.settled` and `session.removed` perform at most one release.
+ * - `session.started` performs at most one binding. The public `getBinding`
+ *   result is authoritative: a real existing binding is accepted idempotently
+ *   only when its role matches the derived role; a conflicting role is a
+ *   structured role-conflict failure. Unexpected `getBinding` errors are
+ *   propagated, never converted to absence.
+ * - `session.settled` and `session.removed` release exactly once. When local
+ *   state is absent (restart/idempotence), the adapter resolves the Change and
+ *   consults `getBinding` before unbinding. Only the expected no-binding /
+ *   NOT_FOUND race is tolerated; every other failure is propagated.
  * - `task.completed` forwards stable lifecycle identifiers through
- *   `appendAudit` without scheduling or inventing Change transitions.
+ *   `appendAudit`; unexpected failures are propagated.
  */
+
+/** Exact enum tokens accepted for Change role mapping. */
+const REVIEWER_TOKENS = new Set(['review', 'reviewer']);
+const WORKER_TOKENS = new Set(['test', 'implementation', 'repair', 'worker']);
 
 /**
  * @param {object} deps
@@ -42,21 +51,20 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
   let unsubscribe;
 
   /**
-   * Map generic taskKind/role metadata to a Change Control role.
-   * Reviewer indicators win; worker/test/implementation/repair indicators map
-   * to worker; unknown indicators are ignored. Provider/model fields are
+   * Map generic taskKind/role metadata to a Change Control role using exact
+   * enum-token matching. Reviewer tokens win; worker tokens map to worker;
+   * unknown or conflicting values are ignored. Provider/model fields are
    * intentionally never inspected.
    * @param {any} event
    * @returns {string | null}
    */
   function mapRole(event) {
     if (!event || typeof event !== 'object') return null;
-    const text = [event.taskKind, event.role]
-      .filter((value) => value !== null && value !== undefined)
-      .map((value) => String(value).toLowerCase())
-      .join(' ');
-    if (text.includes('review')) return 'reviewer';
-    if (['test', 'implementation', 'repair', 'worker'].some((token) => text.includes(token))) return 'worker';
+    const tokens = [event.taskKind, event.role]
+      .filter((value) => typeof value === 'string')
+      .map((value) => value.toLowerCase());
+    if (tokens.some((t) => REVIEWER_TOKENS.has(t))) return 'reviewer';
+    if (tokens.some((t) => WORKER_TOKENS.has(t))) return 'worker';
     return null;
   }
 
@@ -100,15 +108,22 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
     try {
       const change = await findChangeForEvent(event);
       if (!change || typeof change.id !== 'string') return;
-      let existing = null;
+
       if (typeof cc.getBinding === 'function') {
-        try {
-          existing = await Promise.resolve(cc.getBinding(change.id, event.sessionId));
-        } catch {
-          existing = null;
+        const existing = await Promise.resolve(cc.getBinding(change.id, event.sessionId));
+        if (existing) {
+          if (existing.role !== role) {
+            const err = new Error(
+              `role-conflict: session ${event.sessionId} already bound as ${existing.role}; expected ${role}`,
+            );
+            err.code = 'ROLE_CONFLICT';
+            throw err;
+          }
+          sessionState.set(event.sessionId, 'active');
+          return;
         }
       }
-      if (existing) return;
+
       const options = {};
       if (typeof event.attemptId === 'string' && event.attemptId !== '') {
         options.worker = event.attemptId;
@@ -128,17 +143,70 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
   async function handleSessionReleased(event) {
     if (typeof event.sessionId !== 'string') return;
     const state = sessionState.get(event.sessionId);
-    if (state !== 'active') return;
+    if (state === 'released') return;
+    if (state === undefined) {
+      // No local state: only a binding actually present on Change Control
+      // makes this release actionable. Tolerating a missing binding avoids
+      // Change lookups for ignored/unknown sessions.
+      const role = mapRole(event);
+      if (role === null) return;
+      if (!acquire(event.sessionId)) return;
+      try {
+        if (!(typeof cc?.getBinding === 'function')) return;
+        const change = await findChangeForEvent(event);
+        if (!change || typeof change.id !== 'string') return;
+        const existing = await Promise.resolve(cc.getBinding(change.id, event.sessionId));
+        if (existing) {
+          if (existing.role !== role) {
+            const err = new Error(
+              `release-role-conflict: session ${event.sessionId} bound as ${existing.role}; release event maps to ${role}`,
+            );
+            err.code = 'ROLE_CONFLICT';
+            throw err;
+          }
+          if (typeof cc.unbindRole !== 'function') return;
+          try {
+            await Promise.resolve(cc.unbindRole(change.id, event.sessionId, {}));
+          } catch (err) {
+            if (isExpectedNoBindingError(err)) {
+              sessionState.set(event.sessionId, 'released');
+            } else {
+              throw err;
+            }
+          }
+        }
+        sessionState.set(event.sessionId, 'released');
+      } finally {
+        releaseLock(event.sessionId);
+      }
+      return;
+    }
+
+    // Local state === 'active'
     if (!acquire(event.sessionId)) return;
     try {
       const change = await findChangeForEvent(event);
       if (change && typeof change.id === 'string' && typeof cc.unbindRole === 'function') {
-        await Promise.resolve(cc.unbindRole(change.id, event.sessionId, {})).catch(() => {});
+        try {
+          await Promise.resolve(cc.unbindRole(change.id, event.sessionId, {}));
+        } catch (err) {
+          if (!isExpectedNoBindingError(err)) throw err;
+        }
       }
       sessionState.set(event.sessionId, 'released');
     } finally {
       releaseLock(event.sessionId);
     }
+  }
+
+  /**
+   * @param {any} error
+   * @returns {boolean}
+   */
+  function isExpectedNoBindingError(error) {
+    if (!error) return false;
+    if (error.code === 'NOT_FOUND' || error.code === 'NO_BINDING') return true;
+    return false;
   }
 
   /**
@@ -156,7 +224,7 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
       sessionId: event.sessionId ?? null,
       status: event.status ?? null,
       result: event.result ?? null,
-    })).catch(() => {});
+    }));
   }
 
   /**
@@ -190,7 +258,7 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
 
   if (lifecycle && typeof lifecycle.subscribe === 'function') {
     unsubscribe = lifecycle.subscribe((event) => {
-      handleEvent(event).catch(() => {});
+      handleEvent(event);
       return undefined;
     });
   }
