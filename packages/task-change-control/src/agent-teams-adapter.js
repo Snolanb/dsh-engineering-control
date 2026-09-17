@@ -51,25 +51,86 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
   let unsubscribe;
 
   /**
-   * Drain any queued settled/removed events for a session after a started
-   * operation completes. Each drained event is handled in isolation so a
-   * role conflict on one does not suppress the rest.
+   * Safely extract a public error code from a thrown value. Returns the
+   * `code` string when the value is a non-null object or function carrying a
+   * string `code`; returns undefined for null/undefined/primitives and for
+   * values whose `code` is not a string. The original value is never mutated.
+   * @param {unknown} error
+   * @returns {string | undefined}
+   */
+  function safeErrorCode(error) {
+    if (error === null || error === undefined) return undefined;
+    if (typeof error !== 'object' && typeof error !== 'function') return undefined;
+    /** @type {any} */
+    const e = /** @type {any} */ (error);
+    if (typeof e.code !== 'string') return undefined;
+    return e.code;
+  }
+
+  /**
+   * @param {unknown} error
+   * @returns {boolean}
+   */
+  function isExpectedNoBindingError(error) {
+    // F4: tolerate exact public no-binding codes regardless of Error prototype;
+    // plain objects {code:'NOT_FOUND'}/{code:'NO_BINDING'} must also be accepted.
+    const code = safeErrorCode(error);
+    if (code === 'NOT_FOUND' || code === 'NO_BINDING') return true;
+    return false;
+  }
+
+  /**
+   * Enqueue a release event for a session whose operation is currently in
+   * flight. A newly allocated queue is stored unconditionally on miss so
+   * later lookups always find an array, never undefined.
+   * @param {string} sessionId
+   * @param {any} event
+   */
+  function queueRelease(sessionId, event) {
+    let q = pendingReleases.get(sessionId);
+    if (!q) {
+      q = [];
+      pendingReleases.set(sessionId, q);
+    }
+    q.push({ type: event.type, event });
+  }
+
+  /**
+   * Drain queued settled/removed events for a session. Drain continues until
+   * the map entry is empty. While draining, release events arriving at a
+   * session whose lock is still held are re-queued by queueRelease and the
+   * outer loop picks them up. Unexpected failures (anything other than the
+   * exact NOT_FOUND/NO_BINDING races the release handler itself tolerates)
+   * are preserved: the first unexpected error is thrown after all remaining
+   * queued entries have been handled, so the originating lifecycle promise
+   * rejects with it while no queued retry is silently lost.
    * @param {string} sessionId
    */
   async function drainReleases(sessionId) {
-    /** @type {Array<{ type: string, event: any }> | undefined} */
-    let queue;
-    while ((queue = pendingReleases.get(sessionId)) && queue.length > 0) {
-      pendingReleases.delete(sessionId);
-      for (const entry of queue) {
-        try {
-          await handleSessionReleased(entry.event);
-        } catch {
-          /* one failed release must not suppress the rest */
+    /** @type {unknown} */
+    let firstError;
+    let hasError = false;
+    for (;;) {
+      const queue = pendingReleases.get(sessionId);
+      if (!queue || queue.length === 0) {
+        pendingReleases.delete(sessionId);
+        break;
+      }
+      const entry = queue.shift();
+      if (entry === undefined) continue;
+      try {
+        await handleSessionReleased(entry.event);
+      } catch (err) {
+        // handleSessionReleased absorbs its own tolerated no-binding races;
+        // anything reaching here is unexpected. Remember the first one and
+        // keep draining the rest (they may still re-queue work).
+        if (!hasError) {
+          firstError = err;
+          hasError = true;
         }
       }
-      if (pendingReleases.has(sessionId)) break;
     }
+    if (hasError) throw firstError;
   }
 
   /**
@@ -162,7 +223,7 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
           // F2: duplicate-bind race — two instances/restart both saw null,
           // both called bindRole; the second gets ALREADY_BOUND/DUPLICATE.
           // Re-read getBinding and accept only a matching role.
-          const code = /** @type {Error & { code?: string }} */ (err).code;
+          const code = safeErrorCode(err);
           if (code === 'ALREADY_BOUND' || code === 'DUPLICATE') {
             if (disposed) return;
             const re = await Promise.resolve(cc.getBinding(change.id, event.sessionId));
@@ -199,15 +260,11 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
     if (typeof event.sessionId !== 'string' || event.sessionId === '') return;
     const state = sessionState.get(event.sessionId);
     if (state === 'released') return;
-    // F1: a started is in flight — queue this release so it drains after
-    // the started completes, instead of being silently dropped.
+    // A started (or another release) is in flight for this session — queue
+    // this release so it drains after the in-flight operation completes,
+    // instead of being silently dropped.
     if (inFlight.has(event.sessionId)) {
-      let q = pendingReleases.get(event.sessionId) ?? [];
-      if (!q) {
-        q = [];
-        pendingReleases.set(event.sessionId, q);
-      }
-      q.push({ type: event.type, event });
+      queueRelease(event.sessionId, event);
       return;
     }
     if (state === undefined) {
@@ -249,6 +306,7 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
         sessionState.set(event.sessionId, 'released');
       } finally {
         releaseLock(event.sessionId);
+        if (!disposed) await drainReleases(event.sessionId);
       }
       return;
     }
@@ -287,19 +345,8 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
       sessionState.set(event.sessionId, 'released');
     } finally {
       releaseLock(event.sessionId);
+      if (!disposed) await drainReleases(event.sessionId);
     }
-  }
-
-  /**
-   * @param {any} error
-   * @returns {boolean}
-   */
-  function isExpectedNoBindingError(error) {
-    // F4: tolerate exact public no-binding codes regardless of Error prototype;
-    // plain objects {code:'NOT_FOUND'}/{code:'NO_BINDING'} must also be accepted.
-    const e = /** @type {Error & { code?: string }} */ (error);
-    if (e.code === 'NOT_FOUND' || e.code === 'NO_BINDING') return true;
-    return false;
   }
 
   /**
