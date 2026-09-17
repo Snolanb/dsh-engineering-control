@@ -1,10 +1,5 @@
-# Add the task ↔ Change integration plugin to a DSH profile bundle.
-# Ordering: load both domain plugins first so ctx.taskOrchestrator and
-# ctx.changeControl exist before this integration applies.
+# Add the task ↔ Change integration plugin.
+# dsh-task-orchestrator and dsh-change-control are loaded separately by the profile bundle.
 - insert:
-    - id: task-orchestrator
-      name: dsh-task-orchestrator
-    - id: change-control
-      name: dsh-change-control
     - id: task-change-control
       name: dsh-task-change-control
