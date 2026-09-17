@@ -464,6 +464,7 @@ export function createAgentTeamsAdapter({ agentTeamsLifecycle, changeControl } =
     if (!change || typeof change.id !== 'string') return;
     if (typeof cc.appendAudit !== 'function') return;
     await Promise.resolve(cc.appendAudit({
+      changeId: change.id,
       type: event.type,
       teamId: event.teamId ?? null,
       agentTaskId: event.agentTaskId ?? null,
