@@ -617,7 +617,10 @@ export class TaskStore {
    *
    * The guard is a synchronous callback invoked by every status-changing
    * mutation path BEFORE the row/event write. It receives:
-   *   { task: canonical task, currentStatus, nextStatus, context: { actor, operation, ... } }
+   *   { task: canonical task, currentStatus, nextStatus, context: { ...options } }
+   * where context is the spread of the caller-supplied options object
+   * (actor, worker, reason, etc.). The operation name is a separate
+   * _runLifecycleGuards parameter and is NOT included in context.
    *
    * Return undefined / null / a truthy non-veto value to allow;
    * return { allowed: false, reason: '...' } to veto. A thrown error is

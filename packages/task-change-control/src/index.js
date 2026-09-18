@@ -88,6 +88,10 @@ export default {
       taskOrchestrator: () => ctx.get('taskOrchestrator'),
       changeControl: () => ctx.get('changeControl'),
       changeStateSnapshot,
+      emitLinkageCreated: (taskId, changeId, state) => {
+        changeStateSnapshot.publish(taskId, changeId, state);
+        ctx.events.emit('change-control/linkage-created', { taskId, changeId, state });
+      },
     });
     ctx.provide('taskChangeControl', service);
 
@@ -346,7 +350,7 @@ export default {
       // Fire-and-forget recovery; every candidate is isolated so one malformed
       // task or synchronous facade error cannot abort the remaining scan.
       (async () => {
-        const candidateIds = await collectIds({ statuses: ['in_review', 'changes_requested', 'ready', 'claimed', 'running'] });
+        const candidateIds = await collectIds({ statuses: ['in_review', 'changes_requested', 'ready', 'claimed', 'running', 'blocked', 'failed'] });
         for (const id of candidateIds) {
           try { await reconcileCandidate(id); } catch { /* next candidate owns its retry */ }
         }
@@ -397,19 +401,7 @@ export default {
     await ctx.inject(['taskOrchestrator', 'changeControl'], async (c) => {
       const orch = c.get('taskOrchestrator');
       const cc = c.get('changeControl');
-      if (!orch || !cc || typeof orch.registerLifecycleGuard !== 'function') {
-        // Loud, structured failure: when a governance linkage already exists
-        // (changeStateSnapshotMap is non-empty) but the Task Orchestrator
-        // facade lacks the registerLifecycleGuard seam, the G4 guard cannot
-        // be installed. Throw — never silently degrade.
-        if (changeStateSnapshotMap.size > 0) {
-          /** @type {Error & { code?: string }} */
-          const err = new Error(
-            'G4 lifecycle guard seam (orch.registerLifecycleGuard) absent while a Change linkage exists; governance cannot be enforced'
-          );
-          err.code = 'G4_LIFECYCLE_GUARD_UNAVAILABLE';
-          throw err;
-        }
+      if (!orch || !cc) {
         return () => {};
       }
 
@@ -428,13 +420,15 @@ export default {
         };
       };
 
-      const unregisterGuard = orch.registerLifecycleGuard(guard);
-
       // Populate from durable Change state so a fresh composition is
       // authoritative from the first guard evaluation (covers restart
       // recovery: persisted APPROVED repairs a still-open task).
+      // Includes ALL non-terminal statuses (including blocked/failed) so the
+      // sync cache is complete for every authoritative link regardless of
+      // task status.
       const populate = async () => {
-        const statuses = ['in_review', 'changes_requested', 'ready', 'claimed', 'running'];
+        if (typeof orch.list !== 'function') return;
+        const statuses = ['in_review', 'changes_requested', 'ready', 'claimed', 'running', 'blocked', 'failed'];
         for (let offset = 0; ; offset += 100) {
           let page = [];
           try { page = (await Promise.resolve(orch.list({ statuses, limit: 100, offset }))) ?? []; } catch { break; }
@@ -459,6 +453,7 @@ export default {
       // in_review task whose Change is already APPROVED so a fresh
       // composition is authoritative without waiting for the H11 IIFE.
       const convergeTerminal = async () => {
+        if (typeof orch.list !== 'function') return;
         const statuses = ['in_review'];
         for (let offset = 0; ; offset += 100) {
           let page = [];
@@ -476,9 +471,11 @@ export default {
             }
             if (change && change.state === 'APPROVED') {
               changeStateSnapshot.publish(taskId, change.id, 'APPROVED');
-              const converged = orch.updateIf(taskId, { status: 'in_review' }, { status: 'done' });
-              if (converged) {
-                try { await cc.appendAudit({ kind: 'reconciliation', changeId: change.id, action: 'g4_terminal_converged_compose' }); } catch { /* best-effort */ }
+              if (typeof orch.updateIf === 'function') {
+                const converged = orch.updateIf(taskId, { status: 'in_review' }, { status: 'done' });
+                if (converged) {
+                  try { await cc.appendAudit({ kind: 'reconciliation', changeId: change.id, action: 'g4_terminal_converged_compose' }); } catch { /* best-effort */ }
+                }
               }
             }
           }
@@ -490,9 +487,59 @@ export default {
       await populate();
       await convergeTerminal();
 
-      // Refresh on review settlement so the snapshot tracks durable state
-      // after APPROVED / REPAIR transitions (event is emitted only after
-      // the durable REVIEW→APPROVED|REPAIR persistence).
+      // C3 (repair-round-3): run the seam check AFTER populate() so a durable
+      // linkage discovered during populate makes the missing-seam failure
+      // fire-closed. When no durable linkage exists (changeStateSnapshotMap is
+      // empty), the Task Orchestrator facade may lack registerLifecycleGuard
+      // (e.g. worker-binding test hosts) and it is safe to skip the guard.
+      if (typeof orch.registerLifecycleGuard !== 'function') {
+        if (changeStateSnapshotMap.size > 0) {
+          const err = /** @type {Error & { code?: string }} */ (new Error(
+            'G4 lifecycle guard seam (orch.registerLifecycleGuard) absent while a Change linkage exists; governance cannot be enforced'
+          ));
+          err.code = 'G4_LIFECYCLE_GUARD_UNAVAILABLE';
+          throw err;
+        }
+        return () => {};
+      }
+
+      const unregisterGuard = orch.registerLifecycleGuard(guard);
+
+      // C2 (repair-round-3): refresh the snapshot on every task notification
+      // AND on a Change-side linkage signal. The orch.subscribe notification
+      // carries no payload, so we rescan all linked tasks (mirroring the G2
+      // fiber). The linkage-created event covers Changes created through the
+      // public changeControl API (bootstrapTask / linkTaskChange) that are not
+      // captured by the task-side notification alone.
+      let disposeTaskSub = null;
+      if (typeof orch.subscribe === 'function') {
+        disposeTaskSub = orch.subscribe(() => {
+        // Rescan all tasks in a link-relevant status to refresh the snapshot.
+        void (async () => {
+          const statuses = ['in_review', 'changes_requested', 'ready', 'claimed', 'running', 'blocked', 'failed'];
+          for (let offset = 0; ; offset += 100) {
+            let page = [];
+            try { page = (await Promise.resolve(orch.list({ statuses, limit: 100, offset }))) ?? []; } catch { break; }
+            for (const task of page) {
+              const taskId = task?.id;
+              if (typeof taskId !== 'string') continue;
+              let change = null;
+              try { change = await cc.findByWorkItem(WORK_ITEM_SYSTEM, taskId); } catch { /* best-effort */ }
+              if (!change) {
+                try {
+                  const all = await cc.listByWorkItem(WORK_ITEM_SYSTEM, taskId);
+                  if (Array.isArray(all) && all.length > 0) change = all[all.length - 1];
+                } catch { /* best-effort */ }
+              }
+              if (change) changeStateSnapshot.publish(taskId, change.id, change.state);
+              else changeStateSnapshot.remove(taskId);
+            }
+            if (page.length < 100) break;
+          }
+        })();
+      });
+      }
+
       const disposeEvents = ctx.events.on('change-control/review-settled', /** @param {any} payload */ async (payload) => {
         if (!payload?.changeId) return;
         try {
@@ -502,9 +549,23 @@ export default {
         } catch { /* snapshot refresh is best-effort */ }
       });
 
+      // C2 (repair-round-3): refresh on Change-side linkage creation so a
+      // public changeControl API call (bootstrapTask, linkTaskChange, or a
+      // direct Change creation with a workItem) immediately updates the
+      // snapshot without waiting for the next task notification.
+      const disposeLinkage = ctx.events.on('change-control/linkage-created', /** @param {any} payload */ async (payload) => {
+        if (!payload?.taskId) return;
+        try {
+          const change = await cc.findByWorkItem(WORK_ITEM_SYSTEM, payload.taskId);
+          if (change) changeStateSnapshot.publish(payload.taskId, change.id, change.state);
+        } catch { /* snapshot refresh is best-effort */ }
+      });
+
       return () => {
         unregisterGuard();
+        if (typeof disposeTaskSub === 'function') disposeTaskSub();
         if (typeof disposeEvents === 'function') disposeEvents();
+        if (typeof disposeLinkage === 'function') disposeLinkage();
       };
     });
 

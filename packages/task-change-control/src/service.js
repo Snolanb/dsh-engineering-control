@@ -143,8 +143,12 @@ function proofsEqualExactly(stored, proof) {
  * @param {() => TaskOrchestratorApi | undefined} deps.taskOrchestrator accessor (may be absent)
  * @param {() => ChangeControlApi | undefined} deps.changeControl accessor (may be absent)
  * @param {{ publish?: (taskId: string, changeId: string, state: string) => void }} [deps.changeStateSnapshot] optional G4 sync snapshot
+ * @param {(taskId: string, changeId: string, state: string) => void} [deps.emitLinkageCreated]
+ *        C2 (repair-round-3): optional linkage-created signal. Emitted after
+ *        the durable write in bootstrapTask / linkTaskChange so the G4 fiber
+ *        can refresh the sync snapshot on Change-side linkage mutations.
  */
-export function createTaskChangeControlService({ taskOrchestrator, changeControl, changeStateSnapshot }) {
+export function createTaskChangeControlService({ taskOrchestrator, changeControl, changeStateSnapshot, emitLinkageCreated } = /** @type {object} */ (undefined)) {
   const requireTask = () => { const s = taskOrchestrator(); if (!s) throw unavailable('taskOrchestrator service not provided'); return s; };
   const requireChange = () => { const s = changeControl(); if (!s) throw unavailable('changeControl service not provided'); return s; };
 
@@ -286,6 +290,9 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         // G4: keep the authoritative link in the sync snapshot so the
         // lifecycle guard sees a repaired linkage immediately.
         publishChangeState(taskId, change.id, change.state);
+        // C2 (repair-round-3): emit the linkage signal so the G4 fiber can
+        // refresh the snapshot on a Change-side linkage mutation.
+        try { emitLinkageCreated?.(taskId, change.id, change.state); } catch { /* best-effort */ }
         return { taskId, changeId: change.id };
       })();
     },
@@ -346,6 +353,9 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         // G4: publish the linkage into the sync snapshot so the lifecycle
         // guard immediately sees this task as governed from DRAFT onward.
         publishChangeState(taskId, change.id, change.state);
+        // C2 (repair-round-3): emit the linkage signal so the G4 fiber can
+        // refresh the snapshot on a Change-side linkage mutation.
+        try { emitLinkageCreated?.(taskId, change.id, change.state); } catch { /* best-effort */ }
         return { change, snapshot: apiSnapshot };
       })();
     },
@@ -1605,9 +1615,12 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
             await c.appendAudit({ kind: 'reconciliation', changeId: change.id, action: 'g4_terminal_converged' });
             repairs.push({ kind: 'g4_terminal_converged' });
           }
-          // Intentional early return: R3 projection realignment below only
-          // applies to in_review tasks; the task is now done so no further
-          // repairs are needed. Fall-through to R3 would be a no-op.
+          // C4 (repair-round-3) — captain-set boundary decision: the R3
+          // projection realignment below only applies to in_review tasks
+          // (condition task.status === 'in_review' && proofComplete). The G4
+          // CAS above has already moved the task to done, so fall-through
+          // to R3 would be a guaranteed no-op. The early return is deliberate
+          // and not a skipped repair path.
           return { repairs, manualIntervention };
         }
 

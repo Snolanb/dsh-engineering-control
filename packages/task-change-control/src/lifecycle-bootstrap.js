@@ -10,7 +10,7 @@
 import { resolveGovernancePolicy } from './policy.js';
 import { WORK_ITEM_SYSTEM } from './service.js';
 
-const ACTIVE = Object.freeze(['ready', 'claimed', 'running', 'in_review']);
+const ACTIVE = Object.freeze(['ready', 'claimed', 'running', 'in_review', 'blocked', 'failed']);
 
 /**
  * @param {object} deps
@@ -33,13 +33,6 @@ export function createLifecycleBootstrapper({ taskOrchestrator, changeControl, b
   async function bootstrapTaskSafe(task) {
     if (!ACTIVE.includes(task?.status)) return;
     const taskId = task.id;
-    let policy;
-    try {
-      policy = resolvePolicy(task);
-    } catch {
-      return; // malformed task — skip, never abort sibling reconciliation
-    }
-    if (policy?.required !== true) return;
     if (inFlight.has(taskId)) return; // coalesce duplicate notification
     inFlight.add(taskId);
     try {
@@ -57,9 +50,21 @@ export function createLifecycleBootstrapper({ taskOrchestrator, changeControl, b
         // lifecycle guard sees this task as governed even when the task's
         // row was re-read and the bootstrapTask path did not run (idempotent
         // existing-link case). Fail-closed: the guard now has the entry.
+        // This publish is INDEPENDENT of policy.required: a governed task that
+        // has a durable Change-side link must remain governed regardless of the
+        // current policy flag.
         try { publishChangeState?.(taskId, link.id, link.state); } catch { /* best-effort */ }
         return; // already linked — idempotent no-op
       }
+      // New-link creation (bootstrapTask) is gated on policy.required:
+      // only governed tasks get a Change created when no link exists yet.
+      let policy;
+      try {
+        policy = resolvePolicy(task);
+      } catch {
+        return; // malformed task — skip, never abort sibling reconciliation
+      }
+      if (policy?.required !== true) return;
       await bootstrapTask(taskId);
     } catch {
       // Bootstrap failure never poisons sibling reconciliation.
