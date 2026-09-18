@@ -396,7 +396,7 @@ export default {
       const cc = c.get('changeControl');
       if (!orch || !cc || typeof orch.registerLifecycleGuard !== 'function') return () => {};
 
-      /** @param {{ task: object, currentStatus: string, nextStatus: string, context: object }} event */
+      /** @param {{ task: { id: string }, currentStatus: string, nextStatus: string, context: object }} event */
       const guard = (event) => {
         if (event.nextStatus !== 'done' && event.nextStatus !== 'completed') return undefined;
         const entry = changeStateSnapshot.get(event.task.id);
