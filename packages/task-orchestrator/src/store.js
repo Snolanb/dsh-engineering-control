@@ -74,6 +74,29 @@ export class TaskStoreError extends Error {
   }
 }
 
+/**
+ * Generic lifecycle transition guard contract.
+ *
+ * A registered guard may veto any status mutation BEFORE the store persists
+ * row/event changes. The guard receives:
+ *   { task: canonical task, currentStatus, nextStatus, context: { actor, operation, ... } }
+ *
+ * It must return:
+ *   - undefined, null, or a falsy value → allow the transition
+ *   - { allowed: false, reason: '...' }  → veto; the store throws LIFECYCLE_GUARD_DENIED
+ *   - a truthy value that is not a veto object → allow
+ *
+ * Guards are synchronous; a thrown guard error is normalized to the same
+ * LIFECYCLE_GUARD_DENIED error. Registration returns a disposer.
+ */
+export class LifecycleGuardDeniedError extends TaskStoreError {
+  constructor(message, guardError = null) {
+    super(message, 'LIFECYCLE_GUARD_DENIED')
+    this.name = 'LifecycleGuardDeniedError'
+    this.guardError = guardError
+  }
+}
+
 export class TaskNotFoundError extends TaskStoreError {
   constructor(id) {
     super('task not found: ' + id, 'TASK_NOT_FOUND')
@@ -518,6 +541,7 @@ export class TaskStore {
     this.maxAttemptsDefault = nonNegativeInteger(options.maxAttemptsDefault, 'max_attempts_default', DEFAULT_MAX_ATTEMPTS)
     this.clock = options.clock ?? Date.now
     this.listeners = new Set()
+    this.lifecycleGuards = new Set()
     mkdirSync(dirname(this.dbPath), { recursive: true, mode: 0o700 })
     this.db = new DatabaseSync(this.dbPath)
     this.db.exec('PRAGMA foreign_keys = ON')
@@ -573,6 +597,7 @@ export class TaskStore {
       this.db = undefined
     }
     this.listeners.clear()
+    this.lifecycleGuards.clear()
   }
 
   subscribe(listener) {
@@ -584,6 +609,72 @@ export class TaskStore {
   _notify() {
     for (const listener of [...this.listeners]) {
       try { listener() } catch { /* observer failures cannot break the store */ }
+    }
+  }
+
+  /**
+   * Generic lifecycle transition guard — no domain, no Change Control.
+   *
+   * The guard is a synchronous callback invoked by every status-changing
+   * mutation path BEFORE the row/event write. It receives:
+   *   { task: canonical task, currentStatus, nextStatus, context: { actor, operation, ... } }
+   *
+   * Return undefined / null / a truthy non-veto value to allow;
+   * return { allowed: false, reason: '...' } to veto. A thrown error is
+   * normalized to LifecycleGuardDeniedError. Registration returns a
+   * disposer that removes this guard from the set.
+   *
+   * @param {(event: { task: object, currentStatus: string, nextStatus: string, context: object }) => any} guard
+   * @returns {() => void} disposer
+   */
+  registerLifecycleGuard(guard) {
+    if (typeof guard !== 'function') {
+      throw new TypeError('guard must be a function')
+    }
+    this.lifecycleGuards.add(guard)
+    return () => this.lifecycleGuards.delete(guard)
+  }
+
+  /**
+   * @param {string} taskId
+   * @param {string} nextStatus
+   * @param {string} actor
+   * @param {string} operation
+   * @param {object} [extra]
+   * @param {import('node:sqlite').DatabaseSync} db
+   */
+  _runLifecycleGuards(taskId, nextStatus, options, operation, db = this.db) {
+    for (const guard of this.lifecycleGuards) {
+      if (nextStatus === undefined || nextStatus === null || nextStatus === '') continue
+      const row = this._row(taskId, db)
+      if (!row) continue
+      const context = { ...options }
+      const event = {
+        task: this._hydrate(row, db),
+        currentStatus: row.status,
+        nextStatus,
+        context,
+      }
+      let result
+      try {
+        result = guard(event)
+      } catch (error) {
+        throw new LifecycleGuardDeniedError(
+          'lifecycle guard denied ' + taskId + ': ' + (error instanceof Error ? error.message : String(error)),
+          error,
+        )
+      }
+      if (result && result.allowed === false) {
+        const denial = result
+        const error = new LifecycleGuardDeniedError(
+          'lifecycle guard denied ' + taskId + ': ' + String(denial.reason ?? ''),
+          null,
+        )
+        if (denial.code !== undefined) error.code = denial.code
+        if (denial.message !== undefined) error.message = String(denial.message)
+        if (denial.evidence !== undefined) error.evidence = denial.evidence
+        throw error
+      }
     }
   }
 
@@ -833,6 +924,7 @@ export class TaskStore {
         nextStatus = normalizeStatus(statusRaw, before.status)
         validateTransition(before.status, nextStatus)
         if (nextStatus !== before.status) add('status', nextStatus)
+        this._runLifecycleGuards(taskId, nextStatus, options, 'update')
       }
       for (const [inputName, column] of Object.entries(allowed)) {
         const value = field(patch, inputName, inputName)
@@ -1031,6 +1123,7 @@ export class TaskStore {
       const sql = 'UPDATE tasks SET ' + setters.join(', ') + ' WHERE id = ?'
       db.prepare(sql).run(...params)
       if (changes.status !== undefined && changes.status !== row.status) {
+        this._runLifecycleGuards(taskId, changes.status, { actor: 'system' }, 'updateIf', db)
         this._statusEvent(taskId, row.status, changes.status, 'system', timestamp, db)
       }
       this._appendEvent(taskId, 'task_updated', 'system', { changes }, db, timestamp)
@@ -1080,6 +1173,7 @@ export class TaskStore {
       if (row.status !== 'claimed') throw new TaskStoreError('task must be claimed before it can start', 'TASK_NOT_CLAIMED')
       this._assertActiveLease(row, worker, timestamp)
       if (Number(row.max_attempts) > 0 && Number(row.attempts) >= Number(row.max_attempts)) throw new TaskStoreError('task max_attempts exceeded', 'MAX_ATTEMPTS_EXCEEDED')
+      this._runLifecycleGuards(taskId, 'running', { actor: options.actor ?? worker }, 'start', db)
       const attempts = Number(row.attempts) + 1
       db.prepare('UPDATE tasks SET status = ?, attempts = ?, started_at = COALESCE(started_at, ?), updated_at = ? WHERE id = ?').run('running', attempts, timestamp, timestamp, taskId)
       this._statusEvent(taskId, row.status, 'running', options.actor ?? worker, timestamp, db)
@@ -1104,6 +1198,7 @@ export class TaskStore {
       const row = this._requireRow(taskId, db)
       if (!['claimed', 'running'].includes(row.status)) throw new TaskStoreError('task must be claimed or running before it can finish', 'TASK_NOT_RUNNING')
       this._assertActiveLease(row, options.worker, timestamp)
+      this._runLifecycleGuards(taskId, targetStatus, { actor: options.actor ?? options.worker }, 'finish', db)
       const resultSummary = field(result, 'result_summary', 'resultSummary')
       const commitSha = field(result, 'commit_sha', 'commitSha')
       const filesChanged = field(result, 'files_changed', 'filesChanged')
@@ -1141,6 +1236,7 @@ export class TaskStore {
       const row = this._requireRow(taskId, db)
       if (statusIsTerminal(row.status)) throw new InvalidTransitionError(row.status, 'blocked')
       if (['claimed', 'running'].includes(row.status)) this._assertActiveLease(row, options.worker, timestamp)
+      this._runLifecycleGuards(taskId, 'blocked', { actor: options.actor ?? options.worker }, 'block', db)
       const blockers = options.remaining_blockers ?? options.remainingBlockers ?? (reason === undefined ? parseJson(row.remaining_blockers, []) : [requiredString(reason, 'reason')])
       const normalized = jsonArray(blockers, 'remaining_blockers')
       db.prepare(String.raw`UPDATE tasks SET status = 'blocked', claimed_by = NULL, claimed_at = NULL, lease_expires_at = NULL,
