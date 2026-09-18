@@ -2,6 +2,7 @@ import { createTaskChangeControlService, WORK_ITEM_SYSTEM } from './service.js';
 import { createIntegrationTools } from './tools.js';
 import { createLifecycleBootstrapper } from './lifecycle-bootstrap.js';
 import { createAgentTeamsAdapter } from './agent-teams-adapter.js';
+import { GOVERNED_COMPLETION_PENDING } from './g4-guard.js';
 
 export { WORK_ITEM_SYSTEM };
 export { createAgentTeamsAdapter };
@@ -63,9 +64,34 @@ export default {
   inject: [],
   /** @param {import('@deepseek-ai/cordis').Context} ctx */
   async apply(ctx) {
+    // G4 — sync authoritative Change-state snapshot owned by this activation.
+    // The TaskStore lifecycle guard runs SYNC inside SQLite writes and cannot
+    // await the async changeControl facade; the guard therefore consults this
+    // Map<taskId, {changeId, state}>, populated from durable state at
+    // activation and published by the approval/recovery lifecycle (the
+    // convergence paths publish APPROVED immediately before their
+    // in_review→done CAS, and review-settled refreshes keep it accurate).
+    /** @type {Map<string, { changeId: string, state: string }>} */
+    const changeStateSnapshotMap = new Map();
+    const changeStateSnapshot = {
+      /** @param {string} taskId @param {string} changeId @param {string} state */
+      publish: (taskId, changeId, state) => {
+        changeStateSnapshotMap.set(taskId, { changeId, state });
+      },
+      /** @param {string} taskId */
+      remove: (taskId) => { changeStateSnapshotMap.delete(taskId); },
+      /** @param {string} taskId @returns {{ changeId: string, state: string } | undefined} */
+      get: (taskId) => changeStateSnapshotMap.get(taskId),
+    };
+
     const service = createTaskChangeControlService({
       taskOrchestrator: () => ctx.get('taskOrchestrator'),
       changeControl: () => ctx.get('changeControl'),
+      changeStateSnapshot,
+      emitLinkageCreated: (taskId, changeId, state) => {
+        changeStateSnapshot.publish(taskId, changeId, state);
+        ctx.events.emit('change-control/linkage-created', { taskId, changeId, state });
+      },
     });
     ctx.provide('taskChangeControl', service);
 
@@ -121,6 +147,9 @@ export default {
         let change;
         try { change = await cc.get(changeId); } catch { return; }
         if (!change?.workItem || change.workItem.system !== WORK_ITEM_SYSTEM) return;
+        // G4: publish the terminal state into the sync snapshot so the
+        // TaskStore lifecycle guard permits the convergence CAS below.
+        changeStateSnapshot.publish(change.workItem.id, change.id, change.state);
         await resumeTask(change.workItem.id);
       };
 
@@ -276,7 +305,17 @@ export default {
         const change = await latestChangeFor(id);
         if (!change) return;
         if (change.state === 'APPROVED') {
-          if (task.status === 'in_review') await resumeTask(id);
+          if (task.status === 'in_review') {
+            // G4: publish the authoritative APPROVED state into the sync
+            // snapshot so the TaskStore lifecycle guard permits the
+            // in_review→done CAS, then converge directly (bypasses the
+            // full runGovernedSdlc loop for the terminal path).
+            changeStateSnapshot.publish(id, change.id, 'APPROVED');
+            const converged = orch.updateIf(id, { status: 'in_review' }, { status: 'done' });
+            if (converged) {
+              try { await cc.appendAudit({ kind: 'reconciliation', changeId: change.id, action: 'g4_terminal_converged_restart' }); } catch { /* best-effort */ }
+            }
+          }
           return;
         }
         if (change.state === 'REPAIR') {
@@ -311,7 +350,7 @@ export default {
       // Fire-and-forget recovery; every candidate is isolated so one malformed
       // task or synchronous facade error cannot abort the remaining scan.
       (async () => {
-        const candidateIds = await collectIds({ statuses: ['in_review', 'changes_requested', 'ready', 'claimed', 'running'] });
+        const candidateIds = await collectIds({ statuses: ['in_review', 'changes_requested', 'ready', 'claimed', 'running', 'blocked', 'failed'] });
         for (const id of candidateIds) {
           try { await reconcileCandidate(id); } catch { /* next candidate owns its retry */ }
         }
@@ -344,9 +383,190 @@ export default {
         taskOrchestrator: orch,
         changeControl: cc,
         bootstrapTask: service.bootstrapTask.bind(service),
+        publishChangeState: (/** @type {string} */ taskId, /** @type {string} */ changeId, /** @type {string} */ state) => {
+          changeStateSnapshot.publish(taskId, changeId, state);
+        },
       });
       const dispose = controller.start();
       return () => { if (typeof dispose === 'function') dispose(); };
+    });
+
+    // G4 — governed completion guard: register ONE sync lifecycle guard per
+    // activation on the TaskStore. The guard denies every transition to
+    // 'done' while the task's linked Change is not APPROVED, consulting the
+    // activation-owned sync snapshot (no sync-over-async; no Change Control
+    // import ever reaches task-orchestrator source). The H11 convergence
+    // fiber below publishes APPROVED into the snapshot immediately before its
+    // in_review→done CAS, so the convergence write always passes.
+    await ctx.inject(['taskOrchestrator', 'changeControl'], async (c) => {
+      const orch = c.get('taskOrchestrator');
+      const cc = c.get('changeControl');
+      if (!orch || !cc) {
+        return () => {};
+      }
+
+      /** @param {{ task: { id: string }, currentStatus: string, nextStatus: string, context: object }} event */
+      const guard = (event) => {
+        if (event.nextStatus !== 'done' && event.nextStatus !== 'completed') return undefined;
+        const entry = changeStateSnapshot.get(event.task.id);
+        if (!entry) return undefined; // ungoverned task — no snapshot entry
+        if (entry.state === 'APPROVED') return undefined; // terminal-approved → allow
+        return {
+          allowed: false,
+          code: GOVERNED_COMPLETION_PENDING,
+          reason: 'task ' + event.task.id + ' is governed; Change ' + entry.changeId + ' is ' + entry.state + ', not APPROVED',
+          message: 'governed completion pending: Change ' + entry.changeId + ' must reach APPROVED before task ' + event.task.id + ' can complete',
+          evidence: { changeId: entry.changeId, changeState: entry.state },
+        };
+      };
+
+      // Populate from durable Change state so a fresh composition is
+      // authoritative from the first guard evaluation (covers restart
+      // recovery: persisted APPROVED repairs a still-open task).
+      // Includes ALL non-terminal statuses (including blocked/failed) so the
+      // sync cache is complete for every authoritative link regardless of
+      // task status.
+      const populate = async () => {
+        if (typeof orch.list !== 'function') return;
+        const statuses = ['in_review', 'changes_requested', 'ready', 'claimed', 'running', 'blocked', 'failed'];
+        for (let offset = 0; ; offset += 100) {
+          let page = [];
+          try { page = (await Promise.resolve(orch.list({ statuses, limit: 100, offset }))) ?? []; } catch { break; }
+          for (const task of page) {
+            const taskId = task?.id;
+            if (typeof taskId !== 'string') continue;
+            let change = null;
+            try { change = await cc.findByWorkItem(WORK_ITEM_SYSTEM, taskId); } catch { /* best-effort */ }
+            if (!change) {
+              try {
+                const all = await cc.listByWorkItem(WORK_ITEM_SYSTEM, taskId);
+                if (Array.isArray(all) && all.length > 0) change = all[all.length - 1];
+              } catch { /* best-effort */ }
+            }
+            if (change) changeStateSnapshot.publish(taskId, change.id, change.state);
+            else changeStateSnapshot.remove(taskId);
+          }
+          if (page.length < 100) break;
+        }
+      };
+      // G4 terminal convergence: after populating the snapshot, repair any
+      // in_review task whose Change is already APPROVED so a fresh
+      // composition is authoritative without waiting for the H11 IIFE.
+      const convergeTerminal = async () => {
+        if (typeof orch.list !== 'function') return;
+        const statuses = ['in_review'];
+        for (let offset = 0; ; offset += 100) {
+          let page = [];
+          try { page = (await Promise.resolve(orch.list({ statuses, limit: 100, offset }))) ?? []; } catch { break; }
+          for (const task of page) {
+            const taskId = task?.id;
+            if (typeof taskId !== 'string') continue;
+            let change = null;
+            try { change = await cc.findByWorkItem(WORK_ITEM_SYSTEM, taskId); } catch { /* best-effort */ }
+            if (!change) {
+              try {
+                const all = await cc.listByWorkItem(WORK_ITEM_SYSTEM, taskId);
+                if (Array.isArray(all) && all.length > 0) change = all[all.length - 1];
+              } catch { /* best-effort */ }
+            }
+            if (change && change.state === 'APPROVED') {
+              changeStateSnapshot.publish(taskId, change.id, 'APPROVED');
+              if (typeof orch.updateIf === 'function') {
+                const converged = orch.updateIf(taskId, { status: 'in_review' }, { status: 'done' });
+                if (converged) {
+                  try { await cc.appendAudit({ kind: 'reconciliation', changeId: change.id, action: 'g4_terminal_converged_compose' }); } catch { /* best-effort */ }
+                }
+              }
+            }
+          }
+          if (page.length < 100) break;
+        }
+      };
+      // Await populate + convergence so the composition itself is the
+      // repair mechanism (not a fire-and-forget IIFE racing setImmediate).
+      await populate();
+      await convergeTerminal();
+
+      // C3 (repair-round-3): run the seam check AFTER populate() so a durable
+      // linkage discovered during populate makes the missing-seam failure
+      // fire-closed. When no durable linkage exists (changeStateSnapshotMap is
+      // empty), the Task Orchestrator facade may lack registerLifecycleGuard
+      // (e.g. worker-binding test hosts) and it is safe to skip the guard.
+      if (typeof orch.registerLifecycleGuard !== 'function') {
+        if (changeStateSnapshotMap.size > 0) {
+          const err = /** @type {Error & { code?: string }} */ (new Error(
+            'G4 lifecycle guard seam (orch.registerLifecycleGuard) absent while a Change linkage exists; governance cannot be enforced'
+          ));
+          err.code = 'G4_LIFECYCLE_GUARD_UNAVAILABLE';
+          throw err;
+        }
+        return () => {};
+      }
+
+      const unregisterGuard = orch.registerLifecycleGuard(guard);
+
+      // C2 (repair-round-3): refresh the snapshot on every task notification
+      // AND on a Change-side linkage signal. The orch.subscribe notification
+      // carries no payload, so we rescan all linked tasks (mirroring the G2
+      // fiber). The linkage-created event covers Changes created through the
+      // public changeControl API (bootstrapTask / linkTaskChange) that are not
+      // captured by the task-side notification alone.
+      let disposeTaskSub = null;
+      if (typeof orch.subscribe === 'function') {
+        disposeTaskSub = orch.subscribe(() => {
+        // Rescan all tasks in a link-relevant status to refresh the snapshot.
+        void (async () => {
+          const statuses = ['in_review', 'changes_requested', 'ready', 'claimed', 'running', 'blocked', 'failed'];
+          for (let offset = 0; ; offset += 100) {
+            let page = [];
+            try { page = (await Promise.resolve(orch.list({ statuses, limit: 100, offset }))) ?? []; } catch { break; }
+            for (const task of page) {
+              const taskId = task?.id;
+              if (typeof taskId !== 'string') continue;
+              let change = null;
+              try { change = await cc.findByWorkItem(WORK_ITEM_SYSTEM, taskId); } catch { /* best-effort */ }
+              if (!change) {
+                try {
+                  const all = await cc.listByWorkItem(WORK_ITEM_SYSTEM, taskId);
+                  if (Array.isArray(all) && all.length > 0) change = all[all.length - 1];
+                } catch { /* best-effort */ }
+              }
+              if (change) changeStateSnapshot.publish(taskId, change.id, change.state);
+              else changeStateSnapshot.remove(taskId);
+            }
+            if (page.length < 100) break;
+          }
+        })();
+      });
+      }
+
+      const disposeEvents = ctx.events.on('change-control/review-settled', /** @param {any} payload */ async (payload) => {
+        if (!payload?.changeId) return;
+        try {
+          const change = await cc.get(payload.changeId);
+          if (!change?.workItem || change.workItem.system !== WORK_ITEM_SYSTEM) return;
+          changeStateSnapshot.publish(change.workItem.id, change.id, change.state);
+        } catch { /* snapshot refresh is best-effort */ }
+      });
+
+      // C2 (repair-round-3): refresh on Change-side linkage creation so a
+      // public changeControl API call (bootstrapTask, linkTaskChange, or a
+      // direct Change creation with a workItem) immediately updates the
+      // snapshot without waiting for the next task notification.
+      const disposeLinkage = ctx.events.on('change-control/linkage-created', /** @param {any} payload */ async (payload) => {
+        if (!payload?.taskId) return;
+        try {
+          const change = await cc.findByWorkItem(WORK_ITEM_SYSTEM, payload.taskId);
+          if (change) changeStateSnapshot.publish(payload.taskId, change.id, change.state);
+        } catch { /* snapshot refresh is best-effort */ }
+      });
+
+      return () => {
+        unregisterGuard();
+        if (typeof disposeTaskSub === 'function') disposeTaskSub();
+        if (typeof disposeEvents === 'function') disposeEvents();
+        if (typeof disposeLinkage === 'function') disposeLinkage();
+      };
     });
 
     // G3 — optional AgentTeams lifecycle adapter: bridges public AgentTeams

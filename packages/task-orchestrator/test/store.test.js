@@ -252,3 +252,36 @@ test('task list filters by project and milestone', t => {
   f.store.update('orphan', { relationship_type: 'spike' })
   assert.deepEqual(f.store.list({ relationship_type: 'spike' }).map(t => t.id), ['orphan'])
 })
+
+// G4 contract boundary: Fail-closed validation applies to the top-level shape of the ticket's own public contracts. Do not extend strictness into nested or interpretive validation unless the ticket explicitly requires it. Over-strictness is as much a defect as fail-open, and reviewers must attack both directions. Where the ticket is silent, the captain sets the boundary and records it.
+test('lifecycle guards receive the current task, requested status, and transition context before mutation', t => {
+  const seen = []
+  const f = fixture(); t.after(() => f.cleanup())
+  f.store.create({ id: 'guarded', title: 'Guarded', status: 'in_review' })
+  const beforeEvents = f.store.events('guarded').length
+  const unregister = f.store.registerLifecycleGuard(input => {
+    seen.push(input)
+    return { allowed: false, code: 'POLICY_PENDING', message: 'external policy is pending', evidence: { policy: 'fixture' } }
+  })
+
+  assert.throws(
+    () => f.store.update('guarded', { status: 'done' }, { actor: 'reviewer', reason: 'approval' }),
+    error => error.code === 'POLICY_PENDING'
+      && error.message === 'external policy is pending'
+      && error.evidence.policy === 'fixture',
+  )
+  assert.equal(f.store.get('guarded').status, 'in_review')
+  assert.equal(f.store.events('guarded').length, beforeEvents, 'denial precedes task row and event mutation')
+  assert.equal(seen.length, 1)
+  assert.equal(seen[0].task.id, 'guarded')
+  assert.equal(seen[0].currentStatus, 'in_review')
+  assert.equal(seen[0].nextStatus, 'done')
+  assert.deepEqual(seen[0].context, { actor: 'reviewer', reason: 'approval' })
+  unregister()
+})
+
+test('no lifecycle guard preserves existing callers and ungoverned completion', t => {
+  const f = fixture(); t.after(() => f.cleanup())
+  f.store.create({ id: 'plain', title: 'Plain', status: 'in_review' })
+  assert.equal(f.store.update('plain', { status: 'done' }).status, 'done')
+})

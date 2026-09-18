@@ -142,10 +142,26 @@ function proofsEqualExactly(stored, proof) {
  * @param {object} deps
  * @param {() => TaskOrchestratorApi | undefined} deps.taskOrchestrator accessor (may be absent)
  * @param {() => ChangeControlApi | undefined} deps.changeControl accessor (may be absent)
+ * @param {{ publish?: (taskId: string, changeId: string, state: string) => void }} [deps.changeStateSnapshot] optional G4 sync snapshot
+ * @param {(taskId: string, changeId: string, state: string) => void} [deps.emitLinkageCreated]
+ *        C2 (repair-round-3): optional linkage-created signal. Emitted after
+ *        the durable write in bootstrapTask / linkTaskChange so the G4 fiber
+ *        can refresh the sync snapshot on Change-side linkage mutations.
  */
-export function createTaskChangeControlService({ taskOrchestrator, changeControl }) {
+export function createTaskChangeControlService({ taskOrchestrator, changeControl, changeStateSnapshot, emitLinkageCreated } = /** @type {object} */ (undefined)) {
   const requireTask = () => { const s = taskOrchestrator(); if (!s) throw unavailable('taskOrchestrator service not provided'); return s; };
   const requireChange = () => { const s = changeControl(); if (!s) throw unavailable('changeControl service not provided'); return s; };
+
+  // G4 — optional sync Change-state snapshot (owned by the plugin's G4 fiber),
+  // passed in so the APPROVED convergence path can publish its authoritative
+  // state BEFORE the in_review→done CAS write reaches the TaskStore's sync
+  // lifecycle guard. Absent in partial compositions → convergence degrades
+  // to the plain CAS (no guard registered either), so behavior is unchanged.
+  /** @param {string} taskId @param {string} changeId @param {string} state */
+  const publishChangeState = (taskId, changeId, state) => {
+    if (typeof changeStateSnapshot?.publish !== 'function') return;
+    try { changeStateSnapshot.publish(taskId, changeId, state); } catch { /* best-effort */ }
+  };
   /** @param {string} taskId */
   const requireTaskId = (taskId) => {
     if (typeof taskId !== 'string' || taskId.trim() === '' || taskId !== taskId.trim()) {
@@ -271,6 +287,12 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         }
         const metadata = { ...(task.metadata ?? {}), changeControl: { ...(task.metadata?.changeControl ?? {}), changeId: change.id } };
         await Promise.resolve(t.update(taskId, { metadata }));
+        // G4: keep the authoritative link in the sync snapshot so the
+        // lifecycle guard sees a repaired linkage immediately.
+        publishChangeState(taskId, change.id, change.state);
+        // C2 (repair-round-3): emit the linkage signal so the G4 fiber can
+        // refresh the snapshot on a Change-side linkage mutation.
+        try { emitLinkageCreated?.(taskId, change.id, change.state); } catch { /* best-effort */ }
         return { taskId, changeId: change.id };
       })();
     },
@@ -328,6 +350,12 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
           : snapshot;
         // Denormalized projection (repairs drift; Change side stays canon).
         await api.linkTaskChange(taskId);
+        // G4: publish the linkage into the sync snapshot so the lifecycle
+        // guard immediately sees this task as governed from DRAFT onward.
+        publishChangeState(taskId, change.id, change.state);
+        // C2 (repair-round-3): emit the linkage signal so the G4 fiber can
+        // refresh the snapshot on a Change-side linkage mutation.
+        try { emitLinkageCreated?.(taskId, change.id, change.state); } catch { /* best-effort */ }
         return { change, snapshot: apiSnapshot };
       })();
     },
@@ -1080,6 +1108,9 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
             revision: status.revision ?? 'unknown',
             findings: [],
           }, { sessionId: options.sessionId });
+          // G4: publish APPROVED into the sync snapshot so the lifecycle
+          // guard permits the in_review→done CAS immediately below.
+          publishChangeState(taskId, change.id, 'APPROVED');
           const done = t.updateIf(taskId, { status: 'in_review' }, { status: 'done' });
           if (!done) {
             await c.appendAudit({ kind: 'review_orchestration', changeId: change.id, action: 'task_done_blocked', sessionId: options.sessionId });
@@ -1286,6 +1317,10 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
           // ── Terminal convergence ──
           if (state === 'APPROVED') {
             if (task.status !== 'done') {
+              // APPROVED is the only state that permits a task's transition
+              // to done; publish the authoritative state so the guard lets
+              // this convergence write through.
+              publishChangeState(taskId, change.id, 'APPROVED');
               const converged = t.updateIf(taskId, { status: 'in_review' }, { status: 'done' });
               if (converged === null) continue; // moved concurrently — re-read
               await c.appendAudit({ kind: 'review_orchestration', changeId: change.id, action: 'review_pass_converged' });
@@ -1342,6 +1377,10 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
             const live = await c.get(change.id);
             if (live.state === 'APPROVED') {
               if (task.status !== 'done') {
+                // Re-read confirmed APPROVED (the concurrent reviewer settled
+                // through Change Control tools): publish so the guard allows
+                // the convergence CAS.
+                publishChangeState(taskId, change.id, 'APPROVED');
                 const converged = t.updateIf(taskId, { status: 'in_review' }, { status: 'done' });
                 if (converged === null) continue;
                 await c.appendAudit({ kind: 'review_orchestration', changeId: change.id, action: 'review_pass_converged' });
@@ -1456,7 +1495,10 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         const isHalfCompletionShape = (task.status === 'claimed' || task.status === 'running') && change.state === 'PREFLIGHT' && leaseExpired;
         // The HALF-COMPLETION shape is the specific lifecycle pairing that
         // T7.2 repairs — refuse to also bark LIFECYCLE_MISMATCH for it.
-        const pairing = isHalfCompletionShape ? { ok: true } : validatePairing(task.status, change.state);
+        // G4: in_review + APPROVED is a durable mismatch that Phase 2
+        // converges to done — not a manual-intervention finding.
+        const isG4TerminalConvergence = task.status === 'in_review' && change.state === 'APPROVED';
+        const pairing = (isHalfCompletionShape || isG4TerminalConvergence) ? { ok: true } : validatePairing(task.status, change.state);
         if (!pairing.ok) {
           manualIntervention.push({ issue: 'LIFECYCLE_MISMATCH', taskId, taskStatus: task.status, changeState: change.state });
         }
@@ -1559,6 +1601,26 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
           }
           await c.appendAudit({ kind: 'reconciliation', changeId: change.id, action: 'half_completion_converged' });
           repairs.push({ kind: 'half_completion_converged' });
+        }
+
+        // G4 terminal convergence: task still in_review but its Change is
+        // terminal-APPROVED (e.g. the reviewer approved the Change but the
+        // convergence CAS raced or the process restarted before running).
+        // Publish APPROVED into the sync snapshot so the lifecycle guard
+        // permits the in_review→done CAS, then converge the task.
+        if (task.status === 'in_review' && change.state === 'APPROVED') {
+          publishChangeState(taskId, change.id, 'APPROVED');
+          const converged = t.updateIf(taskId, { status: 'in_review' }, { status: 'done' });
+          if (converged) {
+            await c.appendAudit({ kind: 'reconciliation', changeId: change.id, action: 'g4_terminal_converged' });
+            repairs.push({ kind: 'g4_terminal_converged' });
+          }
+          // C4 (repair-round-3) — captain-set boundary decision: terminal
+          // G4 convergence is a distinct reconciliation path. Keep the
+          // legacy in_review projection-realignment pass separate rather than
+          // mixing it into this terminal status transition; this return is
+          // deliberate and records that boundary.
+          return { repairs, manualIntervention };
         }
 
         // R3 projection mismatch on completed task.

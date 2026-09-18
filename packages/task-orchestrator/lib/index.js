@@ -66,6 +66,7 @@ export function apply(ctx, config = {}) {
     blockedByDependencies: store.blockedByDependencies.bind(store),
     events: store.events.bind(store),
     subscribe: store.subscribe.bind(store),
+    registerLifecycleGuard: store.registerLifecycleGuard.bind(store),
     createProject: store.createProject.bind(store),
     getProject: store.getProject.bind(store),
     listProjects: store.listProjects.bind(store),

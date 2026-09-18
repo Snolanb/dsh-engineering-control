@@ -10,27 +10,31 @@ import { TaskStore } from 'dsh-task-orchestrator/store';
 import { WorkerDispatcher } from 'dsh-task-orchestrator/dispatcher';
 import { WorkerSpecRegistry } from 'dsh-task-orchestrator/worker-specs';
 import changeControlPlugin from 'dsh-change-control';
+import * as taskOrchestratorPlugin from 'dsh-task-orchestrator';
 import plugin from '../src/index.js';
 import { createBindingLauncher } from '../src/binding.js';
 
 const SYSTEM = 'dsh-task-orchestrator';
 const WORKER_RUN = 'worker:run-c1';
 
+async function composeAt(dir) {
+  const ctx = new Context();
+  // Provide the webServer service the real Task Orchestrator plugin injects.
+  ctx.provide('webServer', { register: () => () => {} });
+  await ctx.plugin(SystemPrompt);
+  await ctx.plugin(ToolRuntime);
+  // Use the real Task Orchestrator plugin — no hand-rolled facade.
+  await ctx.plugin(taskOrchestratorPlugin, { dbPath: join(dir, 'tasks.db') });
+  const taskStore = ctx.get('taskOrchestrator').store;
+  await ctx.plugin(changeControlPlugin, { storePath: join(dir, 'changes.json') });
+  const integrationFiber = await ctx.plugin(plugin);
+  return { ctx, taskStore, dir, integrationFiber };
+}
+
 async function compose(t) {
   const dir = await mkdtemp(join(tmpdir(), 'tcc-complete-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
-  const ctx = new Context();
-  await ctx.plugin(SystemPrompt);
-  await ctx.plugin(ToolRuntime);
-  const taskStore = new TaskStore({ dbPath: join(dir, 'tasks.db') });
-  ctx.provide('taskOrchestrator', Object.freeze({
-    get: taskStore.get.bind(taskStore),
-    update: taskStore.update.bind(taskStore),
-    complete: taskStore.complete.bind(taskStore),
-  }));
-  await ctx.plugin(changeControlPlugin, { storePath: join(dir, 'changes.json') });
-  await ctx.plugin(plugin);
-  return { ctx, taskStore, dir };
+  return composeAt(dir);
 }
 
 /** Create a task, bootstrap linkage + ready the Change, claim+start the task with worker Wsession. */
@@ -829,4 +833,79 @@ test('T-H3: stale cleanup cannot unbind a reassigned worker session', async () =
   const handle = await wrapped.launch({ task: { id: 'task-h3-reassign' }, spec: { mode: 'session' }, worker: 'worker:old' });
   await handle._governedRelease();
   assert.deepEqual(events, ['bind'], 'cleanup for the old attempt must not remove the new worker binding');
+});
+
+// G4 contract boundary: Fail-closed validation applies to the top-level shape of the ticket's own public contracts. Do not extend strictness into nested or interpretive validation unless the ticket explicitly requires it. Over-strictness is as much a defect as fail-open, and reviewers must attack both directions. Where the ticket is silent, the captain sets the boundary and records it.
+test('G4: linked task cannot transition to done before its Change is APPROVED', async (t) => {
+  const { ctx, taskStore, dir } = await compose(t);
+  const governed = await taskStore.create({ title: 'governed', status: 'in_review', workspace: dir });
+  const { change } = await ctx.taskChangeControl.bootstrapTask(governed.id);
+  const eventsBefore = taskStore.events(governed.id).length;
+
+  await assert.rejects(
+    Promise.resolve().then(() => taskStore.update(governed.id, { status: 'done' }, { actor: 'reviewer' })),
+    error => error?.code === 'GOVERNED_COMPLETION_PENDING'
+      && /approved/i.test(error.message)
+      && error.evidence?.changeId === change.id
+      && error.evidence?.changeState === 'DRAFT',
+  );
+  assert.equal(taskStore.get(governed.id).status, 'in_review');
+  assert.equal(taskStore.events(governed.id).length, eventsBefore, 'guard rejection precedes row/event mutation');
+
+  await assert.rejects(
+    Promise.resolve().then(() => taskStore.updateIf(governed.id, { status: 'in_review' }, { status: 'done' })),
+    error => error?.code === 'GOVERNED_COMPLETION_PENDING'
+      && error.evidence?.changeId === change.id
+      && error.evidence?.changeState === 'DRAFT',
+  );
+  assert.equal(taskStore.get(governed.id).status, 'in_review');
+  assert.equal(taskStore.events(governed.id).length, eventsBefore, 'CAS denial also precedes row/event mutation');
+
+  const plain = await taskStore.create({ title: 'plain', status: 'in_review', workspace: dir });
+  assert.equal(taskStore.update(plain.id, { status: 'done' }).status, 'done', 'ungoverned behavior remains compatible');
+});
+
+test('G4: APPROVED reconciliation uses the canonical task API and is replay-idempotent', async (t) => {
+  const { ctx, taskStore, dir } = await compose(t);
+  const task = await taskStore.create({ title: 'approved', status: 'in_review', workspace: dir });
+  const { change } = await ctx.taskChangeControl.bootstrapTask(task.id);
+  const plan = await ctx.changeControl.submitPlan(change.id, { steps: ['ship'] });
+  await ctx.changeControl.acceptPlan(change.id, plan.id, { authorized: true, actor: 'host' });
+  for (const state of ['IMPLEMENTING', 'PREFLIGHT', 'REVIEW', 'APPROVED']) await ctx.changeControl.transition(change.id, state, {});
+
+  const first = await ctx.taskChangeControl.reconcileTaskChange(task.id);
+  assert.equal(taskStore.get(task.id).status, 'done');
+  const doneEvents = () => taskStore.events(task.id).filter(event => event.event_type === 'status_changed' && event.payload?.to === 'done').length;
+  assert.equal(doneEvents(), 1, 'exactly one status_changed→done event after convergence');
+  const count = doneEvents();
+  const second = await ctx.taskChangeControl.reconcileTaskChange(task.id);
+  assert.equal(doneEvents(), count, 'duplicate approval/reconciliation does not write a second completion');
+  assert.ok(first.repairs.length > 0);
+  assert.equal(second.repairs.length, 0);
+});
+
+test('G4: plugin restart repairs an APPROVED linked task left in review', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'tcc-restart-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const first = await composeAt(dir);
+  const task = await first.taskStore.create({ title: 'restart', status: 'in_review', workspace: dir });
+  const { change } = await first.ctx.taskChangeControl.bootstrapTask(task.id);
+  await first.integrationFiber.dispose();
+  const plan = await first.ctx.changeControl.submitPlan(change.id, { steps: ['ship'] });
+  await first.ctx.changeControl.acceptPlan(change.id, plan.id, { authorized: true, actor: 'host' });
+  for (const state of ['IMPLEMENTING', 'PREFLIGHT', 'REVIEW', 'APPROVED']) await first.ctx.changeControl.transition(change.id, state, {});
+  assert.equal(first.taskStore.get(task.id).status, 'in_review', 'durable mismatch exists before restart');
+  first.taskStore.close();
+
+  const restarted = await composeAt(dir);
+  t.after(async () => { await restarted.integrationFiber.dispose(); restarted.taskStore.close(); });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(restarted.taskStore.get(task.id).status, 'done', 'fresh plugin/store composition repairs persisted approval through the canonical facade');
+});
+
+test('G4: task-orchestrator source has no Change Control domain dependency', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const source = await readFile(new URL('../../task-orchestrator/src/store.js', import.meta.url), 'utf8');
+  assert.doesNotMatch(source, /from\s+['"][^'"]*change-control/i, 'no Change Control package import');
+  assert.doesNotMatch(source, /\b(?:ChangeControl|GOVERNED_COMPLETION|CHANGE_(?:CONTROL|STATE))\b/, 'no Change Control domain symbols');
 });
