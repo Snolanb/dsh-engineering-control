@@ -1615,12 +1615,11 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
             await c.appendAudit({ kind: 'reconciliation', changeId: change.id, action: 'g4_terminal_converged' });
             repairs.push({ kind: 'g4_terminal_converged' });
           }
-          // C4 (repair-round-3) — captain-set boundary decision: the R3
-          // projection realignment below only applies to in_review tasks
-          // (condition task.status === 'in_review' && proofComplete). The G4
-          // CAS above has already moved the task to done, so fall-through
-          // to R3 would be a guaranteed no-op. The early return is deliberate
-          // and not a skipped repair path.
+          // C4 (repair-round-3) — captain-set boundary decision: terminal
+          // G4 convergence is a distinct reconciliation path. Keep the
+          // legacy in_review projection-realignment pass separate rather than
+          // mixing it into this terminal status transition; this return is
+          // deliberate and records that boundary.
           return { repairs, manualIntervention };
         }
 
