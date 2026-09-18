@@ -19,8 +19,10 @@ const ACTIVE = Object.freeze(['ready', 'claimed', 'running', 'in_review']);
  * @param {(taskId: string) => Promise<any>} deps.bootstrapTask  service-bound bootstrapTask
  * @param {(task: object) => { required: boolean, [k: string]: any }} [deps.resolvePolicy]
  *        defaults to G1 resolveGovernancePolicy
+ * @param {(taskId: string, changeId: string, state: string) => void} [deps.publishChangeState]
+ *        G4: optional snapshot publish hook called on the existing-link branch
  */
-export function createLifecycleBootstrapper({ taskOrchestrator, changeControl, bootstrapTask, resolvePolicy = resolveGovernancePolicy }) {
+export function createLifecycleBootstrapper({ taskOrchestrator, changeControl, bootstrapTask, resolvePolicy = resolveGovernancePolicy, publishChangeState } = /** @type {object} */ (undefined)) {
   let active = false;
   let dispose = null;
   // Per-task in-flight set: duplicate notifications for the same task are
@@ -50,7 +52,14 @@ export function createLifecycleBootstrapper({ taskOrchestrator, changeControl, b
       } catch {
         return; // Change-side lookup unavailable — the next notification retries
       }
-      if (link) return; // already linked — idempotent no-op
+      if (link) {
+        // G4: publish the authoritative link into the sync snapshot so the
+        // lifecycle guard sees this task as governed even when the task's
+        // row was re-read and the bootstrapTask path did not run (idempotent
+        // existing-link case). Fail-closed: the guard now has the entry.
+        try { publishChangeState?.(taskId, link.id, link.state); } catch { /* best-effort */ }
+        return; // already linked — idempotent no-op
+      }
       await bootstrapTask(taskId);
     } catch {
       // Bootstrap failure never poisons sibling reconciliation.

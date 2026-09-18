@@ -643,10 +643,10 @@ export class TaskStore {
    * @param {object} [extra]
    * @param {import('node:sqlite').DatabaseSync} db
    */
-  _runLifecycleGuards(taskId, nextStatus, options, operation, db = this.db) {
+  _runLifecycleGuards(taskId, nextStatus, options, operation, db = this.db, preReadRow = null) {
     for (const guard of this.lifecycleGuards) {
       if (nextStatus === undefined || nextStatus === null || nextStatus === '') continue
-      const row = this._row(taskId, db)
+      const row = preReadRow ?? this._row(taskId, db)
       if (!row) continue
       const context = { ...options }
       const event = {
@@ -1008,6 +1008,7 @@ export class TaskStore {
       if ((row.status === 'claimed' || row.status === 'running') && !expired) return { claimed: false, reason: 'already_claimed', task: this._hydrate(row, db) }
       if (Number(row.max_attempts) > 0 && Number(row.attempts) >= Number(row.max_attempts)) return { claimed: false, reason: 'max_attempts_exceeded', task: this._hydrate(row, db) }
       const leaseExpires = timestamp + leaseSeconds * 1000
+      this._runLifecycleGuards(taskId, 'claimed', { actor: options.actor ?? owner, worker: owner }, 'claim', db, row)
       db.prepare('UPDATE tasks SET status = ?, claimed_by = ?, claimed_at = ?, lease_expires_at = ?, updated_at = ? WHERE id = ?').run('claimed', owner, timestamp, leaseExpires, timestamp, taskId)
       this._statusEvent(taskId, row.status, 'claimed', options.actor ?? owner, timestamp, db)
       this._appendEvent(taskId, 'task_claimed', options.actor ?? owner, { claimed_by: owner, lease_expires_at: leaseExpires }, db, timestamp)
@@ -1032,6 +1033,7 @@ export class TaskStore {
       const row = this._requireRow(taskId, db)
       if (!['claimed', 'running'].includes(row.status)) return { released: false, reason: 'not_claimed', task: this._hydrate(row, db) }
       this._assertActiveLease(row, worker, timestamp)
+      this._runLifecycleGuards(taskId, 'ready', { actor: options.actor ?? worker, worker }, 'release', db, row)
       db.prepare('UPDATE tasks SET status = ?, claimed_by = NULL, claimed_at = NULL, lease_expires_at = NULL, started_at = NULL, completed_at = NULL, updated_at = ? WHERE id = ?').run('ready', timestamp, taskId)
       this._statusEvent(taskId, row.status, 'ready', options.actor ?? worker, timestamp, db)
       this._appendEvent(taskId, 'task_released', options.actor ?? worker, { previous_status: row.status }, db, timestamp)
@@ -1123,7 +1125,7 @@ export class TaskStore {
       const sql = 'UPDATE tasks SET ' + setters.join(', ') + ' WHERE id = ?'
       db.prepare(sql).run(...params)
       if (changes.status !== undefined && changes.status !== row.status) {
-        this._runLifecycleGuards(taskId, changes.status, { actor: 'system' }, 'updateIf', db)
+        this._runLifecycleGuards(taskId, changes.status, { actor: 'system' }, 'updateIf', db, row)
         this._statusEvent(taskId, row.status, changes.status, 'system', timestamp, db)
       }
       this._appendEvent(taskId, 'task_updated', 'system', { changes }, db, timestamp)
@@ -1140,6 +1142,7 @@ export class TaskStore {
       const expired = row.lease_expires_at !== null && Number(row.lease_expires_at) <= timestamp
       if (row.claimed_by !== owner) return { released: false, reason: 'not_owner', task: this._hydrate(row, db) }
       if (!expired) return { released: false, reason: 'lease_active', task: this._hydrate(row, db) }
+      this._runLifecycleGuards(taskId, 'ready', { actor: options.actor ?? owner, worker: owner }, 'releaseExpiredClaim', db, row)
       db.prepare("UPDATE tasks SET status = ?, claimed_by = NULL, claimed_at = NULL, lease_expires_at = NULL, started_at = NULL, completed_at = NULL, updated_at = ? WHERE id = ? AND claimed_by = ? AND lease_expires_at <= ? AND status IN ('claimed', 'running')")
         .run('ready', timestamp, taskId, owner, timestamp)
       this._statusEvent(taskId, row.status, 'ready', options.actor ?? owner, timestamp, db)
@@ -1253,6 +1256,7 @@ export class TaskStore {
     return this._write(db => {
       const row = this._requireRow(taskId, db)
       if (row.status !== 'blocked') throw new InvalidTransitionError(row.status, 'ready')
+      this._runLifecycleGuards(taskId, 'ready', { actor: options.actor }, 'unblock', db, row)
       db.prepare(`UPDATE tasks SET status = 'ready', remaining_blockers = '[]', started_at = NULL, completed_at = NULL, updated_at = ? WHERE id = ?`).run(timestamp, taskId)
       this._statusEvent(taskId, row.status, 'ready', options.actor, timestamp, db)
       this._appendEvent(taskId, 'task_unblocked', options.actor, {}, db, timestamp)
@@ -1266,6 +1270,7 @@ export class TaskStore {
     return this._write(db => {
       const row = this._requireRow(taskId, db)
       if (row.status !== 'in_review') throw new InvalidTransitionError(row.status, 'changes_requested')
+      this._runLifecycleGuards(taskId, 'changes_requested', { actor: options.actor, reason }, 'requestChanges', db, row)
       const payload = reason === undefined ? parseJson(row.remaining_blockers, []) : [requiredString(reason, 'reason')]
       db.prepare('UPDATE tasks SET status = ?, remaining_blockers = ?, updated_at = ? WHERE id = ?').run('changes_requested', jsonText(payload, [], 'remaining_blockers'), timestamp, taskId)
       this._statusEvent(taskId, row.status, 'changes_requested', options.actor, timestamp, db)

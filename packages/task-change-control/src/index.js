@@ -379,6 +379,9 @@ export default {
         taskOrchestrator: orch,
         changeControl: cc,
         bootstrapTask: service.bootstrapTask.bind(service),
+        publishChangeState: (/** @type {string} */ taskId, /** @type {string} */ changeId, /** @type {string} */ state) => {
+          changeStateSnapshot.publish(taskId, changeId, state);
+        },
       });
       const dispose = controller.start();
       return () => { if (typeof dispose === 'function') dispose(); };
@@ -394,7 +397,21 @@ export default {
     await ctx.inject(['taskOrchestrator', 'changeControl'], async (c) => {
       const orch = c.get('taskOrchestrator');
       const cc = c.get('changeControl');
-      if (!orch || !cc || typeof orch.registerLifecycleGuard !== 'function') return () => {};
+      if (!orch || !cc || typeof orch.registerLifecycleGuard !== 'function') {
+        // Loud, structured failure: when a governance linkage already exists
+        // (changeStateSnapshotMap is non-empty) but the Task Orchestrator
+        // facade lacks the registerLifecycleGuard seam, the G4 guard cannot
+        // be installed. Throw — never silently degrade.
+        if (changeStateSnapshotMap.size > 0) {
+          /** @type {Error & { code?: string }} */
+          const err = new Error(
+            'G4 lifecycle guard seam (orch.registerLifecycleGuard) absent while a Change linkage exists; governance cannot be enforced'
+          );
+          err.code = 'G4_LIFECYCLE_GUARD_UNAVAILABLE';
+          throw err;
+        }
+        return () => {};
+      }
 
       /** @param {{ task: { id: string }, currentStatus: string, nextStatus: string, context: object }} event */
       const guard = (event) => {

@@ -10,6 +10,7 @@ import { TaskStore } from 'dsh-task-orchestrator/store';
 import { WorkerDispatcher } from 'dsh-task-orchestrator/dispatcher';
 import { WorkerSpecRegistry } from 'dsh-task-orchestrator/worker-specs';
 import changeControlPlugin from 'dsh-change-control';
+import * as taskOrchestratorPlugin from 'dsh-task-orchestrator';
 import plugin from '../src/index.js';
 import { createBindingLauncher } from '../src/binding.js';
 
@@ -18,19 +19,13 @@ const WORKER_RUN = 'worker:run-c1';
 
 async function composeAt(dir) {
   const ctx = new Context();
+  // Provide the webServer service the real Task Orchestrator plugin injects.
+  ctx.provide('webServer', { register: () => () => {} });
   await ctx.plugin(SystemPrompt);
   await ctx.plugin(ToolRuntime);
-  const taskStore = new TaskStore({ dbPath: join(dir, 'tasks.db') });
-  ctx.provide('taskOrchestrator', Object.freeze({
-    get: taskStore.get.bind(taskStore),
-    update: taskStore.update.bind(taskStore),
-    complete: taskStore.complete.bind(taskStore),
-    list: taskStore.list.bind(taskStore),
-    updateIf: taskStore.updateIf.bind(taskStore),
-    ...(typeof taskStore.registerLifecycleGuard === 'function'
-      ? { registerLifecycleGuard: taskStore.registerLifecycleGuard.bind(taskStore) }
-      : {}),
-  }));
+  // Use the real Task Orchestrator plugin — no hand-rolled facade.
+  await ctx.plugin(taskOrchestratorPlugin, { dbPath: join(dir, 'tasks.db') });
+  const taskStore = ctx.get('taskOrchestrator').store;
   await ctx.plugin(changeControlPlugin, { storePath: join(dir, 'changes.json') });
   const integrationFiber = await ctx.plugin(plugin);
   return { ctx, taskStore, dir, integrationFiber };
@@ -880,7 +875,8 @@ test('G4: APPROVED reconciliation uses the canonical task API and is replay-idem
 
   const first = await ctx.taskChangeControl.reconcileTaskChange(task.id);
   assert.equal(taskStore.get(task.id).status, 'done');
-  const doneEvents = () => taskStore.events(task.id).filter(event => event.event_type === 'status_changed' && JSON.parse(event.payload_json ?? '{}').status === 'done').length;
+  const doneEvents = () => taskStore.events(task.id).filter(event => event.event_type === 'status_changed' && event.payload?.to === 'done').length;
+  assert.equal(doneEvents(), 1, 'exactly one status_changed→done event after convergence');
   const count = doneEvents();
   const second = await ctx.taskChangeControl.reconcileTaskChange(task.id);
   assert.equal(doneEvents(), count, 'duplicate approval/reconciliation does not write a second completion');

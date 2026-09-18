@@ -283,6 +283,9 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         }
         const metadata = { ...(task.metadata ?? {}), changeControl: { ...(task.metadata?.changeControl ?? {}), changeId: change.id } };
         await Promise.resolve(t.update(taskId, { metadata }));
+        // G4: keep the authoritative link in the sync snapshot so the
+        // lifecycle guard sees a repaired linkage immediately.
+        publishChangeState(taskId, change.id, change.state);
         return { taskId, changeId: change.id };
       })();
     },
@@ -1602,6 +1605,9 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
             await c.appendAudit({ kind: 'reconciliation', changeId: change.id, action: 'g4_terminal_converged' });
             repairs.push({ kind: 'g4_terminal_converged' });
           }
+          // Intentional early return: R3 projection realignment below only
+          // applies to in_review tasks; the task is now done so no further
+          // repairs are needed. Fall-through to R3 would be a no-op.
           return { repairs, manualIntervention };
         }
 
