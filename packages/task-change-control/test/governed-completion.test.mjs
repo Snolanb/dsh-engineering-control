@@ -16,9 +16,7 @@ import { createBindingLauncher } from '../src/binding.js';
 const SYSTEM = 'dsh-task-orchestrator';
 const WORKER_RUN = 'worker:run-c1';
 
-async function compose(t) {
-  const dir = await mkdtemp(join(tmpdir(), 'tcc-complete-'));
-  t.after(() => rm(dir, { recursive: true, force: true }));
+async function composeAt(dir) {
   const ctx = new Context();
   await ctx.plugin(SystemPrompt);
   await ctx.plugin(ToolRuntime);
@@ -34,8 +32,14 @@ async function compose(t) {
       : {}),
   }));
   await ctx.plugin(changeControlPlugin, { storePath: join(dir, 'changes.json') });
-  await ctx.plugin(plugin);
-  return { ctx, taskStore, dir };
+  const integrationFiber = await ctx.plugin(plugin);
+  return { ctx, taskStore, dir, integrationFiber };
+}
+
+async function compose(t) {
+  const dir = await mkdtemp(join(tmpdir(), 'tcc-complete-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  return composeAt(dir);
 }
 
 /** Create a task, bootstrap linkage + ready the Change, claim+start the task with worker Wsession. */
@@ -853,6 +857,15 @@ test('G4: linked task cannot transition to done before its Change is APPROVED', 
   assert.equal(taskStore.get(governed.id).status, 'in_review');
   assert.equal(taskStore.events(governed.id).length, eventsBefore, 'guard rejection precedes row/event mutation');
 
+  await assert.rejects(
+    Promise.resolve().then(() => taskStore.updateIf(governed.id, { status: 'in_review' }, { status: 'done' })),
+    error => error?.code === 'GOVERNED_COMPLETION_PENDING'
+      && error.evidence?.changeId === change.id
+      && error.evidence?.changeState === 'DRAFT',
+  );
+  assert.equal(taskStore.get(governed.id).status, 'in_review');
+  assert.equal(taskStore.events(governed.id).length, eventsBefore, 'CAS denial also precedes row/event mutation');
+
   const plain = await taskStore.create({ title: 'plain', status: 'in_review', workspace: dir });
   assert.equal(taskStore.update(plain.id, { status: 'done' }).status, 'done', 'ungoverned behavior remains compatible');
 });
@@ -876,19 +889,27 @@ test('G4: APPROVED reconciliation uses the canonical task API and is replay-idem
 });
 
 test('G4: plugin restart repairs an APPROVED linked task left in review', async (t) => {
-  const { ctx, taskStore, dir } = await compose(t);
-  const task = await taskStore.create({ title: 'restart', status: 'in_review', workspace: dir });
-  const { change } = await ctx.taskChangeControl.bootstrapTask(task.id);
-  const plan = await ctx.changeControl.submitPlan(change.id, { steps: ['ship'] });
-  await ctx.changeControl.acceptPlan(change.id, plan.id, { authorized: true, actor: 'host' });
-  for (const state of ['IMPLEMENTING', 'PREFLIGHT', 'REVIEW', 'APPROVED']) await ctx.changeControl.transition(change.id, state, {});
+  const dir = await mkdtemp(join(tmpdir(), 'tcc-restart-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const first = await composeAt(dir);
+  const task = await first.taskStore.create({ title: 'restart', status: 'in_review', workspace: dir });
+  const { change } = await first.ctx.taskChangeControl.bootstrapTask(task.id);
+  await first.integrationFiber.dispose();
+  const plan = await first.ctx.changeControl.submitPlan(change.id, { steps: ['ship'] });
+  await first.ctx.changeControl.acceptPlan(change.id, plan.id, { authorized: true, actor: 'host' });
+  for (const state of ['IMPLEMENTING', 'PREFLIGHT', 'REVIEW', 'APPROVED']) await first.ctx.changeControl.transition(change.id, state, {});
+  assert.equal(first.taskStore.get(task.id).status, 'in_review', 'durable mismatch exists before restart');
+  first.taskStore.close();
 
-  await ctx.taskChangeControl.reconcileTaskChange(task.id);
-  assert.equal(taskStore.get(task.id).status, 'done', 'persisted approval converges through the canonical Task Orchestrator facade');
+  const restarted = await composeAt(dir);
+  t.after(async () => { await restarted.integrationFiber.dispose(); restarted.taskStore.close(); });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(restarted.taskStore.get(task.id).status, 'done', 'fresh plugin/store composition repairs persisted approval through the canonical facade');
 });
 
 test('G4: task-orchestrator source has no Change Control domain dependency', async () => {
   const { readFile } = await import('node:fs/promises');
   const source = await readFile(new URL('../../task-orchestrator/src/store.js', import.meta.url), 'utf8');
-  assert.doesNotMatch(source, /from\s+['"][^'"]*change-control|changeId|changeState|governed/i);
+  assert.doesNotMatch(source, /from\s+['"][^'"]*change-control/i, 'no Change Control package import');
+  assert.doesNotMatch(source, /\b(?:ChangeControl|GOVERNED_COMPLETION|CHANGE_(?:CONTROL|STATE))\b/, 'no Change Control domain symbols');
 });
