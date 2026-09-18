@@ -27,6 +27,11 @@ async function compose(t) {
     get: taskStore.get.bind(taskStore),
     update: taskStore.update.bind(taskStore),
     complete: taskStore.complete.bind(taskStore),
+    list: taskStore.list.bind(taskStore),
+    updateIf: taskStore.updateIf.bind(taskStore),
+    ...(typeof taskStore.registerLifecycleGuard === 'function'
+      ? { registerLifecycleGuard: taskStore.registerLifecycleGuard.bind(taskStore) }
+      : {}),
   }));
   await ctx.plugin(changeControlPlugin, { storePath: join(dir, 'changes.json') });
   await ctx.plugin(plugin);
@@ -829,4 +834,61 @@ test('T-H3: stale cleanup cannot unbind a reassigned worker session', async () =
   const handle = await wrapped.launch({ task: { id: 'task-h3-reassign' }, spec: { mode: 'session' }, worker: 'worker:old' });
   await handle._governedRelease();
   assert.deepEqual(events, ['bind'], 'cleanup for the old attempt must not remove the new worker binding');
+});
+
+// G4 contract boundary: Fail-closed validation applies to the top-level shape of the ticket's own public contracts. Do not extend strictness into nested or interpretive validation unless the ticket explicitly requires it. Over-strictness is as much a defect as fail-open, and reviewers must attack both directions. Where the ticket is silent, the captain sets the boundary and records it.
+test('G4: linked task cannot transition to done before its Change is APPROVED', async (t) => {
+  const { ctx, taskStore, dir } = await compose(t);
+  const governed = await taskStore.create({ title: 'governed', status: 'in_review', workspace: dir });
+  const { change } = await ctx.taskChangeControl.bootstrapTask(governed.id);
+  const eventsBefore = taskStore.events(governed.id).length;
+
+  await assert.rejects(
+    Promise.resolve().then(() => taskStore.update(governed.id, { status: 'done' }, { actor: 'reviewer' })),
+    error => error?.code === 'GOVERNED_COMPLETION_PENDING'
+      && /approved/i.test(error.message)
+      && error.evidence?.changeId === change.id
+      && error.evidence?.changeState === 'DRAFT',
+  );
+  assert.equal(taskStore.get(governed.id).status, 'in_review');
+  assert.equal(taskStore.events(governed.id).length, eventsBefore, 'guard rejection precedes row/event mutation');
+
+  const plain = await taskStore.create({ title: 'plain', status: 'in_review', workspace: dir });
+  assert.equal(taskStore.update(plain.id, { status: 'done' }).status, 'done', 'ungoverned behavior remains compatible');
+});
+
+test('G4: APPROVED reconciliation uses the canonical task API and is replay-idempotent', async (t) => {
+  const { ctx, taskStore, dir } = await compose(t);
+  const task = await taskStore.create({ title: 'approved', status: 'in_review', workspace: dir });
+  const { change } = await ctx.taskChangeControl.bootstrapTask(task.id);
+  const plan = await ctx.changeControl.submitPlan(change.id, { steps: ['ship'] });
+  await ctx.changeControl.acceptPlan(change.id, plan.id, { authorized: true, actor: 'host' });
+  for (const state of ['IMPLEMENTING', 'PREFLIGHT', 'REVIEW', 'APPROVED']) await ctx.changeControl.transition(change.id, state, {});
+
+  const first = await ctx.taskChangeControl.reconcileTaskChange(task.id);
+  assert.equal(taskStore.get(task.id).status, 'done');
+  const doneEvents = () => taskStore.events(task.id).filter(event => event.event_type === 'status_changed' && JSON.parse(event.payload_json ?? '{}').status === 'done').length;
+  const count = doneEvents();
+  const second = await ctx.taskChangeControl.reconcileTaskChange(task.id);
+  assert.equal(doneEvents(), count, 'duplicate approval/reconciliation does not write a second completion');
+  assert.ok(first.repairs.length > 0);
+  assert.equal(second.repairs.length, 0);
+});
+
+test('G4: plugin restart repairs an APPROVED linked task left in review', async (t) => {
+  const { ctx, taskStore, dir } = await compose(t);
+  const task = await taskStore.create({ title: 'restart', status: 'in_review', workspace: dir });
+  const { change } = await ctx.taskChangeControl.bootstrapTask(task.id);
+  const plan = await ctx.changeControl.submitPlan(change.id, { steps: ['ship'] });
+  await ctx.changeControl.acceptPlan(change.id, plan.id, { authorized: true, actor: 'host' });
+  for (const state of ['IMPLEMENTING', 'PREFLIGHT', 'REVIEW', 'APPROVED']) await ctx.changeControl.transition(change.id, state, {});
+
+  await ctx.taskChangeControl.reconcileTaskChange(task.id);
+  assert.equal(taskStore.get(task.id).status, 'done', 'persisted approval converges through the canonical Task Orchestrator facade');
+});
+
+test('G4: task-orchestrator source has no Change Control domain dependency', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const source = await readFile(new URL('../../task-orchestrator/src/store.js', import.meta.url), 'utf8');
+  assert.doesNotMatch(source, /from\s+['"][^'"]*change-control|changeId|changeState|governed/i);
 });
