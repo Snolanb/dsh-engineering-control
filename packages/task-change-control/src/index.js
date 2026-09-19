@@ -8,6 +8,32 @@ export { WORK_ITEM_SYSTEM };
 export { createAgentTeamsAdapter };
 
 /**
+ * G5 — production host seam for source-controlled host composition.
+ *
+ * Obtains the governed dispatcher ONLY through the public Cordis
+ * taskChangeControl service and never through the raw TaskOrchestrator
+ * facade or a private store seam.
+ *
+ * @param {import('@deepseek-ai/cordis').Context} ctx
+ * @param {Record<string, any>} [options]
+ * @returns {ReturnType<NonNullable<ReturnType<typeof createTaskChangeControlService>>['createGovernedDispatcher']>}
+ */
+export function createProductionGovernedDispatcher(ctx, options = {}) {
+  /** @param {string} reason */
+  const unavailable = (reason) => {
+    const err = /** @type {Error & { code?: string }} */ (new Error(`GOVERNED_DISPATCHER_UNAVAILABLE: ${reason}`));
+    err.code = 'GOVERNED_DISPATCHER_UNAVAILABLE';
+    return err;
+  };
+  if (!ctx || typeof ctx.get !== 'function') throw unavailable('context does not expose ctx.get()');
+  const service = ctx.get('taskChangeControl');
+  if (!service || typeof service.createGovernedDispatcher !== 'function') {
+    throw unavailable('taskChangeControl.createGovernedDispatcher is not available');
+  }
+  return service.createGovernedDispatcher(options);
+}
+
+/**
  * T9.1 — mandatory-governance task-context provider.
  *
  * Resolves sessionId → governed task context through the Change-side bindings
