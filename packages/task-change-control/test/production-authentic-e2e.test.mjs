@@ -6,8 +6,8 @@ import { ToolRuntime } from '@deepseek-ai/dsh-tools';
 import * as taskOrchestratorPlugin from 'dsh-task-orchestrator';
 import { createSessionRpcClient } from 'dsh-task-orchestrator/dispatcher';
 import changeControlPlugin from 'dsh-change-control';
-import integrationPlugin from '../src/index.js';
-import { mkdtempSync, rmSync } from 'node:fs';
+import integrationPlugin, { createProductionGovernedDispatcher } from '../src/index.js';
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
 import { spawn } from 'node:child_process';
@@ -242,6 +242,55 @@ async function waitFor(predicate, timeoutMs = 5000) {
 
 const orchestrator = { name: taskOrchestratorPlugin.name, inject: taskOrchestratorPlugin.inject, apply: taskOrchestratorPlugin.apply };
 
+test('Task Orchestrator production source has no Change Control package dependency', () => {
+  const sourceRoot = fileURLToPath(new URL('../../task-orchestrator/src/', import.meta.url));
+  const files = readdirSync(sourceRoot, { recursive: true })
+    .filter((name) => /\.[cm]?js$/.test(name));
+  for (const name of files) {
+    const source = readFileSync(join(sourceRoot, name), 'utf8');
+    assert.doesNotMatch(source, /(?:from\s+|import\s*\()['"](?:dsh-change-control|\.\.\/\.\.\/change-control)/, `${name} imports Change Control`);
+  }
+});
+
+test('production host adapter delegates only through the public Cordis taskChangeControl service', () => {
+  const dispatcher = { dispatchOnce() {} };
+  const options = { nested: { deliberately: 'uninterpreted' } };
+  const calls = [];
+  const service = {
+    createGovernedDispatcher(received) {
+      calls.push(['createGovernedDispatcher', received]);
+      return dispatcher;
+    },
+  };
+  const ctx = {
+    get(name) {
+      calls.push(['get', name]);
+      return service;
+    },
+  };
+
+  assert.equal(createProductionGovernedDispatcher(ctx, options), dispatcher);
+  assert.deepEqual(calls, [
+    ['get', 'taskChangeControl'],
+    ['createGovernedDispatcher', options],
+  ]);
+});
+
+test('production host adapter fails closed when its top-level public seam is unavailable', () => {
+  const unavailable = [
+    undefined,
+    {},
+    { get() {} },
+    { get() { return {}; } },
+  ];
+  for (const ctx of unavailable) {
+    assert.throws(
+      () => createProductionGovernedDispatcher(ctx),
+      (error) => error?.code === 'GOVERNED_DISPATCHER_UNAVAILABLE',
+    );
+  }
+});
+
 test('authentic production E2E executes worker_complete and change_submit_review in a real child session host', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'h11-authentic-e2e-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -308,7 +357,9 @@ test('authentic production E2E executes worker_complete and change_submit_review
   const plan = await cc.submitPlan(change.id, { steps: ['implement', 'test'] });
   await cc.acceptPlan(change.id, plan.id, { authorized: true, actor: 'host' });
 
-  const dispatcher = tcc.createGovernedDispatcher();
+  // Host ownership boundary: the source-controlled production adapter obtains
+  // the dispatcher from the public Cordis service, never a private/store seam.
+  const dispatcher = createProductionGovernedDispatcher(ctx);
   const dispatched = await dispatcher.dispatchOnce({ workerProfile: 'worker' });
   assert.equal(dispatched.dispatched, true, JSON.stringify(dispatched));
   assert.equal(dispatched.status, 'in_review', JSON.stringify(dispatched));
@@ -345,6 +396,22 @@ test('authentic production E2E executes worker_complete and change_submit_review
   assert.equal(bridge.calls.length, 2, 'the child session invoked the parent host review tool bridge twice');
   assert.equal(bridge.results.length, 2, 'the parent ToolRuntime returned both review outcomes');
   assert(bridge.results.every((outcome) => outcome.isError === false), JSON.stringify(bridge.results));
+  assert.equal(orch.get(task.id).status, 'done');
+  assert.equal((await cc.get(change.id)).state, 'APPROVED');
+
+  const history = await cc.history(change.id);
+  assert.deepEqual(
+    history.filter((event) => event.to && !event.type && !event.action).map((event) => event.to),
+    ['DRAFT', 'PLANNED', 'READY', 'IMPLEMENTING', 'PREFLIGHT', 'REVIEW', 'REPAIR', 'PREFLIGHT', 'REVIEW', 'APPROVED'],
+    'canonical proof, independent FAIL/repair, and independent PASS follow the persisted lifecycle',
+  );
+  const reviewerBindings = (await cc.listRoleBindings()).filter((binding) => binding.changeId === change.id && binding.role === 'reviewer');
+  assert.equal(reviewerBindings.length, 2, 'one durable independent reviewer identity per revision');
+  assert.equal(new Set(reviewerBindings.map((binding) => binding.sessionId)).size, 2, 'review rounds never reuse reviewer identity');
+  assert.ok(history.filter((event) => event.type === 'UNBIND' && event.sessionId).length >= 2, 'both durable worker identities are released with audit evidence');
+
+  const replay = await dispatcher.dispatchOnce({ workerProfile: 'worker' });
+  assert.equal(replay.dispatched, false, 'terminal replay is idempotent');
   assert.equal(orch.get(task.id).status, 'done');
   assert.equal((await cc.get(change.id)).state, 'APPROVED');
 });
