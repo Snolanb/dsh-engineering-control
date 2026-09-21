@@ -1695,11 +1695,22 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
             { code: 'TASK_NOT_LINKED', taskId },
           );
         }
+        // A NULL binding is the only no-binding path: the session has no
+        // existing role on this Change. A getBinding EXCEPTION (storage or
+        // authorization failure) must fail closed — treating it as "no
+        // binding" would silently fall through to a fresh bindRole, letting
+        // an unauthorized or unreadable state masquerade as a clean bind.
         let binding = null;
         try {
           binding = await c.getBinding(change.id, sessionId);
-        } catch {
-          binding = null;
+        } catch (error) {
+          const code = error && typeof error === 'object' && typeof error.code === 'string'
+            ? error.code
+            : 'BINDING_LOOKUP_FAILED';
+          throw Object.assign(
+            new Error(error instanceof Error ? error.message : String(error)),
+            { code, taskId, changeId: change.id, cause: error },
+          );
         }
         if (binding) {
           if (binding.role !== 'planner') {
