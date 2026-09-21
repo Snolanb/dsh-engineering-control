@@ -121,6 +121,125 @@ export default {
     });
     ctx.provide('taskChangeControl', service);
 
+    // M1-S3 — host-only controller handoff bridge. An authenticated host may
+    // arm a bounded reconciliation with runtimeContext; no model-facing tool,
+    // task payload identity, or claimed_by inference can arm this path.
+    await ctx.inject(['taskOrchestrator', 'changeControl'], (c) => {
+      const orch = c.get('taskOrchestrator');
+      const cc = c.get('changeControl');
+      if (!orch || !cc) throw new Error('taskOrchestrator/changeControl inactive in handoff fiber');
+      /** @type {Map<string, { promise: Promise<any>, authenticatedSessionId: string }>} */
+      const active = new Map();
+      /** @type {{ authenticatedSessionId: string, workerProfile?: string, actor?: string } | null} */
+      let armed = null;
+      let disposed = false;
+      /** @param {string | null | undefined} taskId @param {any} error */
+      const emitFailure = (taskId, error) => {
+        try {
+          ctx.events.emit('task-change-control/handoff-failed', {
+            taskId: typeof taskId === 'string' ? taskId : undefined,
+            code: error?.code ?? 'GOVERNED_HANDOFF_FAILED',
+            message: error instanceof Error ? error.message : String(error),
+          });
+        } catch { /* diagnostics cannot break lifecycle */ }
+      };
+      /** @param {string | null} filterTaskId */
+      const reconcile = async (filterTaskId = null) => {
+        if (disposed || !armed) return [];
+        const ids = [];
+        let rows;
+        try {
+          rows = await Promise.resolve(orch.list({
+            statuses: ['ready', 'claimed', 'running'],
+            limit: 100,
+          }));
+        } catch (error) {
+          emitFailure(filterTaskId, error);
+          return [];
+        }
+        for (const row of Array.isArray(rows) ? rows : []) {
+          if (typeof row?.id !== 'string') continue;
+          if (filterTaskId !== null && row.id !== filterTaskId) continue;
+          ids.push(row.id);
+        }
+        const results = [];
+        for (const id of ids) {
+          const armedContext = armed;
+          const existing = active.get(id);
+          if (existing) {
+            if (existing.authenticatedSessionId !== armedContext.authenticatedSessionId) {
+              emitFailure(id, Object.assign(new Error('handoff is already armed by another controller'), { code: 'CONTROLLER_CLAIM_CONFLICT' }));
+              continue;
+            }
+            try { results.push(await existing.promise); } catch (error) { emitFailure(id, error); }
+            continue;
+          }
+          const run = (async () => {
+            // Every candidate is re-read immediately before the service call;
+            // list rows are only candidate IDs and never authority.
+            const current = await Promise.resolve(orch.get(id));
+            if (!current) return { ok: true, dispatched: false, reason: 'missing', taskId: id };
+            const profile = armedContext.workerProfile ?? current.worker_profile;
+            const context = {
+              authenticatedSessionId: armedContext.authenticatedSessionId,
+              workerProfile: profile,
+              ...(armedContext.actor ? { actor: armedContext.actor } : {}),
+            };
+            return await service.handoffGovernedDispatch(id, context);
+          })();
+          const entry = { promise: run, authenticatedSessionId: armedContext.authenticatedSessionId };
+          active.set(id, entry);
+          try { results.push(await run); } catch (error) { emitFailure(id, error); }
+          finally { if (active.get(id) === entry) active.delete(id); }
+        }
+        return results;
+      };
+      /** @param {any} payload */
+      const request = async (payload) => {
+        if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+          emitFailure(undefined, Object.assign(new Error('handoff runtime context is required'), { code: 'AUTHENTICATED_SESSION_REQUIRED' }));
+          return;
+        }
+        const runtimeContext = payload.runtimeContext;
+        const authenticatedSessionId = runtimeContext
+          && typeof runtimeContext === 'object'
+          && !Array.isArray(runtimeContext)
+          && typeof runtimeContext.authenticatedSessionId === 'string'
+          ? runtimeContext.authenticatedSessionId.trim()
+          : '';
+        if (authenticatedSessionId === '') {
+          emitFailure(payload.taskId, Object.assign(new Error('authenticatedSessionId is required from the host runtime context'), { code: 'AUTHENTICATED_SESSION_REQUIRED' }));
+          return;
+        }
+        const taskId = payload.taskId === undefined ? null : payload.taskId;
+        if (taskId !== null && (typeof taskId !== 'string' || taskId.trim() === '' || taskId !== taskId.trim())) {
+          emitFailure(taskId, Object.assign(new Error('taskId must be a non-blank string'), { code: 'INVALID_TASK_ID' }));
+          return;
+        }
+        armed = {
+          authenticatedSessionId,
+          ...(typeof runtimeContext.workerProfile === 'string' && runtimeContext.workerProfile.trim() !== ''
+            ? { workerProfile: runtimeContext.workerProfile.trim() } : {}),
+          ...(typeof runtimeContext.actor === 'string' && runtimeContext.actor.trim() !== ''
+            ? { actor: runtimeContext.actor } : {}),
+        };
+        await reconcile(taskId);
+      };
+      const disposeRequest = ctx.events.on('task-change-control/handoff-requested', (payload) => {
+        request(payload).catch((error) => emitFailure(payload?.taskId, error));
+      });
+      const disposeSubscription = typeof orch.subscribe === 'function'
+        ? orch.subscribe(() => { if (armed) reconcile().catch((error) => emitFailure(undefined, error)); })
+        : undefined;
+      return () => {
+        disposed = true;
+        armed = null;
+        active.clear();
+        try { disposeRequest?.(); } catch { /* best-effort */ }
+        try { disposeSubscription?.(); } catch { /* best-effort */ }
+      };
+    });
+
     // Model-facing surface: exactly two tools, wired to the tools registry's
     // lifecycle. Absent at startup → nothing; late registry → registered;
     // registry removal/unload → disposed; re-addition → one fresh
