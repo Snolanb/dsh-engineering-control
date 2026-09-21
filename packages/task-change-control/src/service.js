@@ -176,6 +176,11 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
   // (restarted) host now owns — exactly-once across a real restart.
   const activeObservationStops = new Set();
 
+  // Handoff replay protection belongs to this activation. In-flight requests
+  // share one promise; completed dispatches are returned as no-ops on replay.
+  const handoffInFlight = new Map();
+  const handoffCompleted = new Map();
+
   const api = {
     /**
      * T10.1 — read-only dashboard projection for a governed task.
@@ -1801,6 +1806,157 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
         await recordPlanningAudit('planner_bound');
         return { ok: true, taskId, changeId: change.id, sessionId, reused: false };
       })();
+    },
+
+    /**
+     * M1-S3 — release a controller-owned planning claim into the canonical
+     * governed dispatcher. Host-only: the authenticated session and worker
+     * profile must come from runtimeContext, never from a task/model payload.
+     * The dispatcher owns the worker claim/start; this method only releases
+     * the matching controller claim through the public Task Orchestrator API.
+     *
+     * @param {string} taskId
+     * @param {{ authenticatedSessionId?: string, workerProfile?: string, actor?: string }} runtimeContext
+     * @returns {Promise<any>}
+     */
+    handoffGovernedDispatch(taskId, runtimeContext) {
+      requireTaskId(taskId);
+      // Validate host-provided identity and dispatch selection before any
+      // authoritative task lookup, replay shortcut, or in-flight reuse.
+      const context = runtimeContext || {};
+      const authenticatedSessionId = context
+        && typeof context === 'object'
+        && !Array.isArray(context)
+        && typeof context.authenticatedSessionId === 'string'
+        ? context.authenticatedSessionId.trim()
+        : '';
+      if (authenticatedSessionId === '') {
+        return Promise.reject(Object.assign(
+          new Error('authenticatedSessionId is required from the host runtime context'),
+          { code: 'AUTHENTICATED_SESSION_REQUIRED', taskId },
+        ));
+      }
+      const profile = typeof context.workerProfile === 'string' ? context.workerProfile.trim() : '';
+      if (profile === '') {
+        return Promise.reject(Object.assign(
+          new Error('workerProfile is required from the host runtime context'),
+          { code: 'WORKER_PROFILE_REQUIRED', taskId },
+        ));
+      }
+      const actor = typeof context.actor === 'string' && context.actor.trim() !== ''
+        ? context.actor
+        : 'controller';
+      const previous = handoffCompleted.get(taskId);
+      if (previous) {
+        if (previous.authenticatedSessionId !== authenticatedSessionId || previous.workerProfile !== profile) {
+          return Promise.reject(Object.assign(
+            new Error(`handoff for task ${taskId} is already owned by another runtime request`),
+            { code: 'CONTROLLER_CLAIM_CONFLICT', taskId, authenticatedSessionId },
+          ));
+        }
+        return Promise.resolve({ ...previous, replay: true, dispatched: false });
+      }
+      const active = handoffInFlight.get(taskId);
+      if (active) {
+        if (active.authenticatedSessionId !== authenticatedSessionId || active.profile !== profile) {
+          return Promise.reject(Object.assign(
+            new Error(`handoff for task ${taskId} is already owned by another runtime request`),
+            { code: 'CONTROLLER_CLAIM_CONFLICT', taskId, authenticatedSessionId },
+          ));
+        }
+        return active.promise;
+      }
+      const operation = (async () => {
+        // Missing capabilities never fall back to a raw dispatcher or direct
+        // state mutation.
+        const t = requireTask();
+        const c = requireChange();
+        if (typeof t.get !== 'function') {
+          throw unavailable('taskOrchestrator.get not provided');
+        }
+        if (typeof t.release !== 'function') {
+          throw unavailable('taskOrchestrator.release not provided');
+        }
+        if (typeof c.findByWorkItem !== 'function' || typeof c.status !== 'function') {
+          throw unavailable('changeControl linkage/status projections not provided');
+        }
+        const task = await Promise.resolve(t.get(taskId));
+        if (!task) throw Object.assign(new Error(`task not found: ${taskId}`), { code: 'TASK_NOT_FOUND', taskId });
+        if (task.status !== 'claimed' && task.status !== 'running' && task.status !== 'ready') {
+          return { ok: true, dispatched: false, reason: 'not_handoffable', taskId, status: task.status };
+        }
+
+        // Construct and validate the governed dispatcher before releasing any
+        // controller claim. This preserves the claim when the live governed
+        // seam is unavailable or malformed.
+        const dispatcher = api.createGovernedDispatcher();
+        if (!dispatcher || typeof dispatcher.dispatchOnce !== 'function') {
+          throw unavailable('governed dispatcher.dispatchOnce not provided');
+        }
+        const change = await Promise.resolve(c.findByWorkItem(WORK_ITEM_SYSTEM, taskId));
+        if (change) {
+          const changeStatus = await Promise.resolve(c.status(change.id));
+          if (!changeStatus || !changeStatus.acceptedPlan || changeStatus.state !== 'READY') {
+            throw Object.assign(
+              new Error(`linked Change for task ${taskId} is not READY with an accepted plan`),
+              { code: 'DISPATCH_NOT_GOVERNED', taskId, changeId: change.id },
+            );
+          }
+        }
+
+        if (task.status === 'claimed' || task.status === 'running') {
+          // A restarted host may observe the worker claim created by an earlier
+          // successful handoff. Recognize only the dispatcher run-id shape for
+          // this exact profile; every other owner remains a hard conflict.
+          if (task.claimed_by !== authenticatedSessionId
+            && typeof task.claimed_by === 'string'
+            && task.claimed_by.startsWith(`${profile}:`)) {
+            return { ok: true, dispatched: false, reason: 'already_worker_owned', taskId, status: task.status };
+          }
+          // Only the exact authenticated controller owner may hand its claim
+          // back. A stale or conflicting owner fails closed before dispatch.
+          if (task.claimed_by !== authenticatedSessionId) {
+            throw Object.assign(
+              new Error(`task ${taskId} is not owned by authenticated controller ${authenticatedSessionId}`),
+              { code: 'CONTROLLER_CLAIM_CONFLICT', taskId, claimedBy: task.claimed_by ?? null, authenticatedSessionId },
+            );
+          }
+          const released = await Promise.resolve(t.release(taskId, task.claimed_by, { actor }));
+          if (!released || released.released !== true) {
+            throw Object.assign(
+              new Error(`controller claim for task ${taskId} was not released`),
+              { code: 'CONTROLLER_RELEASE_FAILED', taskId, release: released ?? null },
+            );
+          }
+        } else if (task.status === 'ready') {
+          // Ready is dispatcher's handoff state. Any owner on a ready row is
+          // inconsistent and must not be overwritten by this controller.
+          if (task.claimed_by !== null && task.claimed_by !== undefined && task.claimed_by !== '') {
+            throw Object.assign(
+              new Error(`ready task ${taskId} has conflicting owner ${task.claimed_by}`),
+              { code: 'CONTROLLER_CLAIM_CONFLICT', taskId, claimedBy: task.claimed_by, authenticatedSessionId },
+            );
+          }
+        } else {
+          return { ok: true, dispatched: false, reason: 'not_handoffable', taskId, status: task.status };
+        }
+
+        const result = await dispatcher.dispatchOnce({ workerProfile: profile, limit: 1 });
+        const completed = {
+          ok: true,
+          taskId,
+          workerProfile: profile,
+          authenticatedSessionId,
+          result,
+        };
+        if (result?.dispatched === true) handoffCompleted.set(taskId, completed);
+        return completed;
+      })();
+      const entry = { promise: operation, authenticatedSessionId, profile };
+      handoffInFlight.set(taskId, entry);
+      return operation.finally(() => {
+        if (handoffInFlight.get(taskId) === entry) handoffInFlight.delete(taskId);
+      });
     },
 
     /** True when both domain services are resolvable right now. */
