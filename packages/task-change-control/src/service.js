@@ -1649,6 +1649,96 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
       })();
     },
 
+    /**
+     * Controller-owned governed planning startup.
+     *
+     * Host-side only: binds the AUTHENTICATED session as 'planner' on the
+     * task's linked Change through the public Change Control facade, appends
+     * the authoritative audit, and stops. It never plans, approves, or
+     * dispatches, and it never reads the model-supplied `sessionId` field:
+     * authority comes exclusively from `runtimeContext.authenticatedSessionId`.
+     *
+     * Idempotent: an existing compatible planner binding (including a
+     * manually-created one) is reused without a duplicate bind. An
+     * incompatible binding for the same session, or a bind/authorization
+     * failure, fails closed with a typed machine-readable error.
+     *
+     * @param {string} taskId
+     * @param {{ authenticatedSessionId?: string, actor?: string }} [runtimeContext]
+     * @returns {Promise<{ ok: boolean, taskId: string, changeId: string, sessionId: string, reused: boolean }>}
+     */
+    startGovernedPlanning(taskId, runtimeContext = {}) {
+      return (async () => {
+        const t = requireTask();
+        const c = requireChange();
+        requireTaskId(taskId);
+        // Identity is checked BEFORE any store lookup so a missing
+        // authenticated session fails without touching task/change state.
+        const sessionId = typeof runtimeContext.authenticatedSessionId === 'string'
+          ? runtimeContext.authenticatedSessionId.trim()
+          : '';
+        if (sessionId === '') {
+          throw Object.assign(
+            new Error('authenticatedSessionId is required from the host runtime context'),
+            { code: 'AUTHENTICATED_SESSION_REQUIRED' },
+          );
+        }
+        const actor = typeof runtimeContext.actor === 'string' && runtimeContext.actor.trim() !== ''
+          ? runtimeContext.actor
+          : 'controller';
+        const task = await Promise.resolve(t.get(taskId));
+        if (!task) throw Object.assign(new Error(`task not found: ${taskId}`), { code: 'TASK_NOT_FOUND' });
+        const change = await c.findByWorkItem(WORK_ITEM_SYSTEM, taskId);
+        if (!change) {
+          throw Object.assign(
+            new Error(`no Change linked to task ${taskId}`),
+            { code: 'TASK_NOT_LINKED', taskId },
+          );
+        }
+        let binding = null;
+        try {
+          binding = await c.getBinding(change.id, sessionId);
+        } catch {
+          binding = null;
+        }
+        if (binding) {
+          if (binding.role !== 'planner') {
+            throw Object.assign(
+              new Error(`session ${sessionId} is bound as ${binding.role}, not planner, for Change ${change.id}`),
+              { code: 'PLANNER_BINDING_CONFLICT', taskId, changeId: change.id },
+            );
+          }
+          await c.appendAudit({
+            kind: 'governed_planning',
+            changeId: change.id,
+            sessionId,
+            actor,
+            action: 'planner_binding_reused',
+          });
+          return { ok: true, taskId, changeId: change.id, sessionId, reused: true };
+        }
+        try {
+          await c.bindRole(change.id, sessionId, 'planner', { actor });
+        } catch (error) {
+          const code = error && typeof error === 'object' && typeof error.code === 'string'
+            ? error.code
+            : 'BIND_FAILED';
+          throw Object.assign(
+            new Error(error instanceof Error ? error.message : String(error)),
+            { code, taskId, changeId: change.id, cause: error },
+          );
+        }
+        await c.appendAudit({
+          kind: 'governed_planning',
+          changeId: change.id,
+          sessionId,
+          actor,
+          action: 'planner_bound',
+        });
+        return { ok: true, taskId, changeId: change.id, sessionId, reused: false };
+      })();
+    },
+
     /** True when both domain services are resolvable right now. */
     isAvailable() {
       return Boolean(taskOrchestrator() && changeControl());
