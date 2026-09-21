@@ -120,3 +120,103 @@ test('a manually-created planner binding remains compatible', async () => {
   assert.equal(result.reused, true);
   assert.equal(calls.bind.length, 0);
 });
+
+test('concurrent duplicate starts converge on one bind and both return successful startup results', async () => {
+  let binding = null;
+  let lookups = 0;
+  let releaseLookups;
+  const bothLookups = new Promise((resolve) => { releaseLookups = resolve; });
+  const audit = [];
+  const changeControl = {
+    async findByWorkItem() { return { id: CHANGE_ID }; },
+    async getBinding(_changeId, sessionId) {
+      lookups++;
+      if (lookups === 2) releaseLookups();
+      await bothLookups;
+      return binding?.sessionId === sessionId ? binding : null;
+    },
+    async bindRole(changeId, sessionId, role) {
+      if (binding) throw Object.assign(new Error('already bound'), { code: 'ALREADY_BOUND' });
+      binding = { changeId, sessionId, role };
+      return binding;
+    },
+    async appendAudit(event) { audit.push(event); },
+  };
+  const service = createTaskChangeControlService({
+    taskOrchestrator: () => ({ get: () => ({ id: TASK_ID }) }),
+    changeControl: () => changeControl,
+  });
+
+  const results = await Promise.all([
+    service.startGovernedPlanning(TASK_ID, { authenticatedSessionId: 'same-session' }),
+    service.startGovernedPlanning(TASK_ID, { authenticatedSessionId: 'same-session' }),
+  ]);
+
+  assert.deepEqual(results.map((result) => ({ ...result, reused: undefined })), [
+    { ok: true, taskId: TASK_ID, changeId: CHANGE_ID, sessionId: 'same-session', reused: undefined },
+    { ok: true, taskId: TASK_ID, changeId: CHANGE_ID, sessionId: 'same-session', reused: undefined },
+  ]);
+  assert.deepEqual(results.map((result) => result.reused).sort(), [false, true]);
+  assert.equal(binding.role, 'planner');
+  assert.ok(audit.some((event) => event.action === 'planner_bound'));
+  assert.ok(audit.some((event) => event.action === 'planner_binding_reused'));
+});
+
+test('audit failure after binding reports typed recoverable partial startup with persisted authority evidence', async () => {
+  let binding = null;
+  const auditFailure = Object.assign(new Error('audit store unavailable'), { code: 'AUDIT_WRITE_FAILED' });
+  const service = createTaskChangeControlService({
+    taskOrchestrator: () => ({ get: () => ({ id: TASK_ID }) }),
+    changeControl: () => ({
+      async findByWorkItem() { return { id: CHANGE_ID }; },
+      async getBinding() { return binding; },
+      async bindRole(changeId, sessionId, role) { binding = { changeId, sessionId, role }; },
+      async appendAudit() { throw auditFailure; },
+    }),
+  });
+
+  await assert.rejects(
+    service.startGovernedPlanning(TASK_ID, { authenticatedSessionId: 'bound-session' }),
+    (error) => error?.code === 'PLANNING_STARTUP_PARTIAL'
+      && error?.recoverable === true
+      && error?.bindingPersisted === true
+      && error?.taskId === TASK_ID
+      && error?.changeId === CHANGE_ID
+      && error?.sessionId === 'bound-session'
+      && error?.cause === auditFailure,
+  );
+  assert.deepEqual(binding, { changeId: CHANGE_ID, sessionId: 'bound-session', role: 'planner' });
+});
+
+test('audit failure while recording reuse is wrapped with authoritative startup identity', async () => {
+  const auditFailure = new Error('audit down');
+  const service = createTaskChangeControlService({
+    taskOrchestrator: () => ({ get: () => ({ id: TASK_ID }) }),
+    changeControl: () => ({
+      async findByWorkItem() { return { id: CHANGE_ID }; },
+      async getBinding() { return { changeId: CHANGE_ID, sessionId: 'host-session', role: 'planner' }; },
+      async appendAudit() { throw auditFailure; },
+    }),
+  });
+  await assert.rejects(
+    service.startGovernedPlanning(TASK_ID, { authenticatedSessionId: 'host-session' }),
+    (error) => error?.code === 'PLANNING_STARTUP_PARTIAL'
+      && error?.recoverable === true
+      && error?.bindingPersisted === true
+      && error?.taskId === TASK_ID
+      && error?.changeId === CHANGE_ID
+      && error?.sessionId === 'host-session'
+      && error?.cause === auditFailure,
+  );
+});
+
+test('null runtime context fails closed before task or Change lookup', async () => {
+  const { service, calls } = harness();
+  await assert.rejects(
+    service.startGovernedPlanning(TASK_ID, null),
+    (error) => error?.code === 'AUTHENTICATED_SESSION_REQUIRED',
+  );
+  assert.deepEqual(calls.get, []);
+  assert.deepEqual(calls.find, []);
+  assert.equal(calls.bind.length, 0);
+});
