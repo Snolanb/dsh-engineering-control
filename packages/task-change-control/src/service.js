@@ -1667,15 +1667,20 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
      * @param {{ authenticatedSessionId?: string, actor?: string }} [runtimeContext]
      * @returns {Promise<{ ok: boolean, taskId: string, changeId: string, sessionId: string, reused: boolean }>}
      */
-    startGovernedPlanning(taskId, runtimeContext = {}) {
+    startGovernedPlanning(taskId, runtimeContext) {
       return (async () => {
         const t = requireTask();
         const c = requireChange();
         requireTaskId(taskId);
+        // A null/undefined runtime context must fail closed with a typed
+        // identity error BEFORE any store lookup. Coerce null to {} so the
+        // `authenticatedSessionId` read below is a plain property access that
+        // yields '', tripping the typed guard, instead of a raw TypeError.
+        const context = runtimeContext || {};
         // Identity is checked BEFORE any store lookup so a missing
         // authenticated session fails without touching task/change state.
-        const sessionId = typeof runtimeContext.authenticatedSessionId === 'string'
-          ? runtimeContext.authenticatedSessionId.trim()
+        const sessionId = typeof context.authenticatedSessionId === 'string'
+          ? context.authenticatedSessionId.trim()
           : '';
         if (sessionId === '') {
           throw Object.assign(
@@ -1683,8 +1688,8 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
             { code: 'AUTHENTICATED_SESSION_REQUIRED' },
           );
         }
-        const actor = typeof runtimeContext.actor === 'string' && runtimeContext.actor.trim() !== ''
-          ? runtimeContext.actor
+        const actor = typeof context.actor === 'string' && context.actor.trim() !== ''
+          ? context.actor
           : 'controller';
         const task = await Promise.resolve(t.get(taskId));
         if (!task) throw Object.assign(new Error(`task not found: ${taskId}`), { code: 'TASK_NOT_FOUND' });
@@ -1695,23 +1700,54 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
             { code: 'TASK_NOT_LINKED', taskId },
           );
         }
-        // A NULL binding is the only no-binding path: the session has no
-        // existing role on this Change. A getBinding EXCEPTION (storage or
-        // authorization failure) must fail closed — treating it as "no
-        // binding" would silently fall through to a fresh bindRole, letting
-        // an unauthorized or unreadable state masquerade as a clean bind.
-        let binding = null;
-        try {
-          binding = await c.getBinding(change.id, sessionId);
-        } catch (error) {
-          const code = error && typeof error === 'object' && typeof error.code === 'string'
-            ? error.code
-            : 'BINDING_LOOKUP_FAILED';
-          throw Object.assign(
-            new Error(error instanceof Error ? error.message : String(error)),
-            { code, taskId, changeId: change.id, cause: error },
-          );
-        }
+        // An audit append after a durable planner binding is the ONLY remaining
+        // action that can fail on a successful bind. Wrap it: the binding is
+        // persisted (retry is safe/idempotent) but startup did not fully
+        // record, so report a typed, recoverable partial — never a raw audit
+        // error and never a false success.
+        const recordPlanningAudit = async (action) => {
+          try {
+            await c.appendAudit({
+              kind: 'governed_planning',
+              changeId: change.id,
+              sessionId,
+              actor,
+              action,
+            });
+          } catch (error) {
+            throw Object.assign(
+              new Error(`governed planning startup: ${action} audit failed after planner binding persisted`),
+              {
+                code: 'PLANNING_STARTUP_PARTIAL',
+                recoverable: true,
+                bindingPersisted: true,
+                taskId,
+                changeId: change.id,
+                sessionId,
+                cause: error,
+              },
+            );
+          }
+        };
+        const readBinding = async () => {
+          // A NULL binding is the only no-binding path: the session has no
+          // existing role on this Change. A getBinding EXCEPTION (storage or
+          // authorization failure) must fail closed — treating it as "no
+          // binding" would silently fall through to a fresh bindRole, letting
+          // an unauthorized or unreadable state masquerade as a clean bind.
+          try {
+            return await c.getBinding(change.id, sessionId);
+          } catch (error) {
+            const code = error && typeof error === 'object' && typeof error.code === 'string'
+              ? error.code
+              : 'BINDING_LOOKUP_FAILED';
+            throw Object.assign(
+              new Error(error instanceof Error ? error.message : String(error)),
+              { code, taskId, changeId: change.id, cause: error },
+            );
+          }
+        };
+        let binding = await readBinding();
         if (binding) {
           if (binding.role !== 'planner') {
             throw Object.assign(
@@ -1719,18 +1755,41 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
               { code: 'PLANNER_BINDING_CONFLICT', taskId, changeId: change.id },
             );
           }
-          await c.appendAudit({
-            kind: 'governed_planning',
-            changeId: change.id,
-            sessionId,
-            actor,
-            action: 'planner_binding_reused',
-          });
+          await recordPlanningAudit('planner_binding_reused');
           return { ok: true, taskId, changeId: change.id, sessionId, reused: true };
         }
         try {
           await c.bindRole(change.id, sessionId, 'planner', { actor });
         } catch (error) {
+          // Concurrent duplicate startup: a second host already bound this
+          // exact session as planner while we were in flight. ALREADY_BOUND
+          // is NOT a failure — re-read the authoritative binding; if the
+          // winner is a planner, converge to a successful idempotent
+          // (reused) startup. Any other role or a missing winner still
+          // fails closed. A single re-read is sufficient; a non-planner
+          // result below re-throws, so this never loops.
+          const isAlreadyBound = error && typeof error === 'object'
+            && typeof error.code === 'string' && error.code === 'ALREADY_BOUND';
+          if (isAlreadyBound) {
+            binding = await readBinding();
+            if (binding && binding.role === 'planner') {
+              await recordPlanningAudit('planner_binding_reused');
+              return { ok: true, taskId, changeId: change.id, sessionId, reused: true };
+            }
+            if (binding && binding.role !== 'planner') {
+              throw Object.assign(
+                new Error(`session ${sessionId} is bound as ${binding.role}, not planner, for Change ${change.id}`),
+                { code: 'PLANNER_BINDING_CONFLICT', taskId, changeId: change.id, cause: error },
+              );
+            }
+            // Winner not yet visible: keep the authoritative ALREADY_BOUND
+            // machine-readable code and fail closed (no overwrite, no
+            // downstream planning/approval/dispatch).
+            throw Object.assign(
+              new Error(error instanceof Error ? error.message : String(error)),
+              { code: 'ALREADY_BOUND', taskId, changeId: change.id, cause: error },
+            );
+          }
           const code = error && typeof error === 'object' && typeof error.code === 'string'
             ? error.code
             : 'BIND_FAILED';
@@ -1739,13 +1798,7 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
             { code, taskId, changeId: change.id, cause: error },
           );
         }
-        await c.appendAudit({
-          kind: 'governed_planning',
-          changeId: change.id,
-          sessionId,
-          actor,
-          action: 'planner_bound',
-        });
+        await recordPlanningAudit('planner_bound');
         return { ok: true, taskId, changeId: change.id, sessionId, reused: false };
       })();
     },
