@@ -36,15 +36,11 @@ async function compose(t, { withIntegration = true } = {}) {
   return { ctx, taskStore };
 }
 
-test('integration active: the added model-facing surface is exactly the two tools', async (t) => {
+test('integration active: the model-facing Change surface is exactly seven narrow tools', async (t) => {
   const { ctx } = await compose(t);
-  const names = toolNames(ctx);
-  const delta = names.filter(
-    (n) => !CHANGE_TOOLS.includes(n) && !n.startsWith('run_code') && !n.startsWith('read ') && !n.startsWith('write ') && !n.startsWith('exec')
-  );
-  for (const n of INTEGRATION_TOOLS) assert.ok(delta.includes(n), `missing ${n}`);
-  const extra = delta.filter((n) => !INTEGRATION_TOOLS.includes(n) && n.startsWith('change_'));
-  assert.deepEqual(extra, [], `unexpected tools: ${extra.join(', ')}`);
+  const changeTools = toolNames(ctx).filter((name) => name.startsWith('change_'));
+  assert.deepEqual(changeTools, [...CHANGE_TOOLS, ...INTEGRATION_TOOLS].sort());
+  assert.equal(changeTools.length, 7);
 });
 
 test('integration absent: neither integration tool exists', async (t) => {
