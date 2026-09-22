@@ -23,8 +23,10 @@
  * Eligibility requires: task `status === 'ready'`, `ready_to_run === true`,
  * no active worker claim/execution (`claimed_by === null`,
  * `claimed_at === null`, `lease_expires_at === null`), canonical nonterminal
- * linkage (`change.workItem.system === 'dsh-task-orchestrator'` and
- * `change.id` is a nonblank string), Change `state === 'READY'`, a current
+ * linkage (`change.workItem` present, `change.workItem.system === 'dsh-task-orchestrator'`,
+ * `change.workItem.id === taskId`, and `change.id` is a nonblank string) —
+ * missing workItem, wrong system, wrong id, or blank Change ID fail closed,
+ * Change `state === 'READY'`, a current
  * accepted plan (`acceptedPlan` object with a nonblank `id`), and a
  * resolvable nonblank string `worker_profile` from the fresh task.
  *
@@ -51,7 +53,7 @@ const WORK_ITEM_SYSTEM = 'dsh-task-orchestrator';
  * @property {string} [id]
  * @property {string} [state]
  * @property {{ id?: string }} [acceptedPlan]
- * @property {{ system?: string, id?: string }} [workItem]
+ * @property {{ system?: string, id?: string }} workItem
  */
 
 /**
@@ -186,9 +188,19 @@ export function createR2HandoffProducer({ taskOrchestrator: orch, changeControl:
       change = /** @type {R2Change | null} */ (await Promise.resolve(cc.findByWorkItem(WORK_ITEM_SYSTEM, taskId)));
     } catch { change = null; }
     if (!change || typeof change !== 'object') return { emitted: 0, taskId, reason: 'MISSING_LINKAGE' };
-    // Validate canonical linkage: workItem must carry the correct system and id.
-    if (change.workItem && change.workItem.system !== WORK_ITEM_SYSTEM) {
+    // Enforce the exact canonical task-to-Change linkage: the returned Change
+    // must carry a present workItem object whose system is the canonical
+    // orchestrator system AND whose id equals the candidate taskId. Missing,
+    // malformed, wrong-system, or wrong-id linkage fails closed.
+    const wi = change.workItem;
+    if (!wi || typeof wi !== 'object') {
+      return { emitted: 0, taskId, reason: 'MALFORMED_LINKAGE' };
+    }
+    if (wi.system !== WORK_ITEM_SYSTEM) {
       return { emitted: 0, taskId, reason: 'LINKAGE_SYSTEM_MISMATCH' };
+    }
+    if (wi.id !== taskId) {
+      return { emitted: 0, taskId, reason: 'LINKAGE_TASK_MISMATCH' };
     }
     const changeId = typeof change.id === 'string' ? change.id.trim() : '';
     if (changeId === '') return { emitted: 0, taskId, reason: 'MALFORMED_CHANGE_ID' };

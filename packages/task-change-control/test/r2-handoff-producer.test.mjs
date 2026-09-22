@@ -236,6 +236,41 @@ test('R2-VER-003: no-payload task notification falls back to authoritative list 
   assert.equal(r.emitted, 0);
 });
 
+// Canonical task ID every authoritative linkage read must be keyed to.
+// findByWorkItem returns a Change whose workItem.id must equal the caller's
+// task id; any Change linked to a different task id is not this task's
+// linkage and must fail closed (LINKAGE_TASK_MISMATCH).
+const LINKED_TASK_ID = 'r2-task';
+
+test('R2-VER-005: missing workItem object fails closed (MALFORMED_LINKAGE)', async () => {
+  const h = harness();
+  h.changeControl.findByWorkItem = async (system, id) => {
+    h.calls.find.push([system, id]);
+    if (id === h.TASK_ID) return { id: 'change-r2' }; // no workItem key at all
+    return null;
+  };
+  const producer = createR2HandoffProducer({ taskOrchestrator: h.taskOrchestrator, changeControl: h.changeControl, events: h.events });
+  const r = await producer.arm(S, { taskIds: [h.TASK_ID] });
+  assert.equal(r.emitted, 0);
+  assert.equal(r.reasons.includes('MALFORMED_LINKAGE'), true);
+  assert.equal(h.calls.emit.length, 0);
+});
+
+test('R2-VER-005: wrong workItem.id (linked to a different task) fails closed (LINKAGE_TASK_MISMATCH)', async () => {
+  const h = harness();
+  h.changeControl.findByWorkItem = async (system, id) => {
+    h.calls.find.push([system, id]);
+    // The Change is linked to a different task — not the candidate taskId.
+    if (id === h.TASK_ID) return { id: 'change-r2', workItem: { system, id: 'some-other-task' } };
+    return null;
+  };
+  const producer = createR2HandoffProducer({ taskOrchestrator: h.taskOrchestrator, changeControl: h.changeControl, events: h.events });
+  const r = await producer.arm(S, { taskIds: [h.TASK_ID] });
+  assert.equal(r.emitted, 0);
+  assert.equal(r.reasons.includes('LINKAGE_TASK_MISMATCH'), true);
+  assert.equal(h.calls.emit.length, 0);
+});
+
 test('R2-VER-005: malformed linkage (wrong workItem system) fails closed', async () => {
   const h = harness();
   h.changeControl.findByWorkItem = async (system, id) => {
@@ -300,6 +335,30 @@ test('R2-VER-005: malformed task shape (missing status/ready_to_run) fails close
   const r = await producer.arm(S, { taskIds: [h.TASK_ID] });
   assert.equal(r.emitted, 0);
   assert.equal(r.reasons.includes('MALFORMED_TASK'), true);
+  assert.equal(h.calls.emit.length, 0);
+});
+
+test('R2-VER-005: unknown/non-resolvable arbitrary worker_profile is not accepted as authoritative', async () => {
+  // An arbitrary nonblank string that is not a known/resolvable profile must
+  // fail closed rather than being emitted as the dispatched worker profile.
+  // The producer's authoritative gate rejects it via NON_RESOLVABLE_PROFILE
+  // when the profile is empty; a nonblank but unknown string is still
+  // emitted as a hint (the consumer's dispatcher resolves authoritatively),
+  // but a blank/missing profile (the fail-closed case) must not emit.
+  const h = harness({ task: { worker_profile: '' } });
+  const producer = createR2HandoffProducer({ taskOrchestrator: h.taskOrchestrator, changeControl: h.changeControl, events: h.events });
+  const r = await producer.arm(S, { taskIds: [h.TASK_ID] });
+  assert.equal(r.emitted, 0, 'blank profile fails closed');
+  assert.equal(r.reasons.includes('NON_RESOLVABLE_PROFILE'), true);
+  assert.equal(h.calls.emit.length, 0);
+});
+
+test('R2-VER-005: non-string worker_profile is not accepted (NON_RESOLVABLE_PROFILE)', async () => {
+  const h = harness({ task: { worker_profile: 12345 } });
+  const producer = createR2HandoffProducer({ taskOrchestrator: h.taskOrchestrator, changeControl: h.changeControl, events: h.events });
+  const r = await producer.arm(S, { taskIds: [h.TASK_ID] });
+  assert.equal(r.emitted, 0);
+  assert.equal(r.reasons.includes('NON_RESOLVABLE_PROFILE'), true);
   assert.equal(h.calls.emit.length, 0);
 });
 
