@@ -1870,17 +1870,14 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
             { code: 'CONTROLLER_CLAIM_CONFLICT', taskId, claimedBy: currentOwner, authenticatedSessionId: S },
           );
         }
-        // Matching ownership (currentOwner === S) is an idempotent no-op claim.
-        // No claim, no mutation, no planning startup — just converge.
-        // (The claim boundary is already satisfied; the planner binding is
-        // authoritative and idempotent on its own side.)
+        // Matching ownership (currentOwner === S) is an idempotent no-op
+        // claim — no re-claim, no mutation; planning startup converges.
         void payload; // payload is explicitly ignored for ownership (spoofable).
         // Claim the task under S through the public Task Orchestrator API.
         // When currentOwner is null this performs the claim; when it equals S
-        // the claim is a matching-ownership no-op (idempotent).
+        // the claim is already satisfied (idempotent matching ownership).
         if (currentOwner === null) {
-          const claimOptions = typeof t.claim === 'function' ? {} : undefined;
-          await Promise.resolve(t.claim(taskId, S, claimOptions));
+          await Promise.resolve(t.claim(taskId, S));
         }
         // Same-principal governed planning: pass EXACTLY S (never the
         // model-supplied sessionId/worker/captain) to the planner startup.
