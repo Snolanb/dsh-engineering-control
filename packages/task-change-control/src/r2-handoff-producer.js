@@ -30,8 +30,9 @@
  * accepted plan (`acceptedPlan` object with a nonblank `id`), and a
  * resolvable nonblank string `worker_profile` from the fresh task,
  * confirmed by `orch.resolveWorkerSpec` (authoritative public registry
- * resolution — unknown, disabled, or resolver-error profiles fail closed;
- * the resolver must be available for any emission to occur).
+ * resolution — unknown, disabled, name-mismatched, or model-mismatched
+ * profiles fail closed; the resolver must be available for any emission to
+ * occur; the resolved name is the only profile value emitted).
  *
  * The producer never calls Task Orchestrator `release`, the dispatcher, or
  * `handoffGovernedDispatch` directly. It emits one event and stops.
@@ -78,7 +79,7 @@ const WORK_ITEM_SYSTEM = 'dsh-task-orchestrator';
  * @property {(id: string) => R2Task | Promise<R2Task> | null} get
  * @property {() => Array<{ id: string }> | Promise<Array<{ id: string }>>} list
  * @property {(listener: (event: { taskId?: string }) => void) => (() => void) | Promise<() => void> | void} [subscribe]
- * @property {(profile: string, workerModel?: string) => { enabled?: boolean, name?: string, [k: string]: unknown } | Promise<{ enabled?: boolean, name?: string, [k: string]: unknown }>} [resolveWorkerSpec]
+ * @property {(profile: string, workerModel?: string) => { enabled?: boolean, name?: string, model?: { provider?: string, model?: string, reasoningEffort?: string } | null, [k: string]: unknown } | Promise<{ enabled?: boolean, name?: string, model?: { provider?: string, model?: string, reasoningEffort?: string } | null, [k: string]: unknown }>} [resolveWorkerSpec]
  */
 
 /**
@@ -189,25 +190,55 @@ export function createR2HandoffProducer({ taskOrchestrator: orch, changeControl:
     const rawProfile = t.worker_profile;
     const profile = typeof rawProfile === 'string' ? rawProfile.trim() : '';
     if (profile === '') return { emitted: 0, taskId, reason: 'NON_RESOLVABLE_PROFILE' };
-    if (typeof orch.resolveWorkerSpec === 'function') {
-      /** @type {unknown} */
-      let resolvedSpec;
-      try {
-        resolvedSpec = await Promise.resolve(orch.resolveWorkerSpec(profile, t.worker_model));
-      } catch {
-        return { emitted: 0, taskId, reason: 'NON_RESOLVABLE_PROFILE' };
-      }
-      if (
-        !resolvedSpec
-        || typeof resolvedSpec !== 'object'
-        || /** @type {{ enabled?: boolean }} */ (resolvedSpec).enabled === false
-      ) {
-        return { emitted: 0, taskId, reason: 'NON_RESOLVABLE_PROFILE' };
-      }
-    } else {
+    if (typeof orch.resolveWorkerSpec !== 'function') {
       // No public resolver available: fail closed — an arbitrary string must
       // not be emitted when the registry cannot authoritatively confirm it.
       return { emitted: 0, taskId, reason: 'NON_RESOLVABLE_PROFILE' };
+    }
+    /** @type {unknown} */
+    let resolvedSpec;
+    try {
+      resolvedSpec = await Promise.resolve(orch.resolveWorkerSpec(profile, t.worker_model));
+    } catch {
+      return { emitted: 0, taskId, reason: 'NON_RESOLVABLE_PROFILE' };
+    }
+    // R2-VER-007: the resolved spec must be an object that is enabled, whose
+    // name exactly equals the requested fresh worker_profile (no alias
+    // substitution), and whose exposed model matches every explicitly requested
+    // worker_model field after the repository's provider/model normalization.
+    const spec = /** @type {{ name?: unknown, enabled?: unknown, model?: { provider?: unknown, model?: unknown } | null } | null} */ (
+      resolvedSpec && typeof resolvedSpec === 'object' ? resolvedSpec : null
+    );
+    if (
+      !spec
+      || spec.enabled === false
+      || spec.name !== profile
+    ) {
+      return { emitted: 0, taskId, reason: 'NON_RESOLVABLE_PROFILE' };
+    }
+    // Verify the resolved model matches the explicitly requested worker_model.
+    // The task's worker_model is an optional string that may encode a
+    // "provider/model" pair (slash < 1 means bare model name).
+    // A mismatch in provider or model means the resolver substituted a
+    // different model — fail closed.
+    if (typeof t.worker_model === 'string' && t.worker_model.trim() !== '') {
+      const requested = t.worker_model;
+      const rm = /** @type {{ provider?: unknown, model?: unknown } | null | undefined} */ (
+        spec.model && typeof spec.model === 'object' ? spec.model : null
+      );
+      if (!rm) {
+        // Task requested a model but the resolved spec has no model: fail closed.
+        return { emitted: 0, taskId, reason: 'NON_RESOLVABLE_PROFILE' };
+      }
+      const slash = requested.indexOf('/');
+      const reqProvider = slash < 1 ? undefined : requested.slice(0, slash);
+      const reqModel = slash < 1 ? requested : requested.slice(slash + 1);
+      if (
+        (reqProvider !== undefined && rm.provider !== reqProvider)
+        || rm.model !== reqModel
+      ) {
+        return { emitted: 0, taskId, reason: 'NON_RESOLVABLE_PROFILE' };
+      }
     }
     // Canonical nonterminal linkage: one Change per task, with a valid system/id.
     let change = /** @type {R2Change | null} */ (null);

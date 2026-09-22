@@ -42,7 +42,17 @@ function harness({ task = {}, linked = true, changeStatus = null, resolveWorkerS
     resolveWorkerSpec(profile, workerModel) {
       calls.resolveWorkerSpec.push([profile, workerModel]);
       if (resolveWorkerSpec) return resolveWorkerSpec(profile, workerModel, current);
-      if (profile === 'worker') return { name: 'worker', enabled: true, mode: 'session' };
+      if (profile === 'worker') {
+        // Mirror normalizeModelSelection: worker_model is an optional string
+        // that may encode "provider/model" or a bare model name.
+        const model = {};
+        if (typeof workerModel === 'string' && workerModel.trim() !== '') {
+          const slash = workerModel.indexOf('/');
+          if (slash < 1) model.model = workerModel;
+          else { model.provider = workerModel.slice(0, slash); model.model = workerModel.slice(slash + 1); }
+        }
+        return { name: 'worker', enabled: true, mode: 'session', model };
+      }
       throw new Error('unknown worker profile: ' + profile);
     },
   };
@@ -410,6 +420,65 @@ test('R2-VER-006: known resolver-confirmed profile emits through the consumer se
   assert.equal(r.emitted, 1, 'resolver-confirmed profile emits');
   assert.equal(h.calls.emit.length, 1);
   assert.equal(h.calls.resolveWorkerSpec.length, 1, 'resolver was called once');
+});
+
+test('R2-VER-007: resolver name mismatch (alias substitution) fails closed — NON_RESOLVABLE_PROFILE', async () => {
+  const h = harness({
+    task: { worker_profile: 'worker' },
+    resolveWorkerSpec: () => ({ name: 'other-profile', enabled: true, mode: 'session' }),
+  });
+  const producer = createR2HandoffProducer({ taskOrchestrator: h.taskOrchestrator, changeControl: h.changeControl, events: h.events });
+  const r = await producer.arm(S, { taskIds: [h.TASK_ID] });
+  assert.equal(r.emitted, 0, 'resolver returning a different name fails closed');
+  assert.equal(r.reasons.includes('NON_RESOLVABLE_PROFILE'), true);
+  assert.equal(h.calls.emit.length, 0);
+});
+
+test('R2-VER-007: model mismatch (resolver substitutes provider/model) fails closed — NON_RESOLVABLE_PROFILE', async () => {
+  const h = harness({
+    task: { worker_profile: 'worker', worker_model: 'openai/gpt-4' },
+    resolveWorkerSpec: () => ({ name: 'worker', enabled: true, mode: 'session', model: { provider: 'anthropic', model: 'claude-3' } }),
+  });
+  const producer = createR2HandoffProducer({ taskOrchestrator: h.taskOrchestrator, changeControl: h.changeControl, events: h.events });
+  const r = await producer.arm(S, { taskIds: [h.TASK_ID] });
+  assert.equal(r.emitted, 0, 'resolver substituting a different provider/model fails closed');
+  assert.equal(r.reasons.includes('NON_RESOLVABLE_PROFILE'), true);
+  assert.equal(h.calls.emit.length, 0);
+});
+
+test('R2-VER-007: bare model name mismatch fails closed — NON_RESOLVABLE_PROFILE', async () => {
+  const h = harness({
+    task: { worker_profile: 'worker', worker_model: 'gpt-4' },
+    resolveWorkerSpec: () => ({ name: 'worker', enabled: true, mode: 'session', model: { model: 'gpt-3.5' } }),
+  });
+  const producer = createR2HandoffProducer({ taskOrchestrator: h.taskOrchestrator, changeControl: h.changeControl, events: h.events });
+  const r = await producer.arm(S, { taskIds: [h.TASK_ID] });
+  assert.equal(r.emitted, 0, 'bare model mismatch fails closed');
+  assert.equal(r.reasons.includes('NON_RESOLVABLE_PROFILE'), true);
+});
+
+test('R2-VER-007: task requested model but resolver returns no model fails closed — NON_RESOLVABLE_PROFILE', async () => {
+  const h = harness({
+    task: { worker_profile: 'worker', worker_model: 'openai/gpt-4' },
+    resolveWorkerSpec: () => ({ name: 'worker', enabled: true, mode: 'session' }),
+  });
+  const producer = createR2HandoffProducer({ taskOrchestrator: h.taskOrchestrator, changeControl: h.changeControl, events: h.events });
+  const r = await producer.arm(S, { taskIds: [h.TASK_ID] });
+  assert.equal(r.emitted, 0, 'missing model field fails closed when task requested a model');
+  assert.equal(r.reasons.includes('NON_RESOLVABLE_PROFILE'), true);
+});
+
+test('R2-VER-007: valid known profile + matching model emits through the consumer seam', async () => {
+  const h = harness({
+    task: { worker_profile: 'worker', worker_model: 'openai/gpt-4' },
+    resolveWorkerSpec: () => ({ name: 'worker', enabled: true, mode: 'session', model: { provider: 'openai', model: 'gpt-4' } }),
+  });
+  const producer = createR2HandoffProducer({ taskOrchestrator: h.taskOrchestrator, changeControl: h.changeControl, events: h.events });
+  const r = await producer.arm(S, { taskIds: [h.TASK_ID] });
+  assert.equal(r.emitted, 1, 'valid profile + matching model emits');
+  assert.equal(h.calls.emit.length, 1);
+  const [, payload] = h.calls.emit[0];
+  assert.equal(payload.runtimeContext.workerProfile, 'worker', 'emitted workerProfile is the authoritative resolved name');
 });
 
 test('R2-VER-005: non-string worker_profile is not accepted (NON_RESOLVABLE_PROFILE)', async () => {
