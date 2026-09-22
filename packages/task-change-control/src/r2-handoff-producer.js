@@ -115,14 +115,21 @@ const WORK_ITEM_SYSTEM = 'dsh-task-orchestrator';
  * semantics from WorkerSpecRegistry.normalizeModelSelection:
  *  - string "provider/model" → { provider, model } (both trimmed)
  *  - string "model" (no slash) → { model }
- *  - object → fields trimmed (provider/model/reasoningEffort)
+ *  - object → provider/model fields must be non-nullish strings (null rejected);
+ *    reasoningEffort (camelCase) ?? reasoning_effort (snake_case) with nullish
+ *    precedence; all fields trimmed
  *  - arrays, non-string/non-object types, and empty-after-trim fields
  *    are rejected (throw → fail closed).
  * @param {unknown} value
  * @returns {Record<string, string>}
  */
 function normalizeRequestedModel(value) {
-  if (value === undefined || value === null) return {};
+  if (value === undefined) return {};
+  if (value === null) {
+    // Explicit null for the whole worker_model is invalid under repository
+    // semantics (string(null) → required → throws).
+    throw new Error('worker_model must not be null');
+  }
   if (Array.isArray(value)) {
     throw new Error('worker_model must not be an array');
   }
@@ -146,9 +153,14 @@ function normalizeRequestedModel(value) {
   } else if (typeof value === 'object') {
     out = {};
     const src = /** @type {Record<string, unknown>} */ (value);
-    for (const key of ['provider', 'model', 'reasoningEffort']) {
+    // Provider and model: explicit null is rejected (repository string()
+    // treats null as "required" → throws); undefined is absent (skipped).
+    for (const key of ['provider', 'model']) {
       const raw = src[key];
-      if (raw === undefined || raw === null) continue;
+      if (raw === undefined) continue;
+      if (raw === null) {
+        throw new Error('worker_model.' + key + ' must not be null');
+      }
       if (typeof raw !== 'string') {
         throw new Error('worker_model.' + key + ' must be a string');
       }
@@ -157,6 +169,21 @@ function normalizeRequestedModel(value) {
         throw new Error('worker_model.' + key + ' is empty after normalization');
       }
       out[key] = trimmed;
+    }
+    // ReasoningEffort: camelCase wins, snake_case is the alias fallback
+    // (nullish precedence: reasoningEffort ?? reasoning_effort).
+    // Repository semantics: reasoningEffort is optional — an explicit null
+    // is treated as absent (skipped), not an error.
+    const rawEffort = src.reasoningEffort ?? src.reasoning_effort;
+    if (rawEffort !== undefined && rawEffort !== null) {
+      if (typeof rawEffort !== 'string') {
+        throw new Error('worker_model.reasoningEffort must be a string');
+      }
+      const trimmed = rawEffort.trim();
+      if (trimmed === '') {
+        throw new Error('worker_model.reasoningEffort is empty after normalization');
+      }
+      out.reasoningEffort = trimmed;
     }
   } else {
     throw new Error('worker_model must be a string or object, got ' + typeof value);

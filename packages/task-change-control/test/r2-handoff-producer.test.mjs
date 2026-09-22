@@ -607,6 +607,95 @@ test('R2-VER-008: reasoningEffort match emits', async () => {
   assert.equal(r.emitted, 1, 'reasoningEffort match emits');
 });
 
+test('R2-VER-009: reasoning_effort alias match emits through resolver comparison', async () => {
+  // The request uses the snake_case alias; the resolver returns canonical
+  // camelCase reasoningEffort. Normalization maps the alias to camelCase,
+  // so the match succeeds.
+  const h = harness({
+    task: { worker_profile: 'worker', worker_model: { provider: 'openai', model: 'gpt-4', reasoning_effort: 'high' } },
+    resolveWorkerSpec: () => ({ name: 'worker', enabled: true, mode: 'session', model: { provider: 'openai', model: 'gpt-4', reasoningEffort: 'high' } }),
+  });
+  const producer = createR2HandoffProducer({ taskOrchestrator: h.taskOrchestrator, changeControl: h.changeControl, events: h.events });
+  const r = await producer.arm(S, { taskIds: [h.TASK_ID] });
+  assert.equal(r.emitted, 1, 'reasoning_effort alias matches canonical resolver output');
+  assert.equal(h.calls.emit.length, 1);
+});
+
+test('R2-VER-009: reasoning_effort alias mismatch fails closed', async () => {
+  const h = harness({
+    task: { worker_profile: 'worker', worker_model: { provider: 'openai', model: 'gpt-4', reasoning_effort: 'high' } },
+    resolveWorkerSpec: () => ({ name: 'worker', enabled: true, mode: 'session', model: { provider: 'openai', model: 'gpt-4', reasoningEffort: 'low' } }),
+  });
+  const producer = createR2HandoffProducer({ taskOrchestrator: h.taskOrchestrator, changeControl: h.changeControl, events: h.events });
+  const r = await producer.arm(S, { taskIds: [h.TASK_ID] });
+  assert.equal(r.emitted, 0, 'reasoning_effort alias mismatch fails closed');
+  assert.equal(r.reasons.includes('NON_RESOLVABLE_PROFILE'), true);
+  assert.equal(h.calls.emit.length, 0);
+});
+
+test('R2-VER-009: camelCase reasoningEffort wins over snake_case alias (nullish precedence)', async () => {
+  // reasoningEffort ?? reasoning_effort: the camelCase field is present and
+  // is the authoritative value; the alias is ignored.
+  const h = harness({
+    task: { worker_profile: 'worker', worker_model: { provider: 'openai', model: 'gpt-4', reasoningEffort: 'high', reasoning_effort: 'low' } },
+    resolveWorkerSpec: () => ({ name: 'worker', enabled: true, mode: 'session', model: { provider: 'openai', model: 'gpt-4', reasoningEffort: 'high' } }),
+  });
+  const producer = createR2HandoffProducer({ taskOrchestrator: h.taskOrchestrator, changeControl: h.changeControl, events: h.events });
+  const r = await producer.arm(S, { taskIds: [h.TASK_ID] });
+  assert.equal(r.emitted, 1, 'camelCase reasoningEffort takes precedence over alias');
+});
+
+test('R2-VER-009: explicit null provider field fails closed', async () => {
+  // Repository semantics: string(null) with a required field throws. An
+  // explicit null provider/model is invalid, not silently skipped.
+  const h = harness({
+    task: { worker_profile: 'worker', worker_model: { provider: null, model: 'gpt-4' } },
+    resolveWorkerSpec: () => ({ name: 'worker', enabled: true, mode: 'session', model: { model: 'gpt-4' } }),
+  });
+  const producer = createR2HandoffProducer({ taskOrchestrator: h.taskOrchestrator, changeControl: h.changeControl, events: h.events });
+  const r = await producer.arm(S, { taskIds: [h.TASK_ID] });
+  assert.equal(r.emitted, 0, 'explicit null provider fails closed');
+  assert.equal(r.reasons.includes('NON_RESOLVABLE_PROFILE'), true);
+  assert.equal(h.calls.emit.length, 0);
+});
+
+test('R2-VER-009: explicit null model field fails closed', async () => {
+  const h = harness({
+    task: { worker_profile: 'worker', worker_model: { provider: 'openai', model: null } },
+    resolveWorkerSpec: () => ({ name: 'worker', enabled: true, mode: 'session', model: { provider: 'openai' } }),
+  });
+  const producer = createR2HandoffProducer({ taskOrchestrator: h.taskOrchestrator, changeControl: h.changeControl, events: h.events });
+  const r = await producer.arm(S, { taskIds: [h.TASK_ID] });
+  assert.equal(r.emitted, 0, 'explicit null model fails closed');
+  assert.equal(r.reasons.includes('NON_RESOLVABLE_PROFILE'), true);
+  assert.equal(h.calls.emit.length, 0);
+});
+
+test('R2-VER-009: explicit null reasoningEffort is treated as absent (optional field)', async () => {
+  // Repository semantics: reasoningEffort is optional — string(null) with
+  // optional:true returns undefined (skipped), so an explicit null is
+  // equivalent to absent. No requested fields remain to compare.
+  const h = harness({
+    task: { worker_profile: 'worker', worker_model: { provider: 'openai', model: 'gpt-4', reasoningEffort: null } },
+    resolveWorkerSpec: () => ({ name: 'worker', enabled: true, mode: 'session', model: { provider: 'openai', model: 'gpt-4' } }),
+  });
+  const producer = createR2HandoffProducer({ taskOrchestrator: h.taskOrchestrator, changeControl: h.changeControl, events: h.events });
+  const r = await producer.arm(S, { taskIds: [h.TASK_ID] });
+  assert.equal(r.emitted, 1, 'explicit null reasoningEffort is skipped as absent, no fields to compare');
+});
+
+test('R2-VER-009: explicit null worker_model value fails closed', async () => {
+  const h = harness({
+    task: { worker_profile: 'worker', worker_model: null },
+    resolveWorkerSpec: () => ({ name: 'worker', enabled: true, mode: 'session', model: { provider: 'openai', model: 'gpt-4' } }),
+  });
+  const producer = createR2HandoffProducer({ taskOrchestrator: h.taskOrchestrator, changeControl: h.changeControl, events: h.events });
+  const r = await producer.arm(S, { taskIds: [h.TASK_ID] });
+  assert.equal(r.emitted, 0, 'explicit null worker_model fails closed');
+  assert.equal(r.reasons.includes('NON_RESOLVABLE_PROFILE'), true);
+  assert.equal(h.calls.emit.length, 0);
+});
+
 test('R2-VER-005: non-string worker_profile is not accepted (NON_RESOLVABLE_PROFILE)', async () => {
   const h = harness({ task: { worker_profile: 12345 } });
   const producer = createR2HandoffProducer({ taskOrchestrator: h.taskOrchestrator, changeControl: h.changeControl, events: h.events });
