@@ -50,7 +50,7 @@ const WORK_ITEM_SYSTEM = 'dsh-task-orchestrator';
  * @property {number | string | null} [claimed_at]
  * @property {number | string | null} [lease_expires_at]
  * @property {string} [worker_profile]
- * @property {string} [worker_model]
+ * @property {string | { provider?: string, model?: string, reasoningEffort?: string }} [worker_model]
  */
 
 /**
@@ -79,7 +79,7 @@ const WORK_ITEM_SYSTEM = 'dsh-task-orchestrator';
  * @property {(id: string) => R2Task | Promise<R2Task> | null} get
  * @property {() => Array<{ id: string }> | Promise<Array<{ id: string }>>} list
  * @property {(listener: (event: { taskId?: string }) => void) => (() => void) | Promise<() => void> | void} [subscribe]
- * @property {(profile: string, workerModel?: string) => { enabled?: boolean, name?: string, model?: { provider?: string, model?: string, reasoningEffort?: string } | null, [k: string]: unknown } | Promise<{ enabled?: boolean, name?: string, model?: { provider?: string, model?: string, reasoningEffort?: string } | null, [k: string]: unknown }>} [resolveWorkerSpec]
+ * @property {(profile: string, workerModel?: string | { provider?: string, model?: string, reasoningEffort?: string }) => { enabled?: boolean, name?: string, model?: { provider?: string, model?: string, reasoningEffort?: string } | null, [k: string]: unknown } | Promise<{ enabled?: boolean, name?: string, model?: { provider?: string, model?: string, reasoningEffort?: string } | null, [k: string]: unknown }>} [resolveWorkerSpec]
  */
 
 /**
@@ -109,6 +109,60 @@ const WORK_ITEM_SYSTEM = 'dsh-task-orchestrator';
  * @property {() => void} restart
  * @property {() => void} dispose
  */
+
+/**
+ * Normalize a requested worker_model value using repository-equivalent
+ * semantics from WorkerSpecRegistry.normalizeModelSelection:
+ *  - string "provider/model" → { provider, model } (both trimmed)
+ *  - string "model" (no slash) → { model }
+ *  - object → fields trimmed (provider/model/reasoningEffort)
+ *  - arrays, non-string/non-object types, and empty-after-trim fields
+ *    are rejected (throw → fail closed).
+ * @param {unknown} value
+ * @returns {Record<string, string>}
+ */
+function normalizeRequestedModel(value) {
+  if (value === undefined || value === null) return {};
+  if (Array.isArray(value)) {
+    throw new Error('worker_model must not be an array');
+  }
+  /** @type {Record<string, string> | null} */
+  let out;
+  if (typeof value === 'string') {
+    const s = value.trim();
+    if (s === '') return {};
+    out = {};
+    const slash = s.indexOf('/');
+    if (slash < 1) {
+      out.model = s;
+    } else {
+      const p = s.slice(0, slash).trim();
+      const m = s.slice(slash + 1).trim();
+      if (p === '') throw new Error('worker_model provider is empty after normalization');
+      if (m === '') throw new Error('worker_model model is empty after normalization');
+      out.provider = p;
+      out.model = m;
+    }
+  } else if (typeof value === 'object') {
+    out = {};
+    const src = /** @type {Record<string, unknown>} */ (value);
+    for (const key of ['provider', 'model', 'reasoningEffort']) {
+      const raw = src[key];
+      if (raw === undefined || raw === null) continue;
+      if (typeof raw !== 'string') {
+        throw new Error('worker_model.' + key + ' must be a string');
+      }
+      const trimmed = raw.trim();
+      if (trimmed === '') {
+        throw new Error('worker_model.' + key + ' is empty after normalization');
+      }
+      out[key] = trimmed;
+    }
+  } else {
+    throw new Error('worker_model must be a string or object, got ' + typeof value);
+  }
+  return out;
+}
 
 /**
  * @param {R2ProducerDeps} deps
@@ -216,28 +270,31 @@ export function createR2HandoffProducer({ taskOrchestrator: orch, changeControl:
     ) {
       return { emitted: 0, taskId, reason: 'NON_RESOLVABLE_PROFILE' };
     }
-    // Verify the resolved model matches the explicitly requested worker_model.
-    // The task's worker_model is an optional string that may encode a
-    // "provider/model" pair (slash < 1 means bare model name).
-    // A mismatch in provider or model means the resolver substituted a
-    // different model — fail closed.
-    if (typeof t.worker_model === 'string' && t.worker_model.trim() !== '') {
-      const requested = t.worker_model;
-      const rm = /** @type {{ provider?: unknown, model?: unknown } | null | undefined} */ (
+    // R2-VER-008: normalize the requested worker_model using the repository's
+    // WorkerSpecRegistry.normalizeModelSelection semantics, then compare every
+    // explicitly requested field against the resolved spec.model.
+    // Malformed requested values (arrays, non-string/non-object types,
+    // empty-after-trim fields) fail closed.
+    /** @type {{ provider?: string, model?: string, reasoningEffort?: string }} */
+    let requestedNorm;
+    try {
+      requestedNorm = normalizeRequestedModel(t.worker_model);
+    } catch {
+      return { emitted: 0, taskId, reason: 'NON_RESOLVABLE_PROFILE' };
+    }
+    const reqKeys = Object.keys(requestedNorm);
+    if (reqKeys.length > 0) {
+      const rm = /** @type {{ provider?: unknown, model?: unknown, reasoningEffort?: unknown } | null} */ (
         spec.model && typeof spec.model === 'object' ? spec.model : null
       );
       if (!rm) {
         // Task requested a model but the resolved spec has no model: fail closed.
         return { emitted: 0, taskId, reason: 'NON_RESOLVABLE_PROFILE' };
       }
-      const slash = requested.indexOf('/');
-      const reqProvider = slash < 1 ? undefined : requested.slice(0, slash);
-      const reqModel = slash < 1 ? requested : requested.slice(slash + 1);
-      if (
-        (reqProvider !== undefined && rm.provider !== reqProvider)
-        || rm.model !== reqModel
-      ) {
-        return { emitted: 0, taskId, reason: 'NON_RESOLVABLE_PROFILE' };
+      for (const key of reqKeys) {
+        if (/** @type {Record<string, unknown>} */ (rm)[key] !== /** @type {Record<string, string>} */ (requestedNorm)[key]) {
+          return { emitted: 0, taskId, reason: 'NON_RESOLVABLE_PROFILE' };
+        }
       }
     }
     // Canonical nonterminal linkage: one Change per task, with a valid system/id.

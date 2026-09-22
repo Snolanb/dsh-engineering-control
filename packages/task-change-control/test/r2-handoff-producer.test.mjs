@@ -481,6 +481,132 @@ test('R2-VER-007: valid known profile + matching model emits through the consume
   assert.equal(payload.runtimeContext.workerProfile, 'worker', 'emitted workerProfile is the authoritative resolved name');
 });
 
+test('R2-VER-008: whitespace-equivalent provider/model string normalizes to match', async () => {
+  // "openai/ gpt-4" with a space after the slash should normalize to
+  // { provider: 'openai', model: 'gpt-4' } and match the resolver output.
+  const h = harness({
+    task: { worker_profile: 'worker', worker_model: 'openai/ gpt-4' },
+    resolveWorkerSpec: () => ({ name: 'worker', enabled: true, mode: 'session', model: { provider: 'openai', model: 'gpt-4' } }),
+  });
+  const producer = createR2HandoffProducer({ taskOrchestrator: h.taskOrchestrator, changeControl: h.changeControl, events: h.events });
+  const r = await producer.arm(S, { taskIds: [h.TASK_ID] });
+  assert.equal(r.emitted, 1, 'whitespace-equivalent model string emits');
+  assert.equal(h.calls.emit.length, 1);
+});
+
+test('R2-VER-008: whitespace in bare model string normalizes to match', async () => {
+  // "  gpt-4  " with surrounding whitespace should normalize to { model: 'gpt-4' }.
+  const h = harness({
+    task: { worker_profile: 'worker', worker_model: '  gpt-4  ' },
+    resolveWorkerSpec: () => ({ name: 'worker', enabled: true, mode: 'session', model: { model: 'gpt-4' } }),
+  });
+  const producer = createR2HandoffProducer({ taskOrchestrator: h.taskOrchestrator, changeControl: h.changeControl, events: h.events });
+  const r = await producer.arm(S, { taskIds: [h.TASK_ID] });
+  assert.equal(r.emitted, 1, 'trimmed bare model string emits');
+});
+
+test('R2-VER-008: whitespace in provider/model fields of object form normalizes to match', async () => {
+  // { provider: ' openai ', model: ' gpt-4 ' } should normalize and match.
+  const h = harness({
+    task: { worker_profile: 'worker', worker_model: { provider: ' openai ', model: ' gpt-4 ' } },
+    resolveWorkerSpec: () => ({ name: 'worker', enabled: true, mode: 'session', model: { provider: 'openai', model: 'gpt-4' } }),
+  });
+  const producer = createR2HandoffProducer({ taskOrchestrator: h.taskOrchestrator, changeControl: h.changeControl, events: h.events });
+  const r = await producer.arm(S, { taskIds: [h.TASK_ID] });
+  assert.equal(r.emitted, 1, 'whitespace in object model fields normalizes to match');
+});
+
+test('R2-VER-008: whitespace normalization mismatch (resolved model not trimmed) fails closed', async () => {
+  // Resolved model has untrimmed values that differ from normalized requested.
+  const h = harness({
+    task: { worker_profile: 'worker', worker_model: 'openai/gpt-4' },
+    resolveWorkerSpec: () => ({ name: 'worker', enabled: true, mode: 'session', model: { provider: ' openai', model: 'gpt-4 ' } }),
+  });
+  const producer = createR2HandoffProducer({ taskOrchestrator: h.taskOrchestrator, changeControl: h.changeControl, events: h.events });
+  const r = await producer.arm(S, { taskIds: [h.TASK_ID] });
+  assert.equal(r.emitted, 0, 'untrimmed resolved model fails closed');
+  assert.equal(r.reasons.includes('NON_RESOLVABLE_PROFILE'), true);
+});
+
+test('R2-VER-008: empty provider after slash fails closed', async () => {
+  // "/gpt-4" has an empty provider — normalization must reject it.
+  const h = harness({
+    task: { worker_profile: 'worker', worker_model: '/gpt-4' },
+    resolveWorkerSpec: () => ({ name: 'worker', enabled: true, mode: 'session', model: { provider: '', model: 'gpt-4' } }),
+  });
+  const producer = createR2HandoffProducer({ taskOrchestrator: h.taskOrchestrator, changeControl: h.changeControl, events: h.events });
+  const r = await producer.arm(S, { taskIds: [h.TASK_ID] });
+  assert.equal(r.emitted, 0, 'empty provider fails closed');
+  assert.equal(r.reasons.includes('NON_RESOLVABLE_PROFILE'), true);
+});
+
+test('R2-VER-008: empty model after slash fails closed', async () => {
+  // "openai/" has an empty model — normalization must reject it.
+  const h = harness({
+    task: { worker_profile: 'worker', worker_model: 'openai/' },
+    resolveWorkerSpec: () => ({ name: 'worker', enabled: true, mode: 'session', model: { provider: 'openai', model: '' } }),
+  });
+  const producer = createR2HandoffProducer({ taskOrchestrator: h.taskOrchestrator, changeControl: h.changeControl, events: h.events });
+  const r = await producer.arm(S, { taskIds: [h.TASK_ID] });
+  assert.equal(r.emitted, 0, 'empty model fails closed');
+  assert.equal(r.reasons.includes('NON_RESOLVABLE_PROFILE'), true);
+});
+
+test('R2-VER-008: array worker_model fails closed (malformed type)', async () => {
+  const h = harness({
+    task: { worker_profile: 'worker', worker_model: ['openai', 'gpt-4'] },
+    resolveWorkerSpec: () => ({ name: 'worker', enabled: true, mode: 'session', model: { provider: 'openai', model: 'gpt-4' } }),
+  });
+  const producer = createR2HandoffProducer({ taskOrchestrator: h.taskOrchestrator, changeControl: h.changeControl, events: h.events });
+  const r = await producer.arm(S, { taskIds: [h.TASK_ID] });
+  assert.equal(r.emitted, 0, 'array worker_model fails closed');
+  assert.equal(r.reasons.includes('NON_RESOLVABLE_PROFILE'), true);
+});
+
+test('R2-VER-008: non-string model field in object worker_model fails closed', async () => {
+  const h = harness({
+    task: { worker_profile: 'worker', worker_model: { provider: 'openai', model: 42 } },
+    resolveWorkerSpec: () => ({ name: 'worker', enabled: true, mode: 'session', model: { provider: 'openai', model: 'gpt-4' } }),
+  });
+  const producer = createR2HandoffProducer({ taskOrchestrator: h.taskOrchestrator, changeControl: h.changeControl, events: h.events });
+  const r = await producer.arm(S, { taskIds: [h.TASK_ID] });
+  assert.equal(r.emitted, 0, 'non-string model field fails closed');
+  assert.equal(r.reasons.includes('NON_RESOLVABLE_PROFILE'), true);
+});
+
+test('R2-VER-008: empty object worker_model is treated as no model request (emits)', async () => {
+  // An empty object {} has no requested fields, so the check passes and
+  // the resolver output is accepted as-is.
+  const h = harness({
+    task: { worker_profile: 'worker', worker_model: {} },
+    resolveWorkerSpec: () => ({ name: 'worker', enabled: true, mode: 'session', model: { provider: 'openai', model: 'gpt-4' } }),
+  });
+  const producer = createR2HandoffProducer({ taskOrchestrator: h.taskOrchestrator, changeControl: h.changeControl, events: h.events });
+  const r = await producer.arm(S, { taskIds: [h.TASK_ID] });
+  assert.equal(r.emitted, 1, 'empty object worker_model passes (no fields to match)');
+});
+
+test('R2-VER-008: reasoningEffort mismatch fails closed', async () => {
+  const h = harness({
+    task: { worker_profile: 'worker', worker_model: { provider: 'openai', model: 'gpt-4', reasoningEffort: 'high' } },
+    resolveWorkerSpec: () => ({ name: 'worker', enabled: true, mode: 'session', model: { provider: 'openai', model: 'gpt-4', reasoningEffort: 'low' } }),
+  });
+  const producer = createR2HandoffProducer({ taskOrchestrator: h.taskOrchestrator, changeControl: h.changeControl, events: h.events });
+  const r = await producer.arm(S, { taskIds: [h.TASK_ID] });
+  assert.equal(r.emitted, 0, 'reasoningEffort mismatch fails closed');
+  assert.equal(r.reasons.includes('NON_RESOLVABLE_PROFILE'), true);
+});
+
+test('R2-VER-008: reasoningEffort match emits', async () => {
+  const h = harness({
+    task: { worker_profile: 'worker', worker_model: { provider: 'openai', model: 'gpt-4', reasoningEffort: 'high' } },
+    resolveWorkerSpec: () => ({ name: 'worker', enabled: true, mode: 'session', model: { provider: 'openai', model: 'gpt-4', reasoningEffort: 'high' } }),
+  });
+  const producer = createR2HandoffProducer({ taskOrchestrator: h.taskOrchestrator, changeControl: h.changeControl, events: h.events });
+  const r = await producer.arm(S, { taskIds: [h.TASK_ID] });
+  assert.equal(r.emitted, 1, 'reasoningEffort match emits');
+});
+
 test('R2-VER-005: non-string worker_profile is not accepted (NON_RESOLVABLE_PROFILE)', async () => {
   const h = harness({ task: { worker_profile: 12345 } });
   const producer = createR2HandoffProducer({ taskOrchestrator: h.taskOrchestrator, changeControl: h.changeControl, events: h.events });
