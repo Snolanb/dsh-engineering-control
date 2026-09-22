@@ -1809,6 +1809,126 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
     },
 
     /**
+     * M1-S3-R1 — session-backed controller claim boundary.
+     *
+     * At the owned trusted DSH execution/controller boundary, derive the
+     * authenticated session S EXCLUSIVELY from exec.agent.id (the host
+     * identity). Model-supplied payload fields — worker, sessionId,
+     * claimed_by, captain — are ordinary spoofable values and are ignored
+     * for ownership: they never become the owner, never release or
+     * overwrite a claim, and are never passed to the planning startup.
+     *
+     * Ownership flows through the public Task Orchestrator API:
+     * taskOrchestrator.claim(taskId, S) makes S the claim owner;
+     * startGovernedPlanning(taskId, { authenticatedSessionId: S }) then
+     * binds the SAME S as 'planner' on the task's linked Change
+     * (same-principal governed planning).
+     *
+     * Fail closed BEFORE mutation when the identity is missing: no task
+     * lookup, no claim, no binding. A task already claimed by S is an
+     * idempotent no-op (matching ownership). A claim held by anyone else
+     * fails closed with CONTROLLER_CLAIM_CONFLICT — no release, no
+     * overwrite, no planning startup. The generic task_claim surface is
+     * untouched (M1-S1/R2 unchanged).
+     *
+     * @param {string} taskId
+     * @param {{ agent?: { id?: string } }} exec trusted host execution context
+     * @param {object} [payload] model-supplied payload (worker/sessionId/claimed_by/captain) — ignored for ownership
+     * @returns {Promise<{ ok: boolean, taskId: string, changeId: string, sessionId: string, reused: boolean }>}
+     */
+    startControllerOwnedPlanning(taskId, exec, payload) {
+      return (async () => {
+        const t = requireTask();
+        const c = requireChange();
+        requireTaskId(taskId);
+        // S is derived EXCLUSIVELY from the trusted host execution identity
+        // (exec.agent.id). payload (worker/sessionId/claimed_by/captain) is
+        // never consulted for ownership — it is spoofable model data.
+        const S = exec
+          && typeof exec === 'object'
+          && exec.agent && typeof exec.agent === 'object'
+          && typeof exec.agent.id === 'string'
+          ? exec.agent.id.trim()
+          : '';
+        // Fail closed BEFORE mutation: no task lookup, no claim, no binding
+        // when the trusted identity is missing.
+        if (S === '') {
+          throw Object.assign(
+            new Error('exec.agent.id is required from the trusted host execution context'),
+            { code: 'AUTHENTICATED_SESSION_REQUIRED', taskId },
+          );
+        }
+        // Ownership check BEFORE any mutation. Read the current claim holder.
+        const task = await Promise.resolve(t.get(taskId));
+        if (!task) throw Object.assign(new Error(`task not found: ${taskId}`), { code: 'TASK_NOT_FOUND', taskId });
+        const currentOwner = task.claimed_by ?? null;
+        if (currentOwner !== null && currentOwner !== S) {
+          // Conflicting ownership: fail closed WITHOUT release/overwrite and
+          // WITHOUT planning startup.
+          throw Object.assign(
+            new Error(`task ${taskId} is claimed by ${currentOwner}, not ${S}`),
+            { code: 'CONTROLLER_CLAIM_CONFLICT', taskId, claimedBy: currentOwner, authenticatedSessionId: S },
+          );
+        }
+        // Matching ownership (currentOwner === S) is an idempotent no-op
+        // claim. A new claim must be established through the public API and
+        // its result must be checked: TaskStore returns { claimed: false }
+        // for conflicts and non-claimable tasks instead of throwing.
+        void payload; // payload is explicitly ignored for ownership (spoofable).
+        if (currentOwner === null) {
+          const claimResult = await Promise.resolve(t.claim(taskId, S));
+          const returnedOwner = claimResult?.task?.claimed_by ?? null;
+          if (claimResult?.claimed !== true && returnedOwner !== S) {
+            if (returnedOwner !== null) {
+              throw Object.assign(
+                new Error(`task ${taskId} is claimed by ${returnedOwner}, not ${S}`),
+                {
+                  code: 'CONTROLLER_CLAIM_CONFLICT',
+                  taskId,
+                  claimedBy: returnedOwner,
+                  authenticatedSessionId: S,
+                  claimReason: claimResult?.reason,
+                },
+              );
+            }
+            throw Object.assign(
+              new Error(`controller claim for task ${taskId} was not established`),
+              {
+                code: 'CONTROLLER_CLAIM_FAILED',
+                taskId,
+                authenticatedSessionId: S,
+                claimReason: claimResult?.reason,
+              },
+            );
+          }
+        }
+        // Re-read the authoritative task after claim/replay. This closes the
+        // claim-to-planning race and prevents planner binding without owner S.
+        const claimedTask = await Promise.resolve(t.get(taskId));
+        const claimedOwner = claimedTask?.claimed_by ?? null;
+        if (claimedOwner !== S) {
+          if (claimedOwner !== null) {
+            throw Object.assign(
+              new Error(`task ${taskId} is claimed by ${claimedOwner}, not ${S}`),
+              { code: 'CONTROLLER_CLAIM_CONFLICT', taskId, claimedBy: claimedOwner, authenticatedSessionId: S },
+            );
+          }
+          throw Object.assign(
+            new Error(`controller claim for task ${taskId} was not established`),
+            { code: 'CONTROLLER_CLAIM_FAILED', taskId, authenticatedSessionId: S },
+          );
+        }
+        // Same-principal governed planning: pass EXACTLY S (never the
+        // model-supplied sessionId/worker/captain) to the planner startup.
+        const result = await api.startGovernedPlanning(taskId, {
+          authenticatedSessionId: S,
+          actor: 'controller',
+        });
+        return { ...result, ok: true, taskId, sessionId: S, changeId: result.changeId ?? (await c.findByWorkItem(WORK_ITEM_SYSTEM, taskId))?.id ?? result.changeId };
+      })();
+    },
+
+    /**
      * M1-S3 — release a controller-owned planning claim into the canonical
      * governed dispatcher. Host-only: the authenticated session and worker
      * profile must come from runtimeContext, never from a task/model payload.
