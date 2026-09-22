@@ -3,6 +3,7 @@ import { createIntegrationTools } from './tools.js';
 import { createLifecycleBootstrapper } from './lifecycle-bootstrap.js';
 import { createAgentTeamsAdapter } from './agent-teams-adapter.js';
 import { GOVERNED_COMPLETION_PENDING } from './g4-guard.js';
+import { createR2HandoffProducer } from './r2-handoff-producer.js';
 
 export { WORK_ITEM_SYSTEM };
 export { createAgentTeamsAdapter };
@@ -119,7 +120,50 @@ export default {
         ctx.events.emit('change-control/linkage-created', { taskId, changeId, state });
       },
     });
-    ctx.provide('taskChangeControl', service);
+
+    // M1-S3-R2 — host-only R1 controller boundary: a successful
+    // startControllerOwnedPlanning is the host hook that arms the R2
+    // producer. Only the trusted exec.agent.id (S) returned by R1 may arm
+    // it — never a model payload, task.claimed_by, or planner binding. The
+    // producer emits handoff-requested; the existing PR #35 consumer owns
+    // release/dispatch.
+    /** @type {ReturnType<typeof createR2HandoffProducer> | null} */
+    let r2Producer = null;
+    /** @type {any} */
+    let r2WrappedService;
+    {
+      const svcRef = service;
+      r2WrappedService = new Proxy(svcRef, {
+        get(target, prop, receiver) {
+          if (prop === 'startControllerOwnedPlanning') {
+            /** @param {string} taskId @param {any} exec @param {any} payload */
+            return (taskId, exec, payload) =>
+              Reflect.get(target, 'startControllerOwnedPlanning', target)(taskId, exec, payload)
+                .then((/** @type {any} */ result) => {
+                  if (r2Producer && result && result.ok && result.sessionId) {
+                    r2Producer.arm(result.sessionId, { taskIds: [taskId] }).catch(() => {});
+                  }
+                  return result;
+                });
+          }
+          return Reflect.get(target, prop, receiver);
+        },
+      });
+    }
+    ctx.provide('taskChangeControl', r2WrappedService);
+
+    await ctx.inject(['taskOrchestrator', 'changeControl'], (c) => {
+      const orch = c.get('taskOrchestrator');
+      const cc = c.get('changeControl');
+      if (!orch || !cc) throw new Error('taskOrchestrator/changeControl inactive in R2 producer fiber');
+      r2Producer = createR2HandoffProducer({
+        taskOrchestrator: orch,
+        changeControl: cc,
+        events: ctx.events,
+        list: () => Promise.resolve(orch.list?.({ statuses: ['ready'], limit: 100 }) ?? []),
+      });
+      return () => { r2Producer?.dispose(); };
+    });
 
     // M1-S3 — host-only controller handoff bridge. An authenticated host may
     // arm a bounded reconciliation with runtimeContext; no model-facing tool,
