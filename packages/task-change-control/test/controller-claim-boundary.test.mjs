@@ -6,7 +6,7 @@ const TASK_ID = 'task-controller-1';
 const CHANGE_ID = 'change-controller-1';
 const SESSION_ID = 'session-controller-1';
 
-function harness({ task = {}, binding = null } = {}) {
+function harness({ task = {}, binding = null, claimResponse = null } = {}) {
   const calls = {
     get: [],
     claim: [],
@@ -36,6 +36,13 @@ function harness({ task = {}, binding = null } = {}) {
     },
     claim(id, worker, options) {
       calls.claim.push([id, worker, options]);
+      if (claimResponse !== null) {
+        const response = typeof claimResponse === 'function'
+          ? claimResponse({ task: currentTask, worker })
+          : claimResponse;
+        if (response?.task) currentTask = response.task;
+        return response;
+      }
       if (id === TASK_ID) {
         currentTask = { ...currentTask, status: 'claimed', claimed_by: worker };
       }
@@ -111,6 +118,52 @@ test('matching controller ownership is idempotent and conflicting ownership fail
   );
   assert.deepEqual(conflicting.calls.claim, []);
   assert.deepEqual(conflicting.calls.planning, []);
+});
+
+test('false claim results fail closed before planner binding', async () => {
+  const conflicting = harness({
+    claimResponse: {
+      claimed: false,
+      reason: 'already_claimed',
+      task: { id: TASK_ID, status: 'claimed', claimed_by: 'other-session' },
+    },
+  });
+  await assert.rejects(
+    conflicting.service.startControllerOwnedPlanning(TASK_ID, { agent: { id: SESSION_ID } }),
+    (error) => error?.code === 'CONTROLLER_CLAIM_CONFLICT',
+  );
+  assert.equal(conflicting.calls.getBinding.length, 0);
+  assert.equal(conflicting.calls.bind.length, 0);
+  assert.equal(conflicting.calls.audit.length, 0);
+
+  const blocked = harness({
+    claimResponse: {
+      claimed: false,
+      reason: 'blocked_by_dependencies',
+      task: { id: TASK_ID, status: 'ready', claimed_by: null },
+    },
+  });
+  await assert.rejects(
+    blocked.service.startControllerOwnedPlanning(TASK_ID, { agent: { id: SESSION_ID } }),
+    (error) => error?.code === 'CONTROLLER_CLAIM_FAILED',
+  );
+  assert.equal(blocked.calls.getBinding.length, 0);
+  assert.equal(blocked.calls.bind.length, 0);
+  assert.equal(blocked.calls.audit.length, 0);
+});
+
+test('same-owner replay from a false already-claimed result may continue', async () => {
+  const raced = harness({
+    claimResponse: ({ task, worker }) => ({
+      claimed: false,
+      reason: 'already_claimed',
+      task: { ...task, status: 'claimed', claimed_by: worker },
+    }),
+  });
+  const result = await raced.service.startControllerOwnedPlanning(TASK_ID, { agent: { id: SESSION_ID } });
+  assert.equal(result.sessionId, SESSION_ID);
+  assert.deepEqual(raced.calls.claim[0].slice(0, 2), [TASK_ID, SESSION_ID]);
+  assert.equal(raced.calls.bind.length, 1);
 });
 
 test('captain remains an ordinary spoofable payload value, never an owner alias', async () => {

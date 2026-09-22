@@ -1871,13 +1871,52 @@ export function createTaskChangeControlService({ taskOrchestrator, changeControl
           );
         }
         // Matching ownership (currentOwner === S) is an idempotent no-op
-        // claim — no re-claim, no mutation; planning startup converges.
+        // claim. A new claim must be established through the public API and
+        // its result must be checked: TaskStore returns { claimed: false }
+        // for conflicts and non-claimable tasks instead of throwing.
         void payload; // payload is explicitly ignored for ownership (spoofable).
-        // Claim the task under S through the public Task Orchestrator API.
-        // When currentOwner is null this performs the claim; when it equals S
-        // the claim is already satisfied (idempotent matching ownership).
         if (currentOwner === null) {
-          await Promise.resolve(t.claim(taskId, S));
+          const claimResult = await Promise.resolve(t.claim(taskId, S));
+          const returnedOwner = claimResult?.task?.claimed_by ?? null;
+          if (claimResult?.claimed !== true && returnedOwner !== S) {
+            if (returnedOwner !== null) {
+              throw Object.assign(
+                new Error(`task ${taskId} is claimed by ${returnedOwner}, not ${S}`),
+                {
+                  code: 'CONTROLLER_CLAIM_CONFLICT',
+                  taskId,
+                  claimedBy: returnedOwner,
+                  authenticatedSessionId: S,
+                  claimReason: claimResult?.reason,
+                },
+              );
+            }
+            throw Object.assign(
+              new Error(`controller claim for task ${taskId} was not established`),
+              {
+                code: 'CONTROLLER_CLAIM_FAILED',
+                taskId,
+                authenticatedSessionId: S,
+                claimReason: claimResult?.reason,
+              },
+            );
+          }
+        }
+        // Re-read the authoritative task after claim/replay. This closes the
+        // claim-to-planning race and prevents planner binding without owner S.
+        const claimedTask = await Promise.resolve(t.get(taskId));
+        const claimedOwner = claimedTask?.claimed_by ?? null;
+        if (claimedOwner !== S) {
+          if (claimedOwner !== null) {
+            throw Object.assign(
+              new Error(`task ${taskId} is claimed by ${claimedOwner}, not ${S}`),
+              { code: 'CONTROLLER_CLAIM_CONFLICT', taskId, claimedBy: claimedOwner, authenticatedSessionId: S },
+            );
+          }
+          throw Object.assign(
+            new Error(`controller claim for task ${taskId} was not established`),
+            { code: 'CONTROLLER_CLAIM_FAILED', taskId, authenticatedSessionId: S },
+          );
         }
         // Same-principal governed planning: pass EXACTLY S (never the
         // model-supplied sessionId/worker/captain) to the planner startup.
