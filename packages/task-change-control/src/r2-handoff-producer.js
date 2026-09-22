@@ -28,7 +28,10 @@
  * missing workItem, wrong system, wrong id, or blank Change ID fail closed,
  * Change `state === 'READY'`, a current
  * accepted plan (`acceptedPlan` object with a nonblank `id`), and a
- * resolvable nonblank string `worker_profile` from the fresh task.
+ * resolvable nonblank string `worker_profile` from the fresh task,
+ * confirmed by `orch.resolveWorkerSpec` (authoritative public registry
+ * resolution — unknown, disabled, or resolver-error profiles fail closed;
+ * the resolver must be available for any emission to occur).
  *
  * The producer never calls Task Orchestrator `release`, the dispatcher, or
  * `handoffGovernedDispatch` directly. It emits one event and stops.
@@ -46,6 +49,7 @@ const WORK_ITEM_SYSTEM = 'dsh-task-orchestrator';
  * @property {number | string | null} [claimed_at]
  * @property {number | string | null} [lease_expires_at]
  * @property {string} [worker_profile]
+ * @property {string} [worker_model]
  */
 
 /**
@@ -74,6 +78,7 @@ const WORK_ITEM_SYSTEM = 'dsh-task-orchestrator';
  * @property {(id: string) => R2Task | Promise<R2Task> | null} get
  * @property {() => Array<{ id: string }> | Promise<Array<{ id: string }>>} list
  * @property {(listener: (event: { taskId?: string }) => void) => (() => void) | Promise<() => void> | void} [subscribe]
+ * @property {(profile: string, workerModel?: string) => { enabled?: boolean, name?: string, [k: string]: unknown } | Promise<{ enabled?: boolean, name?: string, [k: string]: unknown }>} [resolveWorkerSpec]
  */
 
 /**
@@ -176,12 +181,34 @@ export function createR2HandoffProducer({ taskOrchestrator: orch, changeControl:
     if (claimedBy !== null || claimedAt !== null || leaseExpiresAt !== null) {
       return { emitted: 0, taskId, reason: 'WORKER_CLAIM_PRESENT' };
     }
-    // Resolve a resolvable worker profile from the FRESH task via public API.
-    // The profile must come from the task's authoritative worker_profile field,
-    // never from a payload or hint.
+    // Authoritative worker-profile resolution: the fresh task's worker_profile
+    // must be a nonblank string that is confirmed by the public orchestrator
+    // registry (resolveWorkerSpec). Unknown, disabled, blank, non-string, or
+    // resolver-error profiles fail closed — arbitrary nonblank strings are
+    // never accepted as hints.
     const rawProfile = t.worker_profile;
     const profile = typeof rawProfile === 'string' ? rawProfile.trim() : '';
     if (profile === '') return { emitted: 0, taskId, reason: 'NON_RESOLVABLE_PROFILE' };
+    if (typeof orch.resolveWorkerSpec === 'function') {
+      /** @type {unknown} */
+      let resolvedSpec;
+      try {
+        resolvedSpec = await Promise.resolve(orch.resolveWorkerSpec(profile, t.worker_model));
+      } catch {
+        return { emitted: 0, taskId, reason: 'NON_RESOLVABLE_PROFILE' };
+      }
+      if (
+        !resolvedSpec
+        || typeof resolvedSpec !== 'object'
+        || /** @type {{ enabled?: boolean }} */ (resolvedSpec).enabled === false
+      ) {
+        return { emitted: 0, taskId, reason: 'NON_RESOLVABLE_PROFILE' };
+      }
+    } else {
+      // No public resolver available: fail closed — an arbitrary string must
+      // not be emitted when the registry cannot authoritatively confirm it.
+      return { emitted: 0, taskId, reason: 'NON_RESOLVABLE_PROFILE' };
+    }
     // Canonical nonterminal linkage: one Change per task, with a valid system/id.
     let change = /** @type {R2Change | null} */ (null);
     try {

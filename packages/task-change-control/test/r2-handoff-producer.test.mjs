@@ -6,7 +6,7 @@ import { createR2HandoffProducer } from '../src/r2-handoff-producer.js';
 // exclusively from the trusted arm (which mirrors R1 exec.agent.id) and
 // must never consult claimed_by / planner bindings / captain metadata /
 // model payload for identity.
-function harness({ task = {}, linked = true, changeStatus = null } = {}) {
+function harness({ task = {}, linked = true, changeStatus = null, resolveWorkerSpec = null } = {}) {
   const TASK_ID = 'r2-task';
   const current = {
     id: TASK_ID,
@@ -26,7 +26,7 @@ function harness({ task = {}, linked = true, changeStatus = null } = {}) {
     ...changeStatus,
   };
   const state = { change };
-  const calls = { get: [], find: [], status: [], list: [], subscribe: [], emit: [], release: [], claim: [] };
+  const calls = { get: [], find: [], status: [], list: [], subscribe: [], emit: [], release: [], claim: [], resolveWorkerSpec: [] };
   const taskOrchestrator = {
     get(id) {
       calls.get.push(id);
@@ -37,6 +37,14 @@ function harness({ task = {}, linked = true, changeStatus = null } = {}) {
     update() { throw new Error('producer must not mutate task state'); },
     claim() { throw new Error('producer must not claim'); },
     release() { throw new Error('producer must not release'); },
+    // Authoritative public registry resolver. 'worker' is a known, enabled spec;
+    // unknown profiles throw (mirroring WorkerSpecRegistry.get behavior).
+    resolveWorkerSpec(profile, workerModel) {
+      calls.resolveWorkerSpec.push([profile, workerModel]);
+      if (resolveWorkerSpec) return resolveWorkerSpec(profile, workerModel, current);
+      if (profile === 'worker') return { name: 'worker', enabled: true, mode: 'session' };
+      throw new Error('unknown worker profile: ' + profile);
+    },
   };
   const changeControl = {
     async findByWorkItem(system, id) {
@@ -338,19 +346,70 @@ test('R2-VER-005: malformed task shape (missing status/ready_to_run) fails close
   assert.equal(h.calls.emit.length, 0);
 });
 
-test('R2-VER-005: unknown/non-resolvable arbitrary worker_profile is not accepted as authoritative', async () => {
+test('R2-VER-005/006: unknown nonblank worker_profile fails closed — resolver error → NON_RESOLVABLE_PROFILE', async () => {
   // An arbitrary nonblank string that is not a known/resolvable profile must
-  // fail closed rather than being emitted as the dispatched worker profile.
-  // The producer's authoritative gate rejects it via NON_RESOLVABLE_PROFILE
-  // when the profile is empty; a nonblank but unknown string is still
-  // emitted as a hint (the consumer's dispatcher resolves authoritatively),
-  // but a blank/missing profile (the fail-closed case) must not emit.
-  const h = harness({ task: { worker_profile: '' } });
+  // fail closed via the authoritative resolver. The harness resolver throws
+  // for any profile other than 'worker', so 'unknown-profile' triggers
+  // NON_RESOLVABLE_PROFILE with zero emission.
+  const h = harness({ task: { worker_profile: 'unknown-profile' } });
   const producer = createR2HandoffProducer({ taskOrchestrator: h.taskOrchestrator, changeControl: h.changeControl, events: h.events });
   const r = await producer.arm(S, { taskIds: [h.TASK_ID] });
-  assert.equal(r.emitted, 0, 'blank profile fails closed');
+  assert.equal(r.emitted, 0, 'unknown nonblank profile fails closed');
   assert.equal(r.reasons.includes('NON_RESOLVABLE_PROFILE'), true);
   assert.equal(h.calls.emit.length, 0);
+});
+
+test('R2-VER-006: disabled spec (enabled === false) fails closed — NON_RESOLVABLE_PROFILE', async () => {
+  const h = harness({
+    task: { worker_profile: 'disabled-profile' },
+    resolveWorkerSpec: (profile) => (profile === 'disabled-profile' ? { name: 'disabled-profile', enabled: false } : { name: profile, enabled: true }),
+  });
+  const producer = createR2HandoffProducer({ taskOrchestrator: h.taskOrchestrator, changeControl: h.changeControl, events: h.events });
+  const r = await producer.arm(S, { taskIds: [h.TASK_ID] });
+  assert.equal(r.emitted, 0, 'disabled spec fails closed');
+  assert.equal(r.reasons.includes('NON_RESOLVABLE_PROFILE'), true);
+});
+
+test('R2-VER-006: resolver exception fails closed — NON_RESOLVABLE_PROFILE', async () => {
+  const h = harness({
+    task: { worker_profile: 'error-profile' },
+    resolveWorkerSpec: () => { throw new Error('registry unavailable'); },
+  });
+  const producer = createR2HandoffProducer({ taskOrchestrator: h.taskOrchestrator, changeControl: h.changeControl, events: h.events });
+  const r = await producer.arm(S, { taskIds: [h.TASK_ID] });
+  assert.equal(r.emitted, 0, 'resolver exception fails closed');
+  assert.equal(r.reasons.includes('NON_RESOLVABLE_PROFILE'), true);
+});
+
+test('R2-VER-006: resolver returns null fails closed — NON_RESOLVABLE_PROFILE', async () => {
+  const h = harness({
+    task: { worker_profile: 'null-profile' },
+    resolveWorkerSpec: () => null,
+  });
+  const producer = createR2HandoffProducer({ taskOrchestrator: h.taskOrchestrator, changeControl: h.changeControl, events: h.events });
+  const r = await producer.arm(S, { taskIds: [h.TASK_ID] });
+  assert.equal(r.emitted, 0, 'null resolver result fails closed');
+  assert.equal(r.reasons.includes('NON_RESOLVABLE_PROFILE'), true);
+});
+
+test('R2-VER-006: no resolveWorkerSpec on orchestrator fails closed — arbitrary string never emitted', async () => {
+  // When the orchestrator does not expose a public resolver, the producer
+  // must fail closed — an arbitrary nonblank string must not be emitted.
+  const h = harness();
+  delete h.taskOrchestrator.resolveWorkerSpec;
+  const producer = createR2HandoffProducer({ taskOrchestrator: h.taskOrchestrator, changeControl: h.changeControl, events: h.events });
+  const r = await producer.arm(S, { taskIds: [h.TASK_ID] });
+  assert.equal(r.emitted, 0, 'arbitrary string is not emitted when no resolver is available');
+  assert.equal(r.reasons.includes('NON_RESOLVABLE_PROFILE'), true);
+});
+
+test('R2-VER-006: known resolver-confirmed profile emits through the consumer seam', async () => {
+  const h = harness(); // default: worker is a known enabled spec
+  const producer = createR2HandoffProducer({ taskOrchestrator: h.taskOrchestrator, changeControl: h.changeControl, events: h.events });
+  const r = await producer.arm(S, { taskIds: [h.TASK_ID] });
+  assert.equal(r.emitted, 1, 'resolver-confirmed profile emits');
+  assert.equal(h.calls.emit.length, 1);
+  assert.equal(h.calls.resolveWorkerSpec.length, 1, 'resolver was called once');
 });
 
 test('R2-VER-005: non-string worker_profile is not accepted (NON_RESOLVABLE_PROFILE)', async () => {
@@ -453,6 +512,9 @@ test('R2-VER-001/005: integrated consumer dispatch — emitted event triggers ha
     registerLifecycleGuard: () => () => {},
     updateIf: () => null,
     complete: () => null,
+    // Authoritative resolver: 'worker' is a known enabled spec (service.js
+    // handoffGovernedDispatch also calls this on the autonomous path).
+    resolveWorkerSpec: () => ({ name: 'worker', enabled: true, mode: 'session' }),
   };
   const changeControl = {
     findByWorkItem: async () => ({ id: 'change-1', workItem: { system: 'dsh-task-orchestrator', id: CTX_TASK_ID } }),
