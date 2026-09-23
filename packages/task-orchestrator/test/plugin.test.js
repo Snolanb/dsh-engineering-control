@@ -3,6 +3,8 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { Context } from '@deepseek-ai/cordis'
+import * as taskOrchestrator from '../src/index.js'
 import { apply } from '../src/index.js'
 
 test('registers the task service, DSH tools, and HTTP route', t => {
@@ -40,4 +42,69 @@ test('registers the task service, DSH tools, and HTTP route', t => {
   const project = api.createProject({ id: 'service-project', title: 'Service project' })
   assert.equal(api.getProject(project.id).id, 'service-project')
   api.deleteProject(project.id)
+})
+
+test('production preflight uses Cordis LLM and preset catalogs and fails closed on unavailable resources', async t => {
+  assert.deepEqual(taskOrchestrator.inject, ['webServer', 'tools', 'llm', 'agentPresets'])
+
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-task-preflight-composition-'))
+  const ctx = new Context()
+  const calls = { providers: 0, callConfigs: [], presets: 0 }
+  let providers = [{ id: 'openai-codex', name: 'OpenAI Codex' }]
+  let routable = true
+  const llm = {
+    listProviders() {
+      calls.providers++
+      return providers
+    },
+    async resolveCallConfig(config) {
+      calls.callConfigs.push(config)
+      if (!routable) throw Object.assign(new Error('unknown model'), { code: 'UNKNOWN_MODEL' })
+      return config
+    },
+  }
+
+  ctx.provide('webServer', { register() { return () => {} } })
+  ctx.provide('tools', { register() { return () => {} } })
+  ctx.provide('llm', llm)
+  ctx.provide('agentPresets', { async list() { calls.presets++; return [{ id: 'standard' }] } })
+  const fiber = ctx.plugin(taskOrchestrator, {
+    dbPath: join(dir, 'tasks.db'),
+    workerSpecs: {
+      worker: {
+        mode: 'session', agentPreset: 'standard', provider: 'openai-codex', model: 'gpt-5.6-luna', reasoningEffort: 'medium',
+        workspacePolicy: 'any',
+      },
+    },
+  })
+  await fiber
+  t.after(async () => {
+    await fiber.dispose()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  const api = ctx.get('taskOrchestrator')
+  const request = { worker_profile: 'worker', workspace: dir }
+  const valid = await api.preflightWorker(request)
+  assert.equal(valid.ok, true)
+  assert.equal(valid.checks.find(check => check.name === 'agent_preset').ok, true)
+  assert.equal(valid.checks.find(check => check.name === 'model').ok, true)
+  assert.deepEqual(valid.checks.map(check => check.name), ['worker_spec', 'workspace', 'agent_preset', 'model'])
+  assert.equal(calls.providers, 1)
+  assert.deepEqual(calls.callConfigs, [{ provider: 'openai-codex', model: 'gpt-5.6-luna', reasoningEffort: 'medium' }])
+
+  providers = []
+  const unavailableProvider = await api.preflightWorker(request)
+  assert.equal(unavailableProvider.ok, false)
+  assert.ok(unavailableProvider.blockers.some(blocker => blocker.code === 'PROVIDER_UNAVAILABLE'))
+  assert.equal(calls.callConfigs.length, 1)
+
+  providers = [{ id: 'openai-codex', name: 'OpenAI Codex' }]
+  routable = false
+  const unavailableModel = await api.preflightWorker(request)
+  assert.equal(unavailableModel.ok, false)
+  assert.ok(unavailableModel.blockers.some(blocker => blocker.code === 'MODEL_UNAVAILABLE'))
+  assert.equal(calls.callConfigs.length, 2)
+  assert.equal(calls.providers, 3)
+  assert.equal(calls.presets, 3)
 })

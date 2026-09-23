@@ -61,21 +61,17 @@ function workspaceCheck(workspace, policy, workspaceRoots) {
 }
 
 async function modelCheck(selection, llm) {
-  if (!llm || typeof llm.listProviders !== 'function' || typeof llm.listModels !== 'function') return check('model', false, 'MODEL_CATALOG_UNAVAILABLE', 'an LLM provider/model catalog is required for preflight')
+  if (!llm || typeof llm.listProviders !== 'function' || typeof llm.resolveCallConfig !== 'function') return check('model', false, 'MODEL_SERVICE_UNAVAILABLE', 'an LLM service with exact-model validation is required for preflight')
   let providers
   try { providers = await llm.listProviders() } catch (error) { return check('model', false, 'MODEL_PROVIDER_LIST_FAILED', error instanceof Error ? error.message : String(error)) }
   if (!providers?.some(provider => provider?.id === selection.provider)) return check('model', false, 'PROVIDER_UNAVAILABLE', 'provider is not active: ' + selection.provider)
-  let models
-  try { models = await llm.listModels(selection.provider) } catch (error) { return check('model', false, 'MODEL_LIST_FAILED', error instanceof Error ? error.message : String(error)) }
-  if (!models?.some(model => model?.id === selection.model)) return check('model', false, 'MODEL_UNAVAILABLE', 'model is not advertised by provider ' + selection.provider + ': ' + selection.model)
-  if (selection.reasoningEffort !== undefined && typeof llm.resolveModelInfo === 'function') {
-    try {
-      const info = await llm.resolveModelInfo(selection.provider, selection.model)
-      const efforts = info?.reasoning?.efforts
-      if (Array.isArray(efforts) && !efforts.some(effort => effort?.id === selection.reasoningEffort)) return check('model', false, 'REASONING_EFFORT_UNAVAILABLE', 'reasoning effort is not supported: ' + selection.reasoningEffort)
-    } catch (error) {
-      return check('model', false, 'MODEL_RESOLUTION_FAILED', error instanceof Error ? error.message : String(error))
-    }
+  try {
+    await llm.resolveCallConfig({ provider: selection.provider, model: selection.model, ...(selection.reasoningEffort === undefined ? {} : { reasoningEffort: selection.reasoningEffort }) })
+  } catch (error) {
+    const code = error?.code === 'UNKNOWN_MODEL' ? 'MODEL_UNAVAILABLE'
+      : error?.code === 'UNSUPPORTED_REASONING_EFFORT' ? 'REASONING_EFFORT_UNAVAILABLE'
+        : 'MODEL_RESOLUTION_FAILED'
+    return check('model', false, code, error instanceof Error ? error.message : String(error))
   }
   return check('model', true, undefined, undefined, { provider: selection.provider, model: selection.model })
 }

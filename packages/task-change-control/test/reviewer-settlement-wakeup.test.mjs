@@ -184,6 +184,14 @@ async function compose(t, rpcOptions = {}) {
   await ctx.plugin(SystemPrompt);
   await ctx.plugin(ToolRuntime, {});
   ctx.provide('webServer', { register() { return () => {}; } });
+  ctx.provide('llm', {
+    listProviders() { return [{ id: 'ollama' }]; },
+    async resolveCallConfig(config) {
+      if (config.provider !== 'ollama' || config.model !== 'm') throw Object.assign(new Error('unknown model'), { code: 'UNKNOWN_MODEL' });
+      return config;
+    },
+  });
+  ctx.provide('agentPresets', { async list() { return [{ id: 'worker' }]; } });
   await ctx.plugin(taskOrchestratorPluginObject, {
     dbPath: taskDbPath,
     workerSpecs: {
@@ -191,13 +199,6 @@ async function compose(t, rpcOptions = {}) {
         mode: 'session', profile: 'wp', agentPreset: 'worker',
         provider: 'ollama', model: 'm', workspacePolicy: 'any',
         timeoutMs: 5000, leaseSeconds: 300,
-      },
-    },
-    preflightOptions: {
-      presetExists: new Set(['worker']),
-      llm: {
-        listProviders() { return [{ id: 'ollama' }]; },
-        async listModels(provider) { return provider === 'ollama' ? [{ id: 'm' }] : []; },
       },
     },
   });
@@ -225,6 +226,14 @@ async function reopen(t, paths) {
   await ctx.plugin(SystemPrompt);
   await ctx.plugin(ToolRuntime, {});
   ctx.provide('webServer', { register() { return () => {}; } });
+  ctx.provide('llm', {
+    listProviders() { return [{ id: 'ollama' }]; },
+    async resolveCallConfig(config) {
+      if (config.provider !== 'ollama' || config.model !== 'm') throw Object.assign(new Error('unknown model'), { code: 'UNKNOWN_MODEL' });
+      return config;
+    },
+  });
+  ctx.provide('agentPresets', { async list() { return [{ id: 'worker' }]; } });
   await ctx.plugin(taskOrchestratorPluginObject, {
     dbPath: paths.taskDbPath,
     workerSpecs: {
@@ -232,13 +241,6 @@ async function reopen(t, paths) {
         mode: 'session', profile: 'wp', agentPreset: 'worker',
         provider: 'ollama', model: 'm', workspacePolicy: 'any',
         timeoutMs: 5000, leaseSeconds: 300,
-      },
-    },
-    preflightOptions: {
-      presetExists: new Set(['worker']),
-      llm: {
-        listProviders() { return [{ id: 'ollama' }]; },
-        async listModels(provider) { return provider === 'ollama' ? [{ id: 'm' }] : []; },
       },
     },
   });
