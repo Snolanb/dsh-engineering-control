@@ -127,7 +127,7 @@ async function invoke(message) {
     void runSession(session).catch((error) => {
       append(session, 'turn/end', { reason: { kind: 'error', error: { message: String(error) } } });
     });
-    return {};
+    return { accepted: true };
   }
   if (method === 'session.cancel') {
     const session = sessions.get(payload.sessionId);

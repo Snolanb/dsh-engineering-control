@@ -10,7 +10,8 @@ function makeFakeRpc() {
       async call(op, args) {
         calls.push({ op, args });
         if (op === 'session.create') return { sessionId: 'sess-reviewer-1' };
-        if (op === 'session.history') return { events: [] };
+        if (op === 'session.history') return { events: [], hasMore: false };
+        if (op === 'session.prompt' || op === 'session.cancel') return { accepted: true };
         return {};
       },
     },

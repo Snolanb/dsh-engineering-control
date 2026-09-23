@@ -25,6 +25,7 @@ import { Context } from '@deepseek-ai/cordis';
 import { SystemPrompt } from '@deepseek-ai/dsh-system-prompt';
 import { ToolRuntime } from '@deepseek-ai/dsh-tools';
 import * as taskOrchestratorPlugin from 'dsh-task-orchestrator';
+import { createSessionRpcClient } from 'dsh-task-orchestrator/dispatcher';
 import changeControlPlugin from 'dsh-change-control';
 import integrationPlugin from '../src/index.js';
 import { observeReviewerTurn } from '../src/service.js';
@@ -78,7 +79,7 @@ function createSessionRpc(proof, { endFirstReviewerOnPrompt = false } = {}) {
           s.ended = { kind: 'error', error: { message: 'reviewer ended before REVIEW transition' } };
         }
       }
-      return respond({});
+      return respond({ accepted: true });
     }
     if (method === 'session.history') {
       // T-H12 round-5: a killed session's history RPC ERRORS — the existing-
@@ -194,6 +195,8 @@ async function compose(t, rpcOptions = {}) {
   ctx.provide('agentPresets', { async list() { return [{ id: 'worker' }]; } });
   await ctx.plugin(taskOrchestratorPluginObject, {
     dbPath: taskDbPath,
+    workerLauncherOptions: { sessionOptions: { rpc: createSessionRpcClient({ fetchImpl: rpc.fetchImpl }) } },
+    reviewerLauncherOptions: { sessionOptions: { rpc: createSessionRpcClient({ fetchImpl: rpc.fetchImpl }) } },
     workerSpecs: {
       worker: {
         mode: 'session', profile: 'wp', agentPreset: 'worker',
@@ -236,6 +239,8 @@ async function reopen(t, paths) {
   ctx.provide('agentPresets', { async list() { return [{ id: 'worker' }]; } });
   await ctx.plugin(taskOrchestratorPluginObject, {
     dbPath: paths.taskDbPath,
+    workerLauncherOptions: { sessionOptions: { rpc: createSessionRpcClient({ fetchImpl: globalThis.fetch }) } },
+    reviewerLauncherOptions: { sessionOptions: { rpc: createSessionRpcClient({ fetchImpl: globalThis.fetch }) } },
     workerSpecs: {
       worker: {
         mode: 'session', profile: 'wp', agentPreset: 'worker',

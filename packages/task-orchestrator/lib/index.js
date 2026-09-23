@@ -38,7 +38,11 @@ export function apply(ctx, config = {}) {
     ...defaults,
     ...options,
     headlessOptions: { ...defaults.headlessOptions, ...options.headlessOptions },
-    sessionOptions: { ...defaults.sessionOptions, ...options.sessionOptions },
+    sessionOptions: {
+      sessionController: ctx.get?.('sessionController'),
+      ...defaults.sessionOptions,
+      ...options.sessionOptions,
+    },
   })
   const api = Object.freeze({
     version: 2,
@@ -94,7 +98,7 @@ export function apply(ctx, config = {}) {
     createDispatcher: (options = {}) => new WorkerDispatcher({
       store,
       registry: workerRegistry,
-      launcher: options.launcher ?? createWorkerLauncher(options.launcherOptions),
+      launcher: options.launcher ?? createWorkerLauncher(mergeLauncherOptions(workerLauncherDefaults, options.launcherOptions)),
       preflight: options.preflight ?? preflight,
       preDispatch: options.preDispatch ?? null,
       completionHook: options.completionHook ?? null,

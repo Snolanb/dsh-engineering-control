@@ -118,7 +118,7 @@ async function startStubHost(t) {
       promptLog.push({ sessionId, prompt: s.prompt });
       notify({ kind: 'prompt', sessionId });
       if (holdPrompt) return new Promise(() => {}); // response withheld: acceptance proven, return value lost
-      return respond({});
+      return respond({ accepted: true });
     }
     if (method === 'session.history') {
       const n = (historyCalls.get(sessionId) ?? 0) + 1;

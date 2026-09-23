@@ -17,6 +17,7 @@ function fakeRpc(log) {
       log.push({ op, args });
       if (op === 'session.create') return { sessionId: 'sess-real-reviewer' };
       if (op === 'session.history') return { events: [] };
+      if (op === 'session.prompt') return { accepted: true };
       return {};
     },
   };

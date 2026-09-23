@@ -425,6 +425,101 @@ export function createSessionRpcClient({ baseUrl = 'http://127.0.0.1:3080/api', 
   }
 }
 
+/**
+ * Adapt DSH's in-process SessionController service to the launcher's narrow
+ * session-operation seam. Production composition uses this adapter so a
+ * plugin never has to authenticate back to its own Web server over loopback.
+ * `createSessionRpcClient` remains available for explicit test/alternate use.
+ */
+export function createSessionControllerRpcClient({ sessionController } = {}) {
+  const required = ['create', 'selectModel', 'inspect', 'prompt', 'cancel']
+  if (!sessionController || required.some(method => typeof sessionController[method] !== 'function')) {
+    throw new TypeError('a DSH SessionController service is required')
+  }
+
+  return {
+    async call(method, payload = {}) {
+      switch (method) {
+        case 'session.create':
+          return sessionController.create({ cwd: payload.cwd, agentPreset: payload.agentPreset })
+        case 'session.selectModel': {
+          const response = await sessionController.selectModel({
+            sessionId: payload.sessionId,
+            provider: payload.provider,
+            model: payload.model,
+            ...(payload.reasoningEffort === undefined ? {} : { reasoningEffort: payload.reasoningEffort }),
+          })
+          const selected = response?.selected
+          if (!selected || selected.provider !== payload.provider || selected.model !== payload.model
+            || (payload.reasoningEffort !== undefined && selected.reasoningEffort !== payload.reasoningEffort)) {
+            throw new WorkerDispatchError(
+              'SessionController did not confirm the exact requested model selection',
+              'SESSION_MODEL_SELECTION_UNCONFIRMED',
+              { sessionId: payload.sessionId, provider: payload.provider, model: payload.model, reasoningEffort: payload.reasoningEffort },
+            )
+          }
+          return response
+        }
+        case 'session.history': {
+          const inspection = await sessionController.inspect(payload.sessionId)
+          const history = validatedSessionHistory({ events: inspection?.events, hasMore: false })
+          if (!history?.complete) {
+            throw new WorkerDispatchError(
+              'SessionController did not return complete authoritative session history',
+              'SESSION_HISTORY_UNAVAILABLE',
+              { sessionId: payload.sessionId },
+            )
+          }
+          return { events: history.events, hasMore: false }
+        }
+        case 'session.prompt': {
+          if (typeof payload.requestId !== 'string' || payload.requestId.trim() === '') {
+            throw new WorkerDispatchError('session.prompt requires a request id', 'SESSION_REQUEST_ID_MISSING', { sessionId: payload.sessionId })
+          }
+          if (payload.mode !== 'queue') {
+            throw new WorkerDispatchError('session.prompt only accepts queued worker prompts', 'SESSION_PROMPT_MODE_UNSUPPORTED', { sessionId: payload.sessionId })
+          }
+          const response = await sessionController.prompt({
+            requestId: payload.requestId,
+            sessionId: payload.sessionId,
+            mode: 'queue',
+            content: payload.content,
+          }, new AbortController().signal)
+          if (response?.accepted !== true) {
+            throw new WorkerDispatchError('SessionController did not confirm prompt acceptance', 'SESSION_PROMPT_NOT_ACCEPTED', { sessionId: payload.sessionId })
+          }
+          return response
+        }
+        case 'session.cancel': {
+          const response = await sessionController.cancel({ sessionId: payload.sessionId })
+          if (response?.accepted !== true) {
+            throw new WorkerDispatchError('SessionController did not confirm cancellation', 'SESSION_CANCEL_NOT_ACCEPTED', { sessionId: payload.sessionId })
+          }
+          return response
+        }
+        default:
+          throw new WorkerDispatchError('unsupported host session operation: ' + method, 'SESSION_OPERATION_UNSUPPORTED', { method })
+      }
+    },
+  }
+}
+
+async function readAuthoritativeSessionEvents(rpc, sessionId, historyMaxMessages, requireCompleteHistory = false) {
+  const response = await rpc.call('session.history', { sessionId, maxMessages: historyMaxMessages })
+  if (requireCompleteHistory) {
+    const history = validatedSessionHistory(response)
+    if (!history?.complete) {
+      throw new WorkerDispatchError(
+        'session history was incomplete or malformed',
+        'SESSION_HISTORY_UNAVAILABLE',
+        { sessionId },
+      )
+    }
+    return history.events
+  }
+  return sessionEvents(response)
+}
+
 function sessionEvents(value) {
   return (Array.isArray(value?.events) ? value.events : [])
     .map(entry => entry?.event ?? entry)
@@ -681,18 +776,32 @@ function sleep(milliseconds) {
   })
 }
 
-export function createSessionLauncher({ rpc = createSessionRpcClient(), pollIntervalMs = 250, historyMaxMessages = 500 } = {}) {
-  if (!rpc || typeof rpc.call !== 'function') throw new TypeError('a session RPC client is required')
+export function createSessionLauncher({ rpc, sessionController, pollIntervalMs = 250, historyMaxMessages = 500, idFactory = randomUUID } = {}) {
+  const usesHostSessionController = !rpc && Boolean(sessionController)
+  const sessionRpc = rpc ?? (sessionController ? createSessionControllerRpcClient({ sessionController }) : null)
+  if (sessionRpc !== null && typeof sessionRpc.call !== 'function') throw new TypeError('a session RPC client is required')
+  if (typeof idFactory !== 'function') throw new TypeError('an id factory is required')
+  const requireSessionRpc = () => {
+    if (!sessionRpc) {
+      throw new WorkerDispatchError(
+        'session-mode workers require the injected DSH SessionController service or an explicit RPC client',
+        'SESSION_SERVICE_UNAVAILABLE',
+      )
+    }
+    return sessionRpc
+  }
   return {
     async launch({ task, spec, runId, requestId, recordCreated, recordSent }) {
       if (spec.mode !== 'session') throw new WorkerDispatchError('worker spec does not support the session launcher', 'UNSUPPORTED_WORKER_MODE', { mode: spec.mode })
+      const rpc = requireSessionRpc()
+      const effectiveRequestId = typeof requestId === 'string' && requestId.trim() !== '' ? requestId : idFactory()
       const created = await rpc.call('session.create', { cwd: task.workspace, agentPreset: spec.agentPreset })
       const sessionId = created?.sessionId
       if (typeof sessionId !== 'string' || sessionId === '') throw new WorkerDispatchError('session.create returned no session id', 'SESSION_ID_MISSING')
       // T-H12 round-4: the pre-send durable record. Persisting the session +
       // request identity at THIS boundary is what lets a crashed owner be
       // reconciled instead of blindly re-requested (see probeRequest below).
-      if (typeof recordCreated === 'function') await recordCreated({ sessionId, requestId })
+      if (typeof recordCreated === 'function') await recordCreated({ sessionId, requestId: effectiveRequestId })
       let baselineSeq = -1
       try {
         if (spec.model) {
@@ -700,17 +809,21 @@ export function createSessionLauncher({ rpc = createSessionRpcClient(), pollInte
           if (spec.model.reasoningEffort !== undefined) selection.reasoningEffort = spec.model.reasoningEffort
           await rpc.call('session.selectModel', { sessionId, ...selection })
         }
-        const before = sessionEvents(await rpc.call('session.history', { sessionId, maxMessages: historyMaxMessages }))
+        const before = await readAuthoritativeSessionEvents(rpc, sessionId, historyMaxMessages, usesHostSessionController)
         baselineSeq = before.reduce((max, event) => Math.max(max, Number.isSafeInteger(event.seq) ? event.seq : max), -1)
         const basePrompt = typeof spec.prompt === 'string' && spec.prompt !== '' ? spec.prompt : buildTaskPrompt(task, spec, runId)
         // The durable request identity is embedded in the prompt so a host
         // history probe can prove whether THIS request was ever delivered.
-        const text = typeof requestId === 'string' && requestId !== '' ? `${basePrompt}\n\n[review-request ${requestId}]` : basePrompt
-        await rpc.call('session.prompt', {
+        const text = `${basePrompt}\n\n[review-request ${effectiveRequestId}]`
+        const promptResult = await rpc.call('session.prompt', {
           sessionId,
+          requestId: effectiveRequestId,
           mode: 'queue',
           content: [{ type: 'text', text }],
         })
+        if (promptResult?.accepted !== true) {
+          throw new WorkerDispatchError('session.prompt did not confirm prompt acceptance', 'SESSION_PROMPT_NOT_ACCEPTED', { sessionId })
+        }
       } catch (setupError) {
         // Never strand a live session half-configured: cancel it so it does
         // not show up as a live item in the host UI without any work item.
@@ -721,13 +834,13 @@ export function createSessionLauncher({ rpc = createSessionRpcClient(), pollInte
       // the request is durably live in the host; persist that fact BEFORE the
       // caller proceeds, closing the crash-after-acceptance window a successor
       // would otherwise mistake for "unsent" and re-request.
-      if (typeof recordSent === 'function') await recordSent({ sessionId, requestId })
+      if (typeof recordSent === 'function') await recordSent({ sessionId, requestId: effectiveRequestId })
       let waitPromise
       const wait = () => {
         if (!waitPromise) {
           waitPromise = (async () => {
             while (true) {
-              const events = sessionEvents(await rpc.call('session.history', { sessionId, maxMessages: historyMaxMessages }))
+              const events = await readAuthoritativeSessionEvents(rpc, sessionId, historyMaxMessages, usesHostSessionController)
               const terminal = sessionTerminal(events, baselineSeq)
               if (terminal) {
                 const kind = terminal.data?.reason?.kind
@@ -801,7 +914,7 @@ export function createSessionLauncher({ rpc = createSessionRpcClient(), pollInte
         if (!waitPromise) {
           waitPromise = (async () => {
             while (!stopped) {
-              const events = sessionEvents(await rpc.call('session.history', { sessionId, maxMessages: historyMaxMessages }))
+              const events = await readAuthoritativeSessionEvents(requireSessionRpc(), sessionId, historyMaxMessages, usesHostSessionController)
               let baseline = 0
               if (typeof requestId === 'string' && requestId !== '') {
                 for (const event of events) {
@@ -842,7 +955,7 @@ export function createSessionLauncher({ rpc = createSessionRpcClient(), pollInte
       if (typeof requestId !== 'string' || requestId === '') return 'unknown'
       let response
       try {
-        response = await rpc.call('session.history', { sessionId, maxMessages: historyMaxMessages })
+        response = await requireSessionRpc().call('session.history', { sessionId, maxMessages: historyMaxMessages })
       } catch (error) {
         return isSessionNotFoundError(error) ? 'unsent' : 'unknown'
       }

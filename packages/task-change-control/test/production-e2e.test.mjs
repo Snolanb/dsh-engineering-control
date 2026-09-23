@@ -19,6 +19,7 @@ import { Context } from '@deepseek-ai/cordis';
 import { SystemPrompt } from '@deepseek-ai/dsh-system-prompt';
 import { ToolRuntime } from '@deepseek-ai/dsh-tools';
 import * as taskOrchestratorPlugin from 'dsh-task-orchestrator';
+import { createSessionRpcClient } from 'dsh-task-orchestrator/dispatcher';
 import { TaskStore } from 'dsh-task-orchestrator/store';
 import changeControlPlugin from 'dsh-change-control';
 import integrationPlugin from '../src/index.js';
@@ -91,7 +92,7 @@ function createSessionRpc() {
         s.prompt = payload.content?.[0]?.text ?? '';
         promptLog.push({ sessionId, prompt: s.prompt });
       }
-      return respond({});
+      return respond({ accepted: true });
     }
     if (method === 'session.cancel') {
       const s = sessions.get(sessionId);
@@ -208,6 +209,8 @@ async function compose(t) {
 
   await ctx.plugin(taskOrchestratorPluginObject, {
     dbPath: taskDbPath,
+    workerLauncherOptions: { sessionOptions: { rpc: createSessionRpcClient({ fetchImpl: rpc.fetchImpl }) } },
+    reviewerLauncherOptions: { sessionOptions: { rpc: createSessionRpcClient({ fetchImpl: rpc.fetchImpl }) } },
     workerSpecs: {
       worker: {
         mode: 'session',

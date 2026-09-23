@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { TaskStore } from '../src/store.js'
-import { WorkerDispatcher, buildTaskPrompt, createSessionLauncher, createSessionRpcClient, createWorkerLauncher } from '../src/dispatcher.js'
+import { WorkerDispatcher, buildTaskPrompt, createSessionControllerRpcClient, createSessionLauncher, createSessionRpcClient, createWorkerLauncher } from '../src/dispatcher.js'
 import { createBindingLauncher } from '../../task-change-control/src/binding.js'
 import { WorkerSpecRegistry } from '../src/worker-specs.js'
 
@@ -123,12 +123,12 @@ test('session launcher selects the model before prompting and polls completion',
         if (method === 'session.create') return { sessionId: 'session-1' }
         if (method === 'session.history') {
           historyCalls += 1
-          if (historyCalls === 1) return { events: [] }
+          if (historyCalls === 1) return { events: [], hasMore: false }
           return { events: [
             { event: { seq: 1, type: 'turn/start', data: { turn: 1 } } },
             { event: { seq: 2, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'session completed' }] } } } },
             { event: { seq: 3, type: 'turn/end', data: { reason: { kind: 'completed' } } } },
-          ] }
+          ], hasMore: false }
         }
         return { accepted: true }
       },
@@ -155,7 +155,9 @@ test('session launcher classifies a terminal model error as failure', async () =
       if (method === 'session.create') return { sessionId: 'session-error' }
       if (method === 'session.history') {
         historyCalls += 1
-        return historyCalls === 1 ? { events: [] } : { events: [{ event: { seq: 1, type: 'turn/end', data: { reason: { kind: 'error', error: { message: 'provider failed' } } } } }] }
+        return historyCalls === 1
+          ? { events: [], hasMore: false }
+          : { events: [{ event: { seq: 1, type: 'turn/end', data: { reason: { kind: 'error', error: { message: 'provider failed' } } } } }], hasMore: false }
       }
       return { accepted: true }
     } },
@@ -215,7 +217,7 @@ function createCompletionRpc({ historyCalls, events }) {
       if (method === 'session.create') return { sessionId: 'session-1' }
       if (method === 'session.history') {
         historyCalls.push('history')
-        return historyCalls.length === 1 ? { events: [] } : { events }
+        return historyCalls.length === 1 ? { events: [], hasMore: false } : { events, hasMore: false }
       }
       return { accepted: true }
     },
@@ -275,11 +277,11 @@ test('session launcher leaves text-only outcome (exit 0) when no completion tool
         if (method === 'session.create') return { sessionId: 'session-1' }
         if (method === 'session.history') {
           historyCalls.push('history')
-          return historyCalls.length === 1 ? { events: [] } : { events: [
+          return historyCalls.length === 1 ? { events: [], hasMore: false } : { events: [
             { event: { seq: 1, type: 'turn/start', data: { turn: 1 } } },
             { event: { seq: 2, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'plain done' }] } } } },
             { event: { seq: 3, type: 'turn/end', data: { reason: { kind: 'completed' } } } },
-          ] }
+          ], hasMore: false }
         }
         return { accepted: true }
       },
@@ -391,13 +393,13 @@ test('session launcher ignores stale completion results before the baseline sequ
           if (historyCalls.length === 1) {
             return { events: [
               { event: { seq: 1, type: 'tool/result', data: { turn: 0, step: 1, message: { content: [{ type: 'tool-result', toolCallId: 'stale-call', content: [], isError: false }] }, meta: completionEnvelope() } } },
-            ] }
+            ], hasMore: false }
           }
           return { events: [
             { event: { seq: 2, type: 'turn/start', data: { turn: 1 } } },
             { event: { seq: 3, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'fresh turn done' }] } } } },
             { event: { seq: 4, type: 'turn/end', data: { reason: { kind: 'completed' } } } },
-          ] }
+          ], hasMore: false }
         }
         return { accepted: true }
       },
@@ -582,6 +584,62 @@ test('session RPC client sends DSH envelopes and surfaces structured errors', as
   assert.deepEqual(await rpc.call('session.prompt', { sessionId: 's1' }), { accepted: true })
   assert.equal(requests[0].url, 'http://127.0.0.1:3080/api/session.prompt')
   assert.equal(JSON.parse(requests[0].init.body).rpcId, 'task-dispatch-rpc-1')
+})
+
+test('session RPC client fails closed on an unauthorized HTTP response', async () => {
+  const rpc = createSessionRpcClient({
+    fetchImpl: async () => ({
+      ok: false,
+      status: 401,
+      async json() { return { result: { ok: false, error: { message: 'Unauthorized' } } } },
+    }),
+  })
+  await assert.rejects(rpc.call('session.create'), error => {
+    assert.equal(error.code, 'SESSION_RPC_FAILED')
+    assert.equal(error.message, 'Unauthorized')
+    assert.deepEqual(error.details, { method: 'session.create' })
+    return true
+  })
+})
+
+test('session launcher requires an injected host service or explicit RPC client', async () => {
+  const launcher = createSessionLauncher()
+  await assert.rejects(launcher.launch({
+    task: { id: 'session-task', title: 'Session task', workspace: '/repo' },
+    spec: { name: 'worker', mode: 'session', agentPreset: 'standard' },
+    runId: 'run-1',
+  }), { code: 'SESSION_SERVICE_UNAVAILABLE' })
+})
+
+test('SessionController adapter fails closed on an unconfirmed model selection or prompt', async () => {
+  const adapter = createSessionControllerRpcClient({
+    sessionController: {
+      async create() { return { sessionId: 'session-1' } },
+      async selectModel() { return { selected: { provider: 'openai-codex', model: 'different-model', reasoningEffort: 'medium' } } },
+      async inspect() { return { events: [] } },
+      async prompt() { return { accepted: false } },
+      async cancel() { return { accepted: true } },
+    },
+  })
+  await assert.rejects(adapter.call('session.selectModel', {
+    sessionId: 'session-1', provider: 'openai-codex', model: 'gpt-5.6-luna', reasoningEffort: 'medium',
+  }), { code: 'SESSION_MODEL_SELECTION_UNCONFIRMED' })
+  await assert.rejects(adapter.call('session.prompt', {
+    sessionId: 'session-1', requestId: 'request-1', mode: 'queue', content: [{ type: 'text', text: 'work' }],
+  }), { code: 'SESSION_PROMPT_NOT_ACCEPTED' })
+})
+
+test('SessionController adapter fails closed when inspection history is malformed', async () => {
+  const adapter = createSessionControllerRpcClient({
+    sessionController: {
+      async create() { return { sessionId: 'session-1' } },
+      async selectModel() { return { selected: { provider: 'openai-codex', model: 'm' } } },
+      async inspect() { return { events: [{ seq: -1, type: 'turn/end' }] } },
+      async prompt() { return { accepted: true } },
+      async cancel() { return { accepted: true } },
+    },
+  })
+  await assert.rejects(adapter.call('session.history', { sessionId: 'session-1' }), { code: 'SESSION_HISTORY_UNAVAILABLE' })
 })
 
 test('probeRequest returns unknown on transient RPC rejection', async () => {
