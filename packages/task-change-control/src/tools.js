@@ -16,11 +16,23 @@ function contentText(value) {
  * No generic change_create/change_bind will ever exist here — creation and
  * role binding are host/controller responsibilities only.
  *
- * @param {{ getChangeForTask: Function, bootstrapTask: Function }} service the taskChangeControl service
+ * @param {{ getChangeForTask: Function, bootstrapTask: Function, startControllerOwnedPlanning: Function }} service the taskChangeControl service
  */
 export function createIntegrationTools(service) {
   const out = { schema: { type: 'object', additionalProperties: true }, render: (_a, v) => contentText(v) };
   return [
+    defineTool({
+      name: 'governed_start_planning',
+      description: 'Start controller-owned governed planning using the host-authenticated execution identity.',
+      parameters: { taskId: { type: 'string' } },
+      output: out,
+      execute: async (args, exec) => {
+        if (typeof args?.taskId !== 'string' || args.taskId.trim() === '') {
+          throw Object.assign(new Error('taskId is required and must be a string'), { code: 'INVALID_TASK_ID' });
+        }
+        return service.startControllerOwnedPlanning(args.taskId, exec);
+      },
+    }),
     defineTool({
       name: 'change_for_task',
       description: 'Resolve the Change linked to a Task Orchestrator task. Never fabricates: unlinked tasks return a structured not-linked result.',

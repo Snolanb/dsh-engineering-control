@@ -259,7 +259,9 @@ export async function registerChangeTools(ctx, config) {
   const store = config?.store ?? await ChangeStore.open(storePath, { preflightPolicy });
   // The sole integration contract. ChangeStore itself is never provided:
   // external packages integrate via ctx.changeControl only.
-  const service = createChangeControlService(store);
+  const service = createChangeControlService(store, {
+    onPlanAccepted: (payload) => ctx.events?.emit('change-control/plan-accepted', payload),
+  });
   ctx.provide('changeControl', service);
   // T-H12 round-4: when the governed task↔change integration provides a
   // review-settlement guard (durable current-round session check), install it

@@ -18,7 +18,7 @@ import { registerGovernanceProvider as registerProviderWithStore } from './gover
  *
  * @param {import('../storage/change-store.js').ChangeStore} store
  */
-export function createChangeControlService(store) {
+export function createChangeControlService(store, { onPlanAccepted } = {}) {
   if (!store || typeof store.create !== 'function') {
     throw new TypeError('changeControl service requires a ChangeStore instance');
   }
@@ -53,7 +53,11 @@ export function createChangeControlService(store) {
      * Host-side plan acceptance. Callers must prove authority; the tool layer
      * passes the session-derived auth context, host commands pass authorized: true.
      */
-    acceptPlan: (changeId, planId, opts) => store.acceptPlan(changeId, planId, opts),
+    acceptPlan: async (changeId, planId, opts) => {
+      const plan = await store.acceptPlan(changeId, planId, opts);
+      await onPlanAccepted?.({ changeId, planId });
+      return plan;
+    },
 
     /** Bind a session identity to a role on a Change. */
     bindRole: (changeId, sessionId, role, opts) => store.bindRole(changeId, sessionId, role, opts),

@@ -684,16 +684,15 @@ test('R2-VER-009: explicit null reasoningEffort is treated as absent (optional f
   assert.equal(r.emitted, 1, 'explicit null reasoningEffort is skipped as absent, no fields to compare');
 });
 
-test('R2-VER-009: explicit null worker_model value fails closed', async () => {
+test('R2-VER-009: explicit null worker_model means no override', async () => {
   const h = harness({
     task: { worker_profile: 'worker', worker_model: null },
     resolveWorkerSpec: () => ({ name: 'worker', enabled: true, mode: 'session', model: { provider: 'openai', model: 'gpt-4' } }),
   });
   const producer = createR2HandoffProducer({ taskOrchestrator: h.taskOrchestrator, changeControl: h.changeControl, events: h.events });
   const r = await producer.arm(S, { taskIds: [h.TASK_ID] });
-  assert.equal(r.emitted, 0, 'explicit null worker_model fails closed');
-  assert.equal(r.reasons.includes('NON_RESOLVABLE_PROFILE'), true);
-  assert.equal(h.calls.emit.length, 0);
+  assert.equal(r.emitted, 1, 'explicit null worker_model uses the profile default');
+  assert.equal(h.calls.emit.length, 1);
 });
 
 test('R2-VER-005: non-string worker_profile is not accepted (NON_RESOLVABLE_PROFILE)', async () => {

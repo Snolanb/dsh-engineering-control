@@ -133,20 +133,20 @@ export default {
     let r2WrappedService;
     {
       const svcRef = service;
-      r2WrappedService = new Proxy(svcRef, {
+      r2WrappedService = new Proxy(Object.create(null), {
         get(target, prop, receiver) {
           if (prop === 'startControllerOwnedPlanning') {
             /** @param {string} taskId @param {any} exec @param {any} payload */
             return (taskId, exec, payload) =>
-              Reflect.get(target, 'startControllerOwnedPlanning', target)(taskId, exec, payload)
-                .then((/** @type {any} */ result) => {
+              Reflect.get(svcRef, 'startControllerOwnedPlanning', svcRef)(taskId, exec, payload)
+                .then(async (/** @type {any} */ result) => {
                   if (r2Producer && result && result.ok && result.sessionId) {
-                    r2Producer.arm(result.sessionId, { taskIds: [taskId] }).catch(() => {});
+                    await r2Producer.arm(result.sessionId, { taskIds: [taskId] });
                   }
                   return result;
                 });
           }
-          return Reflect.get(target, prop, receiver);
+          return Reflect.get(svcRef, prop, svcRef);
         },
       });
     }
@@ -160,7 +160,7 @@ export default {
         taskOrchestrator: orch,
         changeControl: cc,
         events: ctx.events,
-        list: () => Promise.resolve(orch.list?.({ statuses: ['ready'], limit: 100 }) ?? []),
+        list: () => Promise.resolve(orch.list?.({ statuses: ['ready', 'claimed', 'running'], limit: 100 }) ?? []),
       });
       return () => { r2Producer?.dispose(); };
     });
@@ -292,7 +292,7 @@ export default {
     await ctx.inject(['tools'], (c) => {
       const registry = c.get('tools');
       if (!registry) throw new Error('tools service inactive in its own inject fiber');
-      for (const tool of createIntegrationTools(service)) registry.register(tool);
+      for (const tool of createIntegrationTools(r2WrappedService)) registry.register(tool);
     });
 
     // T9.1 — mandatory governance provider: resolves sessionId → task

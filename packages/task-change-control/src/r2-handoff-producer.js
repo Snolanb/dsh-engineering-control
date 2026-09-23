@@ -125,11 +125,7 @@ const WORK_ITEM_SYSTEM = 'dsh-task-orchestrator';
  */
 function normalizeRequestedModel(value) {
   if (value === undefined) return {};
-  if (value === null) {
-    // Explicit null for the whole worker_model is invalid under repository
-    // semantics (string(null) → required → throws).
-    throw new Error('worker_model must not be null');
-  }
+  if (value === null) return {};
   if (Array.isArray(value)) {
     throw new Error('worker_model must not be an array');
   }
@@ -198,6 +194,8 @@ function normalizeRequestedModel(value) {
 export function createR2HandoffProducer({ taskOrchestrator: orch, changeControl: cc, events, list: listFn } = /** @type {R2ProducerDeps} */ ({})) {
   /** Trusted S — activation memory only. No persisted state. */
   let armedS = '';
+  /** @type {string[]} */
+  let armedTaskIds = [];
   /** Per-task in-flight coalescing: taskId → shared evaluation promise. */
   const inFlight = new Map(/** @type {[string, Promise<R2EvaluationResult>][]} */ ([]));
   /** Cross-activation dedup: taskId → emitted this activation. */
@@ -225,10 +223,10 @@ export function createR2HandoffProducer({ taskOrchestrator: orch, changeControl:
         const ids = rows
           .filter((r) => r && typeof r === 'object' && typeof r.id === 'string' && r.id.trim() !== '')
           .map((r) => /** @type {string} */ (r.id));
-        if (ids.length > 0) return ids;
+        return [...new Set([...ids, ...(fallbackIds ?? []), ...armedTaskIds])];
       } catch { /* fall back to provided ids */ }
     }
-    return (fallbackIds ?? []).filter((id) => typeof id === 'string' && id.trim() !== '');
+    return [...new Set([...(fallbackIds ?? []), ...armedTaskIds])].filter((id) => typeof id === 'string' && id.trim() !== '');
   }
 
   /**
@@ -252,15 +250,20 @@ export function createR2HandoffProducer({ taskOrchestrator: orch, changeControl:
     if (typeof t.status !== 'string' || typeof t.ready_to_run !== 'boolean') {
       return { emitted: 0, taskId, reason: 'MALFORMED_TASK' };
     }
-    // Eligibility: task eligible for handoff (no active worker claim).
-    if (t.status !== 'ready' || t.ready_to_run !== true) {
+    // Eligibility: an unclaimed ready task, or the controller-owned claim
+    // established by R1. The latter is intentionally allowed so the producer
+    // can emit the handoff that causes the existing consumer to release it.
+    const claimedBy = t.claimed_by ?? null;
+    const controllerClaim = (t.status === 'claimed' || t.status === 'running')
+      && claimedBy !== null && claimedBy === armedS;
+    const readyUnclaimed = t.status === 'ready' && t.ready_to_run === true && claimedBy === null;
+    if (!controllerClaim && !readyUnclaimed) {
       return { emitted: 0, taskId, reason: `UNSUPPORTED_TASK_STATE:${t.status}` };
     }
-    // No active worker claim/execution.
-    const claimedBy = t.claimed_by ?? null;
+    // Worker claims or claims held by another identity fail closed.
     const claimedAt = t.claimed_at ?? null;
     const leaseExpiresAt = t.lease_expires_at ?? null;
-    if (claimedBy !== null || claimedAt !== null || leaseExpiresAt !== null) {
+    if (!controllerClaim && (claimedBy !== null || claimedAt !== null || leaseExpiresAt !== null)) {
       return { emitted: 0, taskId, reason: 'WORKER_CLAIM_PRESENT' };
     }
     // Authoritative worker-profile resolution: the fresh task's worker_profile
@@ -400,6 +403,7 @@ export function createR2HandoffProducer({ taskOrchestrator: orch, changeControl:
     async arm(trustedSessionId, options = {}) {
       armedS = typeof trustedSessionId === 'string' ? trustedSessionId.trim() : '';
       const taskIds = (options?.taskIds ?? []).filter((id) => typeof id === 'string' && id.trim() !== '');
+      armedTaskIds = [...taskIds];
       const reasons = [];
       let emittedCount = 0;
       // Authoritative candidate discovery via public list/listFn.
@@ -445,8 +449,16 @@ export function createR2HandoffProducer({ taskOrchestrator: orch, changeControl:
           }
         } catch { /* sync subscribe failure: no disposer, no leak */ }
       }
-      // Subscribe to linkage-created notifications (optional hints only).
+      // Subscribe to authoritative plan-accepted wake hints; payload state is untrusted.
       if (typeof events?.on === 'function') {
+        try {
+          const planResult = events.on('change-control/plan-accepted', () => {
+            void discoverCandidates(armedTaskIds).then((ids) => {
+              for (const id of ids) void wake(id);
+            });
+          });
+          if (typeof planResult === 'function') disposers.push(planResult);
+        } catch { /* noop */ }
         try {
           /** @type {(() => void) | void} */
           const linkResult = events.on('change-control/linkage-created', (/** @type {{ taskId?: string }} */ payload) => {
