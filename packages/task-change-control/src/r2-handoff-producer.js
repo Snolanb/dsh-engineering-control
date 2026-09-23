@@ -254,15 +254,18 @@ export function createR2HandoffProducer({ taskOrchestrator: orch, changeControl:
     // established by R1. The latter is intentionally allowed so the producer
     // can emit the handoff that causes the existing consumer to release it.
     const claimedBy = t.claimed_by ?? null;
+    const claimedAt = t.claimed_at ?? null;
+    const leaseExpiresAt = t.lease_expires_at ?? null;
+    const activeControllerLease = claimedAt !== null
+      && leaseExpiresAt !== null
+      && Number(leaseExpiresAt) > Date.now();
     const controllerClaim = (t.status === 'claimed' || t.status === 'running')
-      && claimedBy !== null && claimedBy === armedS;
+      && claimedBy !== null && claimedBy === armedS && activeControllerLease;
     const readyUnclaimed = t.status === 'ready' && t.ready_to_run === true && claimedBy === null;
     if (!controllerClaim && !readyUnclaimed) {
       return { emitted: 0, taskId, reason: `UNSUPPORTED_TASK_STATE:${t.status}` };
     }
     // Worker claims or claims held by another identity fail closed.
-    const claimedAt = t.claimed_at ?? null;
-    const leaseExpiresAt = t.lease_expires_at ?? null;
     if (!controllerClaim && (claimedBy !== null || claimedAt !== null || leaseExpiresAt !== null)) {
       return { emitted: 0, taskId, reason: 'WORKER_CLAIM_PRESENT' };
     }
