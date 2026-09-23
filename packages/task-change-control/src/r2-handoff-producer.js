@@ -492,6 +492,7 @@ export function createR2HandoffProducer({ taskOrchestrator: orch, changeControl:
      */
     restart() {
       armedS = '';
+      armedTaskIds = [];
       inFlight.clear();
       emitted.clear();
       subscribed = false; // allow re-arm after restart
@@ -504,6 +505,7 @@ export function createR2HandoffProducer({ taskOrchestrator: orch, changeControl:
      */
     dispose() {
       armedS = '';
+      armedTaskIds = [];
       inFlight.clear();
       emitted.clear();
       subscribed = false; // allow re-arm after dispose
