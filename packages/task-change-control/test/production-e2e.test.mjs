@@ -197,6 +197,14 @@ async function compose(t) {
   await ctx.plugin(SystemPrompt);
   await ctx.plugin(ToolRuntime, {});
   ctx.provide('webServer', { register() { return () => {}; } });
+  ctx.provide('llm', {
+    listProviders() { return [{ id: 'ollama' }]; },
+    async resolveCallConfig(config) {
+      if (config.provider !== 'ollama' || config.model !== 'm') throw Object.assign(new Error('unknown model'), { code: 'UNKNOWN_MODEL' });
+      return config;
+    },
+  });
+  ctx.provide('agentPresets', { async list() { return [{ id: 'worker' }]; } });
 
   await ctx.plugin(taskOrchestratorPluginObject, {
     dbPath: taskDbPath,
@@ -210,13 +218,6 @@ async function compose(t) {
         workspacePolicy: 'any',
         timeoutMs: 5000,
         leaseSeconds: 300,
-      },
-    },
-    preflightOptions: {
-      presetExists: new Set(['worker']),
-      llm: {
-        listProviders() { return [{ id: 'ollama' }]; },
-        async listModels(provider) { return provider === 'ollama' ? [{ id: 'm' }] : []; },
       },
     },
   });

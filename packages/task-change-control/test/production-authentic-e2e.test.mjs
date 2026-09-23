@@ -301,6 +301,14 @@ test('authentic production E2E executes worker_complete and change_submit_review
   await ctx.plugin(SystemPrompt);
   await ctx.plugin(ToolRuntime, {});
   ctx.provide('webServer', { register() { return () => {}; } });
+  ctx.provide('llm', {
+    listProviders() { return [{ id: 'ollama' }]; },
+    async resolveCallConfig(config) {
+      if (config.provider !== 'ollama' || config.model !== 'm') throw Object.assign(new Error('unknown model'), { code: 'UNKNOWN_MODEL' });
+      return config;
+    },
+  });
+  ctx.provide('agentPresets', { async list() { return [{ id: 'worker' }]; } });
   await ctx.plugin(orchestrator, {
     dbPath: join(dir, 'tasks.db'),
     workerSpecs: {
@@ -308,13 +316,6 @@ test('authentic production E2E executes worker_complete and change_submit_review
         mode: 'session', profile: 'worker-profile', agentPreset: 'worker',
         provider: 'ollama', model: 'm', workspacePolicy: 'any',
         timeoutMs: 2000, leaseSeconds: 30,
-      },
-    },
-    preflightOptions: {
-      presetExists: new Set(['worker']),
-      llm: {
-        listProviders() { return [{ id: 'ollama' }]; },
-        async listModels(provider) { return provider === 'ollama' ? [{ id: 'm' }] : []; },
       },
     },
     workerLauncherOptions: { sessionOptions: { rpc: createSessionRpcClient({ baseUrl: host.baseUrl }), pollIntervalMs: 5 } },

@@ -8,7 +8,7 @@ import { WorkerDispatcher, createWorkerLauncher } from './dispatcher.js'
 import { createReviewerLauncher } from './reviewer-launcher.js'
 
 export const name = 'task-orchestrator'
-export const inject = ['webServer', 'tools']
+export const inject = ['webServer', 'tools', 'llm', 'agentPresets']
 export const TASK_ORCHESTRATOR_SERVICE = 'taskOrchestrator'
 
 export function apply(ctx, config = {}) {
@@ -20,12 +20,18 @@ export function apply(ctx, config = {}) {
   })
   const workerRegistry = new WorkerSpecRegistry(config.workerSpecs ?? {})
   const preflightDefaults = config.preflightOptions ?? {}
-  const preflight = (request = {}, options = {}) => preflightWorker(workerRegistry, request, {
-    ...preflightDefaults,
-    ...options,
-    llm: options.llm ?? preflightDefaults.llm ?? ctx.llm,
-    workspaceRoots: options.workspaceRoots ?? preflightDefaults.workspaceRoots ?? config.workspaceRoots,
-  })
+  const presetIsAvailable = async id => (await ctx.agentPresets.list()).some(preset => preset.id === id && !preset.broken)
+  const preflight = (request = {}, options = {}) => {
+    const presetExists = options.presetExists ?? preflightDefaults.presetExists
+    const presets = options.presets ?? preflightDefaults.presets
+    return preflightWorker(workerRegistry, request, {
+      ...preflightDefaults,
+      ...options,
+      presetExists: presetExists ?? (presets === undefined ? presetIsAvailable : undefined),
+      llm: options.llm ?? preflightDefaults.llm ?? ctx.llm,
+      workspaceRoots: options.workspaceRoots ?? preflightDefaults.workspaceRoots ?? config.workspaceRoots,
+    })
+  }
   const workerLauncherDefaults = config.workerLauncherOptions ?? {}
   const reviewerLauncherDefaults = config.reviewerLauncherOptions ?? {}
   const mergeLauncherOptions = (defaults, options = {}) => ({

@@ -19,8 +19,10 @@ const WORKER_RUN = 'worker:run-c1';
 
 async function composeAt(dir) {
   const ctx = new Context();
-  // Provide the webServer service the real Task Orchestrator plugin injects.
+  // Provide the services the real Task Orchestrator plugin injects.
   ctx.provide('webServer', { register: () => () => {} });
+  ctx.provide('llm', { listProviders: () => [], async resolveCallConfig(config) { return config; } });
+  ctx.provide('agentPresets', { async list() { return []; } });
   await ctx.plugin(SystemPrompt);
   await ctx.plugin(ToolRuntime);
   // Use the real Task Orchestrator plugin — no hand-rolled facade.

@@ -9,8 +9,11 @@ import { WorkerSpecRegistry } from '../src/worker-specs.js'
 function llmFixture({ models = ['ornith-1.5:9b'], efforts = ['low'] } = {}) {
   return {
     listProviders() { return [{ id: 'ollama', name: 'Ollama' }] },
-    async listModels(provider) { return provider === 'ollama' ? models.map(id => ({ provider, id, name: id })) : [] },
-    async resolveModelInfo() { return { reasoning: { efforts: efforts.map(id => ({ id, name: id })) } } },
+    async resolveCallConfig({ model, reasoningEffort }) {
+      if (!models.includes(model)) throw Object.assign(new Error('unknown model'), { code: 'UNKNOWN_MODEL' })
+      if (reasoningEffort !== undefined && !efforts.includes(reasoningEffort)) throw Object.assign(new Error('unsupported effort'), { code: 'UNSUPPORTED_REASONING_EFFORT' })
+      return { model, reasoningEffort }
+    },
   }
 }
 
@@ -56,6 +59,14 @@ test('reports unavailable models and unsupported reasoning without throwing', as
   })
   assert.equal(result.ok, false)
   assert.ok(result.blockers.some(blocker => blocker.code === 'MODEL_UNAVAILABLE'))
+
+  const unsupportedEffort = await preflightWorker(registry('any'), {
+    worker_profile: 'standard', workspace: root,
+  }, {
+    presetExists: new Set(['standard']),
+    llm: llmFixture({ efforts: [] }),
+  })
+  assert.ok(unsupportedEffort.blockers.some(blocker => blocker.code === 'REASONING_EFFORT_UNAVAILABLE'))
 })
 
 test('rejects unsafe workspaces and missing composition resources', async t => {
